@@ -1,0 +1,1 @@
+gcc|-D_FILE_OFFSET_BITS=64 -O3 -march=x86-64-v3 -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function|-lm -fopenmp -static -lpsapi|CUDA=0|CUDA_DLL=0|ARCH=x86-64-v3|CUDA_ARCH=native|METAL=0

@@ -1,0 +1,7 @@
+sabrewing
+Copyright 2026 Schneewolf Labs
+
+This product is a fork of colibrì (https://github.com/JustVugg/colibri),
+Copyright the colibrì contributors, licensed under the Apache License 2.0.
+The expert-streaming runtime, GLM-5.2 engine, container format, and
+validation methodology originate there.
