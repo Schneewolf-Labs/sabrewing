@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """sabrewing — trillion-parameter models on hardware you own.
 
-  sbw run "prompt" [-n N]    one-shot generation
-  sbw api [args...]          OpenAI-compatible API + web UI (port 8000)
-  sbw warm <prompts.txt>     build expert-usage history (one prompt/line)
-  sbw build [cuda]           build the engine (cuda = GPU resident tier)
-  sbw info                   model, cache-history and hardware status
+  swing run "prompt" [-n N]    one-shot generation
+  swing api [args...]          OpenAI-compatible API + web UI (port 8000)
+  swing warm <prompts.txt>     build expert-usage history (one prompt/line)
+  swing build [cuda]           build the engine (cuda = GPU resident tier)
+  swing info                   model, cache-history and hardware status
 
 Environment:
-  SBW_MODEL=<dir>   model snapshot (also honors COLI_MODEL)
+  SWING_MODEL=<dir>   model snapshot (also honors COLI_MODEL)
   Engine knobs pass through: PIN, PIN_N, USAGE_SAVE, NOGPU, GPU_DEV, IDOT
 
 sabrewing is a fork of colibrì; the GLM-5.2 engine remains available
@@ -23,16 +23,16 @@ HERE = Path(__file__).resolve().parent
 
 
 def model_dir():
-    m = os.environ.get("SBW_MODEL") or os.environ.get("COLI_MODEL")
+    m = os.environ.get("SWING_MODEL") or os.environ.get("COLI_MODEL")
     if not m:
-        sys.exit("set SBW_MODEL=<snapshot dir> (converted Inkling weights)")
+        sys.exit("set SWING_MODEL=<snapshot dir> (converted Inkling weights)")
     return m
 
 
 def engine():
     exe = HERE / "inkling"
     if not exe.exists():
-        sys.exit("engine not built: run `sbw build` (or `sbw build cuda`)")
+        sys.exit("engine not built: run `swing build` (or `swing build cuda`)")
     return str(exe)
 
 
@@ -50,13 +50,13 @@ def main():
 
     if cmd == "run":
         if not args:
-            sys.exit('usage: sbw run "prompt" [-n N]')
+            sys.exit('usage: swing run "prompt" [-n N]')
         env = dict(os.environ, SNAP=model_dir())
         sys.exit(subprocess.call([engine(), "-p", args[0], *args[1:]], env=env))
 
     if cmd == "warm":
         if not args:
-            sys.exit("usage: sbw warm <prompts.txt>")
+            sys.exit("usage: swing warm <prompts.txt>")
         env = dict(os.environ, SNAP=model_dir())
         sys.exit(subprocess.call([engine(), "-f", args[0], "-n", "32"], env=env))
 
@@ -70,7 +70,7 @@ def main():
         size = sum(f.stat().st_size for f in Path(m).glob("*.safetensors")) / 1e9
         usage = Path(m) / ".coli_usage"
         print(f"model:   {m}  ({size:.0f} GB)")
-        print(f"history: {'%d KB' % (usage.stat().st_size // 1024) if usage.exists() else 'none (run `sbw warm`)'}")
+        print(f"history: {'%d KB' % (usage.stat().st_size // 1024) if usage.exists() else 'none (run `swing warm`)'}")
         print(f"engine:  {'built' if (HERE / 'inkling').exists() else 'not built'}")
         try:
             gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
