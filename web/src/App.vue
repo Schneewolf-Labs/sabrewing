@@ -56,7 +56,9 @@ async function send(text) {
       temperature: 0.7,
       reasoning: reasoning.value,
       signal: controller.signal,
-      onThink: (t) => { turn.phase = "thinking"; turn.think += t; scrollDown() },
+      // ignore lone-"." keepalive pings (fired during slow cold prefill) — only
+      // real reasoning tokens open the box, so reasoning-off never shows it
+      onThink: (t) => { if (t === ".") return; turn.phase = "thinking"; turn.think += t; scrollDown() },
       onToken: (t) => { turn.phase = "answering"; turn.content += t; scrollDown() },
     })
   } catch (err) {
