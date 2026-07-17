@@ -224,6 +224,41 @@
   .think-live { display: inline-flex; align-items: center; gap: 6px; color: var(--violet); }
   .think-live .typing i { width: 4px; height: 4px; margin: 0 1px; }
 
+
+  /* icon button (gear) */
+  .icon-btn {
+    width: 34px; height: 34px; border-radius: var(--radius-sm); flex: none;
+    display: grid; place-items: center; color: var(--mist-dim);
+    box-shadow: var(--ring); transition: color var(--quick), box-shadow var(--quick);
+  }
+  .icon-btn:hover { color: var(--mist); box-shadow: inset 0 0 0 1px var(--violet-dim); }
+  .icon-btn svg { width: 18px; height: 18px; }
+
+  /* settings modal */
+  .modal-scrim {
+    position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+    padding: 20px; background: oklch(0% 0 0 / 0.5); backdrop-filter: blur(4px);
+    animation: rise 200ms var(--ease) both;
+  }
+  .modal {
+    width: min(440px, 100%); padding: 22px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; }
+  .modal-head h3 { font-size: var(--step-1); }
+  .field { display: flex; flex-direction: column; gap: 7px; }
+  .field > span { display: flex; justify-content: space-between; font-size: var(--step--1); color: var(--mist-dim); }
+  .field > span b { color: var(--violet); font-variant-numeric: tabular-nums; }
+  .field small { color: var(--mist-faint); font-size: 0.78rem; }
+  .field input[type="text"], .field input[type="password"] {
+    padding: 9px 11px; border-radius: var(--radius-sm);
+    background: var(--night-0); box-shadow: var(--ring); color: var(--mist);
+    transition: box-shadow var(--quick);
+  }
+  .field input[type="text"]:focus, .field input[type="password"]:focus { box-shadow: inset 0 0 0 1px var(--violet-dim); }
+  .field input[type="range"] { accent-color: var(--violet); height: 22px; }
+  .reset { align-self: flex-start; color: var(--mist-faint); }
+
   /* aside — the expert brain */
   .aside { display: flex; flex-direction: column; gap: 16px; }
   .card { padding: 15px; }

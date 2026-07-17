@@ -2,12 +2,14 @@
 import { ref, nextTick, onMounted } from "vue"
 import { streamChat, fetchModel } from "./lib/api.js"
 import ExpertBrain from "./components/ExpertBrain.vue"
+import Settings from "./components/Settings.vue"
 
 const model = ref("inkling-colibri")
 const messages = ref([])          // {role, content, think, phase}
 const draft = ref("")
 const busy = ref(false)
 const reasoning = ref(localStorage.getItem("sabrewing.reasoning") === "1")
+const showSettings = ref(false)
 const thread = ref(null)
 let controller = null
 
@@ -53,7 +55,6 @@ async function send(text) {
   try {
     await streamChat(history, {
       model: model.value,
-      temperature: 0.7,
       reasoning: reasoning.value,
       signal: controller.signal,
       // ignore lone-"." keepalive pings (fired during slow cold prefill) — only
@@ -89,6 +90,9 @@ function reset() { messages.value = [] }
         <span class="knob" /> Reasoning
       </button>
       <div class="stat"><span class="dot" :class="{ cold: !busy }" /> {{ busy ? "generating" : "ready" }}</div>
+      <button class="icon-btn" @click="showSettings = true" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
       <button v-if="messages.length" class="ghost-btn" @click="reset">Clear</button>
     </header>
 
@@ -145,5 +149,7 @@ function reset() { messages.value = [] }
 
       <ExpertBrain />
     </main>
+
+    <Settings :open="showSettings" @close="showSettings = false" />
   </div>
 </template>

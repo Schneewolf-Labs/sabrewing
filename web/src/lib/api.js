@@ -1,24 +1,22 @@
-// sabrewing gateway client — chat SSE + expert-brain polling. no deps.
+// sabrewing gateway client — chat SSE + brain/profile polling. no deps.
+import { settings, authHeaders } from "./settings.js"
 
-const BASE = localStorage.getItem("sabrewing.base") || ""
-
-export function setBase(url) {
-  localStorage.setItem("sabrewing.base", url)
-}
-export function getBase() {
-  return BASE
-}
+const base = () => settings.baseUrl || ""
 
 // Stream a chat completion. onToken(text) per content delta; onThink(text) per
-// reasoning delta. Returns the final usage/stats object. Aborts via signal.
+// reasoning delta. Aborts via signal. Sampling comes from shared settings.
 const CTRL = /<\|[^|]*\|>/g   // any Inkling control marker, belt-and-suspenders
 
-export async function streamChat(messages, { model, temperature, reasoning, signal, onToken, onThink }) {
-  const body = { model, messages, temperature, stream: true, max_tokens: 1024 }
+export async function streamChat(messages, { model, reasoning, signal, onToken, onThink }) {
+  const body = {
+    model, messages, stream: true,
+    temperature: settings.temperature,
+    max_tokens: settings.maxTokens,
+  }
   if (reasoning) body.reasoning_effort = "high"
-  const res = await fetch(`${BASE}/v1/chat/completions`, {
+  const res = await fetch(`${base()}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
     signal,
   })
@@ -49,7 +47,7 @@ export async function streamChat(messages, { model, temperature, reasoning, sign
 
 export async function fetchModel() {
   try {
-    const r = await fetch(`${BASE}/v1/models`)
+    const r = await fetch(`${base()}/v1/models`, { headers: authHeaders() })
     const j = await r.json()
     return j.data?.[0]?.id || "inkling-colibri"
   } catch { return "inkling-colibri" }
@@ -58,14 +56,14 @@ export async function fetchModel() {
 // /experts -> { rows, cols, map (hex, 1 byte/expert: tier<<6 | heat) }
 export async function fetchExperts() {
   try {
-    const r = await fetch(`${BASE}/experts`)
+    const r = await fetch(`${base()}/experts`, { headers: authHeaders() })
     return await r.json()
   } catch { return null }
 }
 
 export async function fetchHealth() {
   try {
-    const r = await fetch(`${BASE}/health`)
+    const r = await fetch(`${base()}/health`, { headers: authHeaders() })
     return await r.json()
   } catch { return null }
 }
