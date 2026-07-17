@@ -49,7 +49,7 @@ typedef struct {
     double log_floor;                     /* <=0: log scaling off */
     float log_alpha;
     int n_experts, topk, n_shared, moe_inter, dense_inter;
-    int eos;
+    int eos, img_tok, aud_tok, ctx_max;   /* multimodal placeholders; serve KV bound */
     float eps, route_scale, mup;
     unsigned char local[MAXL];            /* 1 = sliding-window layer */
     unsigned char sparse[MAXL];           /* 1 = MoE layer, 0 = dense MLP */
@@ -417,6 +417,13 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *eo = json_get(root,"eos_token_id");
     if (!eo || eo->t != J_NUM) eo = json_get(r,"eos_token_id");
     c->eos = (eo && eo->t == J_NUM) ? (int)eo->num : -1;
+    /* multimodal placeholder tokens (InklingConfig defaults) — text-only engine
+     * rejects prompts containing them rather than embedding a meaningless row */
+    c->img_tok = (int)jnum(root, "image_token_id", 200054);
+    c->aud_tok = (int)jnum(root, "audio_token_id", 200053);
+    /* serve KV bound: model_max_length is 1M but per-request KV can't be; cap to
+     * a memory-safe default, overridable via CTX_MAX */
+    { const char *e = getenv("CTX_MAX"); c->ctx_max = e ? atoi(e) : 8192; }
     /* real config.json: intermediate_size = MoE, dense_intermediate_size = dense.
      * HF-saved config (post_init applied): intermediate_size = dense, moe_intermediate_size = MoE. */
     jval *dis = json_get(r,"dense_intermediate_size");
@@ -1096,6 +1103,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+static const char *prompt_reject(Cfg *c, const int *ids, int np, int want);
+
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
 static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     Cfg *c = &m->c;
@@ -1103,6 +1112,8 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int *ids = malloc(cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
+    const char *bad = prompt_reject(c, ids, np, n_new);
+    if (bad) { fprintf(stderr, "rejected: %s\n", bad); free(ids); return; }
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
     double t0 = now_s(), t1 = 0;
@@ -1154,6 +1165,28 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
+/* reject a prompt that can't be served correctly: multimodal placeholder
+ * tokens (text-only engine) or a context that would overrun the KV bound.
+ * Returns NULL if ok, else a short reason. */
+static const char *prompt_reject(Cfg *c, const int *ids, int np, int want) {
+    for (int i = 0; i < np; i++)
+        if (ids[i] == c->img_tok || ids[i] == c->aud_tok)
+            return "multimodal input not supported (text only)";
+    if (np + want > c->ctx_max) return "context exceeds CTX_MAX";
+    return NULL;
+}
+
+/* CTC-style repetition penalty applied in place: recently emitted tokens get
+ * their logit divided (if >0) or multiplied (if <0) by pen>1. pen<=1 = off. */
+static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, float pen) {
+    if (pen <= 1.f) return;
+    for (int i = 0; i < nhist; i++) {
+        int t = hist[i];
+        if (t < 0 || t >= n) continue;
+        logit[t] = logit[t] > 0 ? logit[t] / pen : logit[t] * pen;
+    }
+}
+
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
@@ -1217,6 +1250,8 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = prompt_reject(c, ids, np, q->max_tok);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
     state_reset(m);
     kv_alloc(m, np + q->max_tok + 8);
     double t0 = now_s();
@@ -1224,10 +1259,17 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     float *logit = step(m, ids, np, 0, NULL);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
+    /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
+    float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
+    int hist[128], nhist = 0;
+    for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
         free(logit); logit = NULL;
         if (tk == c->eos) { limited = 0; break; }
+        if (nhist < 128) hist[nhist++] = tk;
+        else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
         printf("DATA %s %d\n", q->id, nb);
         fwrite(buf, 1, (size_t)nb, stdout);
