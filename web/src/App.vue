@@ -50,7 +50,7 @@ async function send(text) {
       temperature: 0.7,
       signal: controller.signal,
       onToken: (t) => { turn.content += t; scrollDown() },
-      onThink: (t) => { if (t.trim()) turn.think += t },
+      onThink: (t) => { if (t.trim() && t.trim() !== ".") turn.think += t },
     })
   } catch (err) {
     if (err.name !== "AbortError") turn.content += `\n\n⚠ ${err.message}`

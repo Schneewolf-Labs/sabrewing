@@ -326,20 +326,26 @@ class InklingStreamSplit:
 
     def _emit(self, text):
         if text and self.mode == "content":
-            self.on_content(text)
+            text = _INK_MARKER.sub("", text)
+            if text:
+                self.on_content(text)
 
     def close(self):
         self._emit(self.buf)
         self.buf = ""
 
 
+import re as _re
+_INK_MARKER = _re.compile(r"<\|(?:content_\w+|end_message|message_\w+|audio_end|unused_\d+)\|>")
+
 def strip_inkling_markers(text):
-    """Remove <|content_thinking|>…<|content_text|> sections and stray markers."""
+    """Remove <|content_thinking|>…<|content_text|> sections, then any stray
+    control markers (end_message, role/content tokens) the model emits."""
     while INK_THINK in text:
         pre, _, rest = text.partition(INK_THINK)
         _, _, after = rest.partition(INK_TEXT)
         text = pre + after
-    return text.replace(INK_TEXT, "")
+    return _INK_MARKER.sub("", text)
 
 
 

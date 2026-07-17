@@ -29,10 +29,10 @@ const cells = computed(() => {
 
 function cellStyle(c) {
   if (c.tier === 0 && c.heat === 0) return { "--cell": "var(--night-2)" }
-  const t = Math.min(1, c.heat / 18)          // heat 0..~18 bits -> 0..1
-  const hue = 292 - t * 247                    // violet(292) -> gorget(45)
-  const light = 34 + t * 40
-  const chroma = 0.06 + t * 0.13
+  const t = Math.min(1, c.heat / 16)          // heat 0..~16 bits -> 0..1
+  const hue = (292 + t * 113) % 360            // violet(292) -> magenta -> ember(45), never green
+  const light = 40 + t * 34
+  const chroma = 0.09 + t * 0.11
   return { "--cell": `oklch(${light}% ${chroma} ${hue})` }
 }
 

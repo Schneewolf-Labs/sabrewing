@@ -118,8 +118,9 @@
     display: grid; grid-template-columns: 1fr; gap: clamp(16px, 3vw, 32px);
     width: min(1180px, 100%); margin-inline: auto;
     padding: clamp(18px, 3vw, 34px);
+    box-sizing: border-box;
   }
-  @media (min-width: 940px) { .stage.with-aside { grid-template-columns: 1fr 320px; } }
+  @media (min-width: 960px) { .stage.with-aside { grid-template-columns: minmax(0, 1fr) 300px; } }
 
   .chat { display: flex; flex-direction: column; min-height: 0; gap: 18px; }
 }
@@ -203,7 +204,7 @@
   .card { padding: 15px; }
   .card h3 { font-size: var(--step--1); text-transform: uppercase; letter-spacing: 0.08em; color: var(--mist-faint); margin-bottom: 12px; font-weight: 600; }
 
-  .brain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(6px, 1fr)); gap: 1.5px; border-radius: 6px; overflow: hidden; }
+  .brain-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(6px, 1fr)); gap: 1.5px; border-radius: 6px; overflow: hidden; min-width: 0; }
   .brain-grid i {
     aspect-ratio: 1; border-radius: 1px;
     background: var(--cell, var(--night-2));
@@ -211,8 +212,8 @@
   }
 
   .meter { display: grid; gap: 7px; }
-  .meter .row { display: flex; justify-content: space-between; font-size: var(--step--1); color: var(--mist-dim); }
-  .meter .row b { color: var(--mist); font-variant-numeric: tabular-nums; }
+  .meter .row { display: flex; justify-content: space-between; gap: 10px; font-size: var(--step--1); color: var(--mist-dim); }
+  .meter .row b { color: var(--mist); font-variant-numeric: tabular-nums; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62%; }
   .bar { height: 6px; border-radius: 3px; background: var(--night-2); overflow: hidden; box-shadow: var(--ring); }
   .bar > span { display: block; height: 100%; background: var(--wing); border-radius: 3px; transition: width var(--settle); }
 
