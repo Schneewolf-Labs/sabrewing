@@ -207,6 +207,44 @@ def convert_shard(path, out, xbits):
                 out[base] = t                                 # bf16 passthrough
 
 
+# ---------- MTP head (mtp.safetensors) ----------
+# Each of the 8 MTP layers is a dense transformer block plus three extras
+# (embed_norm, hidden_norm, input_proj). transformers ignores the MTP head, so
+# there's no HF-name convention — we flatten to model.mtp.<N>.<...> reusing the
+# main-layer suffix mapping. Speculative decode verifies every drafted token
+# against the main model, so MTP fidelity affects speed, never output.
+
+def map_mtp_name(name):
+    m = re.match(r"model\.mtp\.layers\.(\d+)\.(.*)", name)
+    if not m:
+        return None
+    n, rest = m.group(1), m.group(2)
+    rest = rest.replace("transformer_block.", "")   # flatten the block
+    rest = "." + rest
+    for pat, rep in SUBS:
+        rest = re.sub(pat, rep, rest)
+    return f"model.mtp.{n}.{rest.lstrip('.')}"
+
+
+def convert_mtp(path, out, xbits):
+    with safe_open(path, framework="pt") as f:
+        for name in f.keys():
+            if ".mlp.experts." in name or "shared_experts" in name:
+                continue                              # MTP MLP is dense, no experts
+            base = map_mtp_name(name)
+            if base is None:
+                continue
+            if name.endswith(".transformer_block.mlp.w13_dn.weight"):
+                t = deinterleave(f.get_tensor(name), 0)   # [2I, D] -> [gate; up]
+                half = t.shape[0] // 2
+                pref = base.replace(".mlp.w13_dn.weight", "")
+                out[pref + ".mlp.gate_proj.weight"] = t[:half].contiguous()
+                out[pref + ".mlp.up_proj.weight"] = t[half:].contiguous()
+                continue
+            t = f.get_tensor(name)
+            out[base] = t.float() if F32_RE.search(base) else t   # bf16 passthrough
+
+
 AUX_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json",
              "special_tokens_map.json", "chat_template.jinja"]
 
@@ -393,11 +431,22 @@ def main():
     ap.add_argument("--delete-src", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-e2e", nargs=2, metavar=("HFDIR", "OUTBASE"))
+    ap.add_argument("--mtp", metavar="MTP_SAFETENSORS",
+                    help="convert the standalone MTP head into <outdir>/out-mtp.safetensors")
     a = ap.parse_args()
     if a.selftest:
         selftest(); return
     if a.selftest_e2e:
         selftest_e2e(*a.selftest_e2e); return
+    if a.mtp:
+        if not a.outdir:
+            ap.error("--mtp requires --outdir")
+        os.makedirs(a.outdir, exist_ok=True)
+        out = {}
+        convert_mtp(a.mtp, out, a.xbits)
+        save_file(out, os.path.join(a.outdir, "out-mtp.safetensors"))
+        print(f"MTP head -> {a.outdir}/out-mtp.safetensors ({len(out)} tensors)")
+        return
     if not a.indir or not a.outdir:
         ap.error("--indir and --outdir required")
     os.makedirs(a.outdir, exist_ok=True)
