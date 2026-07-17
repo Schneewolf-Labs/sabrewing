@@ -48,7 +48,7 @@ export default function App() {
   const servedByEngine = typeof window !== "undefined" && window.location.port !== "5173" && window.location.protocol.startsWith("http")
   const defaultBase = servedByEngine ? `${window.location.origin}/v1` : "http://127.0.0.1:8000/v1"
   const [baseUrl, setBaseUrl] = useState(() => {
-    const saved = stored(localStorage, "colibri.baseUrl", defaultBase)
+    const saved = stored(localStorage, "sabrewing.baseUrl", defaultBase)
     // migrate: a stored FACTORY default pointing at another origin would trip CORS
     // when the page is engine-served — upgrade it to same-origin once.
     if (servedByEngine && saved === "http://127.0.0.1:8000/v1" && defaultBase !== saved) return defaultBase
@@ -56,7 +56,7 @@ export default function App() {
   })
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
+  const [model, setModel] = useState(() => stored(localStorage, "sabrewing.model", "inkling-colibri"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(512)
   const [thinking, setThinking] = useState(false)
@@ -241,7 +241,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand-row">
           <div className="brand-mark"><Feather className="size-5" /></div>
-          <div><h1>colibrì</h1><p>local giant, tiny footprint</p></div>
+          <div><h1>sabrewing</h1><p>trillion-parameter models, your hardware</p></div>
         </div>
 
         <section className="side-section">
@@ -337,7 +337,7 @@ export default function App() {
               <div className="orb"><Feather /></div>
               <span className="eyebrow">COLIBRÌ ENGINE</span>
               <h2>Ask the giant.<br /><em>Keep the machine yours.</em></h2>
-              <p>Connect to a local colibrì server and stream responses directly from your hardware. Nothing leaves the endpoint you choose.</p>
+              <p>Connect to a local sabrewing server and stream responses directly from your hardware. Nothing leaves the endpoint you choose.</p>
               <div className="suggestions">
                 {["Explain how expert routing works", "Write a small C benchmark", "Compare RAM and VRAM caching"].map((item) => <button key={item} onClick={() => setDraft(item)}>{item}<ArrowUp className="size-3.5 rotate-45" /></button>)}
               </div>
@@ -347,7 +347,7 @@ export default function App() {
               {messages.map((item) => (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
-                  <div><div className="message-meta">{item.role === "user" ? "You" : "colibrì"}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                  <div><div className="message-meta">{item.role === "user" ? "You" : "sabrewing"}</div><div className="message-body">{item.content || <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
                 </article>
               ))}
               <div ref={bottomRef} />
@@ -358,7 +358,7 @@ export default function App() {
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{error}</div>}
           <div className="composer">
-            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Message colibrì…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+            <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Message sabrewing…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
             <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> Enter to send · Shift+Enter for newline</span>{loading ? <Button variant="destructive" size="icon" aria-label="Stop generation" onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label="Send message" disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
           </div>
         </div>

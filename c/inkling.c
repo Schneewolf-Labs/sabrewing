@@ -1250,6 +1250,65 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     free(ids);
 }
 
+/* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
+ * Same stdout lines glm.c emits for the web dashboard; the gateway parses
+ * them and the Brain/Profiling pages render live expert-tier state. */
+static void serve_hwinfo(Model *m) {
+    char cpu[256] = ""; int cores = 0; double rt = 0, ra = 0;
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) { char ln[256];
+        while (fgets(ln, sizeof(ln), ci)) if (!strncmp(ln, "model name", 10)) {
+            char *p = strchr(ln, ':'); if (p) { p++; while (*p == ' ') p++;
+            int n = (int)strlen(p); if (n > 0 && p[n-1] == '\n') p[--n] = 0;
+            snprintf(cpu, sizeof(cpu), "%s", p); } break; }
+        fclose(ci); }
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) { char ln[256]; double v = 0;
+        while (fgets(ln, sizeof(ln), mi)) {
+            if (sscanf(ln, "MemTotal: %lf", &v) == 1) rt = v/1e6;
+            if (sscanf(ln, "MemAvailable: %lf", &v) == 1) ra = v/1e6;
+        } fclose(mi); }
+    int ngpu = 0; double vram = 0;
+    const char *gpu = "";
+#ifdef COLI_CUDA
+    if (g_cuda) { ngpu = 1; vram = ink_cuda_total_bytes()/1e9; gpu = "CUDA device"; }
+#endif
+    (void)m;
+    printf("HWINFO %d %.1f %.1f %d %.1f %s|%s\n", cores, rt, ra, ngpu, vram, cpu[0]?cpu:"unknown", gpu);
+    fflush(stdout);
+}
+
+static void serve_tiers_emap(Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int nsp = 0, filled = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) { nsp++; filled += m->cache[i].n; }
+    int64_t I = c->moe_inter, D = c->hidden;
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+                  : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
+    /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM)<<6 | heat(6b: log2 usage) */
+    char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->sparse[i]) continue;
+        LCache *lc = &m->cache[i];
+        for (int e = 0; e < E; e++) {
+            int tier = 0;
+            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e && lc->slots[z].filled) { tier = 1; break; }
+            uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
+            int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
+            int b = (tier << 6) | heat;
+            hex[w++] = "0123456789abcdef"[b >> 4];
+            hex[w++] = "0123456789abcdef"[b & 15];
+        }
+    }
+    hex[w] = 0;
+    printf("EMAP %d %d %s\n", nsp, E, hex);
+    fflush(stdout); free(hex);
+}
+
 static void serve_loop(Model *m, Tok *T) {
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
@@ -1260,11 +1319,14 @@ static void serve_loop(Model *m, Tok *T) {
     fputs("\x01\x01READY\x01\x01\n", stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
     fflush(stdout);
+    serve_hwinfo(m);
+    serve_tiers_emap(m);
     for (;;) {
         while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q);
+        serve_tiers_emap(m);
         free(q.payload);
     }
 }

@@ -272,6 +272,13 @@ def parse_tool_calls(reply, tools=None):
         calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
     text = _BOX_RE.sub("", reply)
+    if ARCH == "inkling":
+        # thinking sections are reasoning, not answer; markers never reach clients
+        while INK_THINK in text:
+            pre, _, rest = text.partition(INK_THINK)
+            _, _, after = rest.partition(INK_TEXT)
+            text = pre + after
+        text = text.replace(INK_TEXT, "")
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
@@ -285,6 +292,51 @@ def parse_tool_calls(reply, tools=None):
 
 
 ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
+
+INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
+
+
+class InklingStreamSplit:
+    """Strips Inkling's content markers from the visible stream and withholds
+    <|content_thinking|> sections from `content` (they are reasoning, not
+    answer). Buffers partial markers across chunk boundaries so a marker split
+    between two DATA frames never leaks."""
+
+    def __init__(self, on_content):
+        self.on_content = on_content
+        self.mode = "content"
+        self.buf = ""
+
+    def feed(self, piece):
+        self.buf += piece
+        while True:
+            hits = [(i, m) for i, m in ((self.buf.find(INK_THINK), INK_THINK),
+                                        (self.buf.find(INK_TEXT), INK_TEXT)) if i >= 0]
+            if not hits:
+                hold = self._tail_hold()
+                out = self.buf[:len(self.buf) - hold] if hold else self.buf
+                self.buf = self.buf[len(self.buf) - hold:] if hold else ""
+                self._emit(out)
+                return
+            i, m = min(hits)
+            self._emit(self.buf[:i])
+            self.mode = "reasoning" if m == INK_THINK else "content"
+            self.buf = self.buf[i + len(m):]
+
+    def _tail_hold(self):
+        for k in range(min(len(self.buf), 24), 0, -1):
+            if INK_THINK.startswith(self.buf[-k:]) or INK_TEXT.startswith(self.buf[-k:]):
+                return k
+        return 0
+
+    def _emit(self, text):
+        if text and self.mode == "content":
+            self.on_content(text)
+
+    def close(self):
+        self._emit(self.buf)
+        self.buf = ""
+
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1016,6 +1068,8 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
+            splitter = InklingStreamSplit(emit) if ARCH == "inkling" else None
+
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
             if chat and tools:
@@ -1059,10 +1113,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    emit(chunk)
+                    (splitter.feed if splitter else emit)(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
                     lambda: not connected)
+                if splitter:
+                    splitter.close()
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)

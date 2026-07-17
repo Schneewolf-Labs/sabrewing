@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- sabrewing: a hummingbird mid-dive, wing swept like a blade -->
+  <g fill="#8b7cf6">
+    <path d="M14 8 C30 14 44 26 50 40 C46 38 40 36 34 36 C40 30 42 22 40 14 C34 20 28 24 22 24 C20 18 17 12 14 8 Z"/>
+    <path d="M50 40 C54 44 57 49 58 54 C53 52 48 51 44 51 C46 47 48 43 50 40 Z"/>
+    <circle cx="52" cy="42" r="2.4"/>
+    <path d="M53 43 L62 47 L54 46 Z"/>
+  </g>
+</svg>
