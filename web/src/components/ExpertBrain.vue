@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from "vue"
+import Profiling from "./Profiling.vue"
 import { fetchExperts, fetchHealth } from "../lib/api.js"
 
 const experts = ref(null)
@@ -57,6 +58,8 @@ onUnmounted(() => clearInterval(timer))
       </div>
       <p v-else class="stat" style="color: var(--mist-faint)">warming up — send a message</p>
     </div>
+
+    <Profiling />
 
     <div class="panel card" v-if="health">
       <h3>Machine</h3>

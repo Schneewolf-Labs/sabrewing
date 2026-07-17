@@ -259,6 +259,16 @@
   .field input[type="range"] { accent-color: var(--violet); height: 22px; }
   .reset { align-self: flex-start; color: var(--mist-faint); }
 
+
+  /* profiling phase bar */
+  .phase-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; box-shadow: var(--ring); margin-bottom: 12px; }
+  .phase-bar > span { transition: width var(--settle); }
+  .phase-legend { display: grid; gap: 6px; }
+  .phase-row { display: flex; align-items: center; gap: 8px; font-size: var(--step--1); color: var(--mist-dim); }
+  .phase-row .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .phase-row .phase-name { flex: 1; }
+  .phase-row b { color: var(--mist); font-variant-numeric: tabular-nums; }
+
   /* aside — the expert brain */
   .aside { display: flex; flex-direction: column; gap: 16px; }
   .card { padding: 15px; }

@@ -67,3 +67,12 @@ export async function fetchHealth() {
     return await r.json()
   } catch { return null }
 }
+
+// /profile -> { seq, turns: [{wall_s, prompt_tokens, completion_tokens,
+//   expert_disk_s, expert_wait_s, expert_matmul_s, attention_s, forwards}] }
+export async function fetchProfile() {
+  try {
+    const r = await fetch(`${base()}/profile`, { headers: authHeaders() })
+    return await r.json()
+  } catch { return null }
+}

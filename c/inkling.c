@@ -1267,6 +1267,8 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     kv_alloc(m, np + q->max_tok + 8);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
+    /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
+    double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
     float *logit = step(m, ids, np, 0, NULL, NULL);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
@@ -1299,6 +1301,10 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     double tot = (double)(m->hits - h0 + m->miss - m0);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
            dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
+     * expert_wait -> shared-expert compute, lm_head folded into 0). */
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
+           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
     fflush(stdout);
     free(ids);
 }
