@@ -273,12 +273,7 @@ def parse_tool_calls(reply, tools=None):
                       "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
     text = _BOX_RE.sub("", reply)
     if ARCH == "inkling":
-        # thinking sections are reasoning, not answer; markers never reach clients
-        while INK_THINK in text:
-            pre, _, rest = text.partition(INK_THINK)
-            _, _, after = rest.partition(INK_TEXT)
-            text = pre + after
-        text = text.replace(INK_TEXT, "")
+        text = strip_inkling_markers(text)   # thinking is reasoning, not answer
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
@@ -338,6 +333,15 @@ class InklingStreamSplit:
         self.buf = ""
 
 
+def strip_inkling_markers(text):
+    """Remove <|content_thinking|>…<|content_text|> sections and stray markers."""
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        _, _, after = rest.partition(INK_TEXT)
+        text = pre + after
+    return text.replace(INK_TEXT, "")
+
+
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None):
@@ -375,7 +379,10 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     if reasoning_effort in effort_map:
         eff = effort_map[reasoning_effort]
     else:
-        eff = 0.9 if enable_thinking else 0.2
+        # default OFF: at local decode speeds unrequested thinking burns the
+        # entire token budget before the answer starts (measured: max_tokens=24
+        # returned an empty reply after the thinking strip)
+        eff = 0.9 if enable_thinking else 0.0
     prompt.append(f"<|message_system|><|content_text|>Thinking effort level: "
                   f"{0 if eff == 0.0 else eff}<|end_message|>")
     prompt.append("<|message_model|>")
@@ -992,6 +999,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
                     self.client_disconnected)
                 text = "".join(output)
+                if ARCH == "inkling":
+                    text = strip_inkling_markers(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
