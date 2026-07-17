@@ -400,6 +400,37 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* teacher-forced NLL of full_ids[np..nfull): feed the REFERENCE token at each step
+ * (never the argmax), accumulate -log softmax(logits)[next_ref]. A loss meter for
+ * throughput experiments: same engine path as decode, so hit rate/speed stay
+ * comparable, but quality is measured as perplexity instead of exact-match.
+ * Cross-checked vs HF transformers bf16 on identical token ids: engine (int8
+ * experts) 12.11 ppl vs reference 12.25 (#108). Enabled by PPL=1. */
+static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
+    Cfg *c = &m->c;
+    m->max_t = nfull;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+    double nll = 0; int scored = 0;
+    float *logit = step(m, full, np, 0);              /* prefill on the prompt */
+    for (int i = np; i < nfull; i++) {
+        /* log softmax(logit)[full[i]] without materializing the softmax */
+        float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
+        double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
+        nll += -((double)logit[full[i]] - mx - log(Z));
+        scored++;
+        free(logit); logit = NULL;
+        if (i == nfull - 1) break;
+        logit = step(m, &full[i], 1, i);              /* teacher forcing */
+    }
+    if (logit) free(logit);
+    *nll_out = nll / scored;
+    return scored;
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -429,6 +460,19 @@ int main(int argc, char **argv) {
     printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
     printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+
+    if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
+        double nll; double t = now_s();
+        int scored = tf_nll(&m, full, nfull, np, &nll);
+        double dt = now_s() - t;
+        double tot = m.hits + m.miss;
+        printf("TF-NLL: %.4f nats/token over %d tokens  |  ppl = %.2f\n", nll, scored, exp(nll));
+        printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+        free(buf); free(arena);
+        return 0;
+    }
 
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();
