@@ -1,0 +1,109 @@
+# Trimmed from colibrì upstream's ci.yml/check.yml: Linux-focused (no Windows
+# jobs — the vendored glm.c Windows path is covered by upstream's own CI), plus
+# a sabrewing-specific job upstream doesn't have: the inkling token-exact
+# oracle against HF transformers, the same fixture `docs/inkling.md`
+# (Validation) describes. When tools/make_tiny_lora.py is present the oracle
+# also exercises the LoRA resident-merge and runtime-expert paths.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  engines:
+    name: Engines (Linux, CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ARCH=x86-64-v3: portable AVX2 baseline — hosted runners vary, and
+      # `native` would make the build depend on whichever CPU we drew.
+      - name: Build glm + inkling + olmoe
+        run: make -C c glm inkling olmoe ARCH=x86-64-v3
+      - name: C test suite
+        run: make -C c test-c ARCH=x86-64-v3
+
+  cuda-syntax:
+    name: CUDA syntax check (glm + inkling backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit (compiler only)
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          # v0.2.19's version table stops at 12.6.2 (same pin as upstream)
+          cuda: '12.6.2'
+          method: network
+          sub-packages: '["nvcc"]'
+      # No pipeline after nvcc: a `| head` would mask the exit status and the
+      # job could only ever be green (upstream's ci.yml learned this the hard
+      # way). No GPU on hosted runners — this proves the .cu files compile,
+      # not that the kernels behave on silicon.
+      - name: Compile CUDA backends (no GPU)
+        run: |
+          cd c
+          nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda.cu     -o /dev/null -Xcompiler=-Wall,-Wextra
+          nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null -Xcompiler=-Wall,-Wextra
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python test suite
+        run: make -C c test-python
+
+  web:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  inkling-oracle:
+    name: Inkling oracle (token-exact vs transformers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install torch (CPU) + transformers
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers safetensors
+      - name: Build inkling
+        run: make -C c inkling ARCH=x86-64-v3
+      - name: Tiny-model fixture + oracle (f32, bit-exact expert path)
+        run: |
+          cd c
+          python3 tools/make_tiny_inkling.py tiny_inkling
+          SNAP=tiny_inkling ./inkling 8 0 tiny_inkling/ref_inkling.json
+      # LoRA oracle: random Tinker-structure adapter + merged-model reference.
+      # Guarded on the tool's presence so this workflow is valid on branches
+      # that predate the lora work.
+      - name: LoRA fixture + oracle
+        run: |
+          cd c
+          if [ -f tools/make_tiny_lora.py ]; then
+            python3 tools/make_tiny_lora.py tiny_inkling tiny_lora
+            SNAP=tiny_inkling LORA=tiny_lora ./inkling 8 0 tiny_lora/ref_inkling_lora.json
+          else
+            echo "tools/make_tiny_lora.py not on this branch — skipped"
+          fi

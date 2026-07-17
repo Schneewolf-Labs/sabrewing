@@ -1425,6 +1425,11 @@ int main(int argc, char **argv) {
 #endif
     }
 #endif  /* !COLI_CUDA */
+#ifdef _WIN32
+    /* CRT text mode turns \n into \r\n, corrupting the byte-framed serve
+     * protocol (READY sentinel, DATA frames) — same fix as glm.c */
+    _setmode(fileno(stdout), O_BINARY);
+#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
