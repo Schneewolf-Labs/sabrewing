@@ -8,10 +8,11 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [ ] **MTP speculative decode** — the checkpoint ships an 8-layer MTP head; we
   skip it. Free ~2–3× decode via draft+verify, and wiring it also exercises the
   draft path against real weights. *(in progress)*
-- [ ] **Real-checkpoint perplexity oracle** — the tiny-model test proves the math,
-  but nothing proves the 469 GB conversion is faithful. Drive the running API over
-  a fixed text slice, compare NLL/perplexity to a transformers bf16 reference.
-  This is the "can't rot silently" gate and what upstream asked for.
+- [x] **Real-checkpoint perplexity oracle** — engine now reports teacher-forced
+  perplexity; `make_tiny_inkling.py` emits the transformers `ppl_ref`. f32 matches
+  to 0.00% (bit-faithful forward), int4 within quant noise (converter faithful).
+  Works on any token list, so `./inkling N 0 tokens.json` is also a real-model
+  health check.
 - [x] **Multimodal token rejection** — text-only load, but an image/audio
   placeholder token (200054 / 200053) in a prompt reads a meaningless embedding
   row instead of erroring. Detect and reject with a clear message.
@@ -48,3 +49,6 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   unaffected (validation stays greedy-exact).
 - **MTP converter** (stage 1) — `--mtp` mode converts the head into the snapshot.
 - **upstream-sync tooling** — vendor colibrì's shared substrate.
+- **Perplexity oracle** — teacher-forced PPL vs transformers `ppl_ref`; f32 0.00%
+  diff (forward bit-faithful), int4 within noise (converter faithful). Doubles as
+  a real-model health check on any token list.

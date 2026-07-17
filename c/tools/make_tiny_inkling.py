@@ -67,13 +67,21 @@ def main():
             ids, max_new_tokens=n_new, do_sample=False, use_cache=True
         )
         full = gen[0].tolist()
-        tf = model(torch.tensor([full], dtype=torch.long)).logits[0].argmax(-1).tolist()
+        logits = model(torch.tensor([full], dtype=torch.long)).logits[0]
+        tf = logits.argmax(-1).tolist()
+        # teacher-forced perplexity: mean NLL of each true next token, exp'd.
+        # Matches the engine's PPL exactly (same reduction), so it's the weight-
+        # faithfulness oracle — a broken conversion diverges here even when
+        # argmax still looks plausible.
+        logp = torch.log_softmax(logits[:-1].float(), dim=-1)
+        nxt = torch.tensor(full[1:], dtype=torch.long)
+        ppl = float(torch.exp(-logp.gather(1, nxt[:, None]).mean()))
 
     model.save_pretrained(out, safe_serialization=True)
-    ref = {"prompt_ids": prompt, "full_ids": full, "tf_pred": tf}
+    ref = {"prompt_ids": prompt, "full_ids": full, "tf_pred": tf, "ppl_ref": ppl}
     with open(f"{out}/ref_inkling.json", "w") as f:
         json.dump(ref, f)
-    print(f"saved tiny model + ref_inkling.json to {out}/")
+    print(f"saved tiny model + ref_inkling.json to {out}/  (transformers ppl={ppl:.4f})")
     print("continuation:", full[len(prompt):])
 
 

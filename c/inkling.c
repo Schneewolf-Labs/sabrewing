@@ -1022,7 +1022,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
  * non-NULL also writes the per-position argmax (teacher-forcing check). */
-static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, double *nll_sum) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) {
@@ -1047,13 +1047,24 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     m->kv_len = pos0 + S;
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
-    if (tf_out) {
+    if (tf_out || nll_sum) {
         for (int s = 0; s < S; s++) {
             rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
             for (int d = 0; d < D; d++) last[d] /= c->mup;
             matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
-            int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
-            tf_out[pos0 + s] = best;
+            if (tf_out) {
+                int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
+                tf_out[pos0 + s] = best;
+            }
+            /* teacher-forced NLL of the true next token: -log softmax(logit)[next] */
+            if (nll_sum && s < S-1) {
+                int nx = ids[s+1];
+                if (nx >= 0 && nx < c->unpad_vocab) {
+                    float mx = logit[0]; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > mx) mx = logit[i];
+                    double se = 0; for (int i = 0; i < c->unpad_vocab; i++) se += exp((double)(logit[i]-mx));
+                    *nll_sum += (mx + log(se)) - logit[nx];
+                }
+            }
         }
     }
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -1089,7 +1100,7 @@ static void kv_alloc(Model *m, int max_t) {
 /* greedy generation, olmoe.c-style */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
-    float *logit = step(m, prompt, np, 0, NULL);
+    float *logit = step(m, prompt, np, 0, NULL, NULL);
     int len = np;
     Cfg *c = &m->c;
     for (int s = 0; s < n_new; s++) {
@@ -1099,7 +1110,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         out[len++] = best;
         if (s == n_new - 1) break;
         int one = best;
-        logit = step(m, &one, 1, len - 1, NULL);
+        logit = step(m, &one, 1, len - 1, NULL, NULL);
     }
 }
 
@@ -1117,7 +1128,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
     double t0 = now_s(), t1 = 0;
-    float *logit = step(m, ids, np, 0, NULL);
+    float *logit = step(m, ids, np, 0, NULL, NULL);
     int len = np;
     char buf[512];
     for (int s = 0; s < n_new; s++) {
@@ -1131,7 +1142,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         int one = best;
         len++;
         if (s == n_new - 1) break;
-        logit = step(m, &one, 1, len - 1, NULL);
+        logit = step(m, &one, 1, len - 1, NULL, NULL);
     }
     double dt = now_s() - t1;
     int gen = len - np;
@@ -1256,7 +1267,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     kv_alloc(m, np + q->max_tok + 8);
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
-    float *logit = step(m, ids, np, 0, NULL);
+    float *logit = step(m, ids, np, 0, NULL, NULL);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
@@ -1281,7 +1292,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
-        logit = step(m, &tk, 1, len - 1, NULL);
+        logit = step(m, &tk, 1, len - 1, NULL, NULL);
     }
     free(logit);
     double dt = now_s() - t0;
@@ -1471,14 +1482,30 @@ int main(int argc, char **argv) {
     printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
     kv_alloc(&m, nfull + 8);
 
-    /* pass 1: teacher-forced argmax over the full reference sequence */
-    if (tfref && ntf == nfull) {
-        int *tf = malloc(nfull * sizeof(int));
-        float *lg = step(&m, full, nfull, 0, tf);
+    /* pass 1: teacher-forced perplexity (+ argmax match if tf_pred present).
+     * PPL validates the WEIGHTS — a broken conversion tanks perplexity even when
+     * argmax still looks plausible. Works on any token list (full_ids alone) so
+     * it doubles as a real-model health check; compares to ppl_ref if present. */
+    if (nfull > 1) {
+        int have_tf = tfref && ntf == nfull;
+        int *tf = have_tf ? malloc(nfull * sizeof(int)) : NULL;
+        double nll = 0;
+        float *lg = step(&m, full, nfull, 0, tf, &nll);
         free(lg);
-        int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
-        printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
-        free(tf);
+        double ppl = exp(nll / (nfull - 1));
+        if (have_tf) {
+            int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
+            printf("teacher-forced argmax: %d/%d match | perplexity: %.4f\n", ok, nfull, ppl);
+            free(tf);
+        } else {
+            printf("perplexity (%d tokens): %.4f\n", nfull, ppl);
+        }
+        jval *pr = json_get(ref, "ppl_ref");
+        if (pr && pr->t == J_NUM) {
+            double rel = fabs(ppl - pr->num) / pr->num;
+            printf("perplexity vs transformers ref %.4f: %.2f%% rel diff %s\n",
+                   pr->num, 100.0*rel, rel < 0.02 ? "[OK]" : rel < 0.10 ? "[quant-noise]" : "[FAIL]");
+        }
         state_reset(&m);
     }
 
