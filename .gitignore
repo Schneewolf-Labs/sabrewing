@@ -75,3 +75,7 @@ c/tests/test_uring
 c/inkling
 c/glm
 c/olmoe
+
+# but DO ship the built web UI so `swing api` works on clone
+!web/dist
+!web/dist/**

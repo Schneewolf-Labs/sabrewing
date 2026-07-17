@@ -4,9 +4,10 @@ import { streamChat, fetchModel } from "./lib/api.js"
 import ExpertBrain from "./components/ExpertBrain.vue"
 
 const model = ref("inkling-colibri")
-const messages = ref([])          // {role, content, think}
+const messages = ref([])          // {role, content, think, phase}
 const draft = ref("")
 const busy = ref(false)
+const reasoning = ref(localStorage.getItem("sabrewing.reasoning") === "1")
 const thread = ref(null)
 let controller = null
 
@@ -18,6 +19,11 @@ const PROMPTS = [
 ]
 
 onMounted(async () => { model.value = await fetchModel() })
+
+function toggleReasoning() {
+  reasoning.value = !reasoning.value
+  localStorage.setItem("sabrewing.reasoning", reasoning.value ? "1" : "0")
+}
 
 function autosize(e) {
   e.target.style.height = "auto"
@@ -33,28 +39,30 @@ async function send(text) {
   const content = (text ?? draft.value).trim()
   if (!content || busy.value) return
   draft.value = ""
-  messages.value.push({ role: "user", content, think: "" })
-  const turn = { role: "assistant", content: "", think: "" }
+  messages.value.push({ role: "user", content, think: "", phase: "done" })
+  // phase: reasoning models open in "thinking" and flip to "answering" on first
+  // content token; non-reasoning turns go straight to "answering".
+  const turn = { role: "assistant", content: "", think: "", phase: reasoning.value ? "thinking" : "answering" }
   messages.value.push(turn)
   busy.value = true
   controller = new AbortController()
   scrollDown()
 
-  const history = messages.value
-    .slice(0, -1)
-    .map((m) => ({ role: m.role, content: m.content }))
+  const history = messages.value.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
 
   try {
     await streamChat(history, {
       model: model.value,
       temperature: 0.7,
+      reasoning: reasoning.value,
       signal: controller.signal,
-      onToken: (t) => { turn.content += t; scrollDown() },
-      onThink: (t) => { if (t.trim() && t.trim() !== ".") turn.think += t },
+      onThink: (t) => { turn.phase = "thinking"; turn.think += t; scrollDown() },
+      onToken: (t) => { turn.phase = "answering"; turn.content += t; scrollDown() },
     })
   } catch (err) {
-    if (err.name !== "AbortError") turn.content += `\n\n⚠ ${err.message}`
+    if (err.name !== "AbortError") turn.content += `${turn.content ? "\n\n" : ""}⚠ ${err.message}`
   } finally {
+    turn.phase = "done"
     busy.value = false
     controller = null
   }
@@ -75,7 +83,10 @@ function reset() { messages.value = [] }
         </div>
       </div>
       <div class="spacer" />
-      <div class="stat"><span class="dot" :class="{ cold: !busy }" /> {{ busy ? "thinking" : "ready" }}</div>
+      <button class="toggle" :class="{ on: reasoning }" @click="toggleReasoning" :title="reasoning ? 'Reasoning on' : 'Reasoning off'">
+        <span class="knob" /> Reasoning
+      </button>
+      <div class="stat"><span class="dot" :class="{ cold: !busy }" /> {{ busy ? "generating" : "ready" }}</div>
       <button v-if="messages.length" class="ghost-btn" @click="reset">Clear</button>
     </header>
 
@@ -95,11 +106,17 @@ function reset() { messages.value = [] }
             <div class="who">{{ m.role === "user" ? "You" : "◈" }}</div>
             <div class="body">
               <div class="name">{{ m.role === "user" ? "You" : "sabrewing" }}</div>
-              <details v-if="m.think" class="think">
-                <summary>reasoning</summary>
-                <div class="think-body">{{ m.think }}</div>
+
+              <!-- reasoning: opens immediately while thinking, collapsible once answering -->
+              <details v-if="m.think || m.phase === 'thinking'" class="think" :open="m.phase === 'thinking'">
+                <summary>
+                  <span v-if="m.phase === 'thinking'" class="think-live">thinking<span class="typing"><i /><i /><i /></span></span>
+                  <span v-else>reasoning</span>
+                </summary>
+                <div class="think-body">{{ m.think || "…" }}</div>
               </details>
-              <div class="bubble">
+
+              <div v-if="m.content || m.phase !== 'thinking'" class="bubble">
                 <template v-if="m.content">{{ m.content }}</template>
                 <span v-else-if="busy && i === messages.length - 1" class="typing" aria-label="Generating"><i /><i /><i /></span>
               </div>

@@ -199,6 +199,31 @@
   }
   .ghost-btn:hover { color: var(--mist); box-shadow: inset 0 0 0 1px var(--violet-dim); }
 
+
+  /* reasoning toggle */
+  .toggle {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px 6px 8px; border-radius: 999px;
+    font-size: var(--step--1); color: var(--mist-faint);
+    box-shadow: var(--ring); transition: color var(--quick), box-shadow var(--quick);
+  }
+  .toggle .knob {
+    width: 26px; height: 15px; border-radius: 999px; flex: none;
+    background: var(--night-3); position: relative; transition: background var(--quick);
+  }
+  .toggle .knob::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 11px; height: 11px; border-radius: 50%; background: var(--mist-faint);
+    transition: transform var(--quick), background var(--quick);
+  }
+  .toggle.on { color: var(--mist); }
+  .toggle.on .knob { background: color-mix(in oklab, var(--violet) 55%, var(--night-3)); }
+  .toggle.on .knob::after { transform: translateX(11px); background: var(--violet); }
+  .toggle:hover { box-shadow: inset 0 0 0 1px var(--violet-dim); }
+
+  .think-live { display: inline-flex; align-items: center; gap: 6px; color: var(--violet); }
+  .think-live .typing i { width: 4px; height: 4px; margin: 0 1px; }
+
   /* aside — the expert brain */
   .aside { display: flex; flex-direction: column; gap: 16px; }
   .card { padding: 15px; }

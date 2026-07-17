@@ -11,11 +11,15 @@ export function getBase() {
 
 // Stream a chat completion. onToken(text) per content delta; onThink(text) per
 // reasoning delta. Returns the final usage/stats object. Aborts via signal.
-export async function streamChat(messages, { model, temperature, signal, onToken, onThink }) {
+const CTRL = /<\|[^|]*\|>/g   // any Inkling control marker, belt-and-suspenders
+
+export async function streamChat(messages, { model, temperature, reasoning, signal, onToken, onThink }) {
+  const body = { model, messages, temperature, stream: true, max_tokens: 1024 }
+  if (reasoning) body.reasoning_effort = "high"
   const res = await fetch(`${BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, temperature, stream: true, max_tokens: 1024 }),
+    body: JSON.stringify(body),
     signal,
   })
   if (!res.ok) throw new Error(`gateway ${res.status}: ${(await res.text()).slice(0, 200)}`)
@@ -37,8 +41,8 @@ export async function streamChat(messages, { model, temperature, signal, onToken
       let evt
       try { evt = JSON.parse(payload) } catch { continue }
       const d = evt.choices?.[0]?.delta || {}
-      if (d.content) onToken?.(d.content)
-      if (d.reasoning_content) onThink?.(d.reasoning_content)
+      if (d.content) onToken?.(d.content.replace(CTRL, ""))
+      if (d.reasoning_content) onThink?.(d.reasoning_content.replace(CTRL, ""))
     }
   }
 }
