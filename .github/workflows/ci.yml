@@ -84,10 +84,11 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          # cache:pip needs a file to hash — without this the action fails on
+          # a repo with no top-level requirements.txt/pyproject.toml
+          cache-dependency-path: c/tools/oracle-requirements.txt
       - name: Install torch (CPU) + transformers
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers safetensors
+        run: pip install -r c/tools/oracle-requirements.txt
       - name: Build inkling
         run: make -C c inkling ARCH=x86-64-v3
       - name: Tiny-model fixture + oracle (f32, bit-exact expert path)

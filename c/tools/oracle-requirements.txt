@@ -1,0 +1,9 @@
+# Deps for the tiny-model oracle fixtures (make_tiny_inkling.py /
+# make_tiny_lora.py) — CI's inkling-oracle job installs exactly this file,
+# and setup-python hashes it for the pip cache key. CPU torch: the oracle
+# is a tiny random-init model, no GPU wanted.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch
+transformers
+safetensors
