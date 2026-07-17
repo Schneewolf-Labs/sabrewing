@@ -1411,6 +1411,11 @@ int main(int argc, char **argv) {
     if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
+        /* LLVM libomp ignores GOMP_* and turns WAIT_POLICY=active into
+         * KMP_BLOCKTIME=infinite — a parked serve-mode engine then spins at
+         * 100% x nthreads forever (upstream glm.c #341). 200 ms keeps the team
+         * hot across back-to-back expert matmuls, asleep at the prompt. */
+        setenv("KMP_BLOCKTIME","200",0);
         setenv("OMP_PROC_BIND","close",0);
         setenv("OMP_DYNAMIC","FALSE",0);
         setenv("COLI_OMP_TUNED","1",1);

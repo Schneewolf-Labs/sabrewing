@@ -6000,6 +6000,14 @@ int main(int argc, char **argv){
        !getenv("COLI_CUDA") && !getenv("COLI_METAL")){
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
+        /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
+         * read GOMP_*: with OMP_WAIT_POLICY=active it sets KMP_BLOCKTIME=infinite,
+         * so the idle team SPINS FOREVER once generation ends — a serve-mode engine
+         * parked on stdin burns ~100% x nthreads (#341, measured 3000% on FreeBSD).
+         * 200 ms of blocktime keeps the team hot across back-to-back expert matmuls
+         * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
+         * the user's own setting authoritative. */
+        setenv("KMP_BLOCKTIME","200",0);
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
