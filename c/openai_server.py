@@ -364,7 +364,20 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
                   "developer": "<|message_system|>", "assistant": "<|message_model|>",
                   "tool": "<|message_tool|>"}
+    # Thinking effort — template default is 0.9, but at single-machine decode
+    # speeds unrequested reasoning burns the whole token budget before the answer
+    # starts, so we default it OFF unless the client asks.
+    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
+                  "high": 0.9, "max": 0.99}
+    if reasoning_effort in effort_map:
+        eff = effort_map[reasoning_effort]
+    else:
+        eff = 0.9 if enable_thinking else 0.0
+    effort_str = ("<|message_system|><|content_text|>Thinking effort level: "
+                  f"{0 if eff == 0.0 else eff}<|end_message|>")
+
     prompt = []
+    effort_emitted = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
@@ -372,26 +385,20 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         rtok = role_token.get(role)
         if rtok is None:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        # the template emits the effort hint inline, right before the first
+        # non-system message — not at the end. Position matters: it changes the
+        # exact token sequence the model was trained on.
+        if not effort_emitted and role not in ("system", "developer"):
+            prompt.append(effort_str)
+            effort_emitted = True
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
         prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
         if role == "assistant":
             prompt.append("<|content_model_end_sampling|>")
-    # Thinking effort: template default is 0.9, but at single-machine decode
-    # speeds unrequested thinking is mostly latency — default low unless the
-    # client asks (reasoning_effort) or sets enable_thinking.
-    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
-                  "high": 0.9, "max": 0.99}
-    if reasoning_effort in effort_map:
-        eff = effort_map[reasoning_effort]
-    else:
-        # default OFF: at local decode speeds unrequested thinking burns the
-        # entire token budget before the answer starts (measured: max_tokens=24
-        # returned an empty reply after the thinking strip)
-        eff = 0.9 if enable_thinking else 0.0
-    prompt.append(f"<|message_system|><|content_text|>Thinking effort level: "
-                  f"{0 if eff == 0.0 else eff}<|end_message|>")
-    prompt.append("<|message_model|>")
+    if not effort_emitted:                       # all-system edge case: fallback
+        prompt.append(effort_str)
+    prompt.append("<|message_model|>")           # add_generation_prompt
     return "".join(prompt)
 
 
