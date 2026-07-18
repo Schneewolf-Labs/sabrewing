@@ -297,8 +297,9 @@ class InklingStreamSplit:
     answer). Buffers partial markers across chunk boundaries so a marker split
     between two DATA frames never leaks."""
 
-    def __init__(self, on_content):
+    def __init__(self, on_content, on_reasoning=None):
         self.on_content = on_content
+        self.on_reasoning = on_reasoning
         self.mode = "content"
         self.buf = ""
 
@@ -325,10 +326,15 @@ class InklingStreamSplit:
         return 0
 
     def _emit(self, text):
-        if text and self.mode == "content":
-            text = _INK_MARKER.sub("", text)
-            if text:
-                self.on_content(text)
+        if not text:
+            return
+        text = _INK_MARKER.sub("", text)
+        if not text:
+            return
+        if self.mode == "content":
+            self.on_content(text)
+        elif self.on_reasoning:
+            self.on_reasoning(text)
 
     def close(self):
         self._emit(self.buf)
@@ -347,6 +353,20 @@ def strip_inkling_markers(text):
         text = pre + after
     return _INK_MARKER.sub("", text)
 
+
+def split_inkling(text):
+    """Split raw Inkling output into (content, reasoning). Thinking blocks
+    (<|content_thinking|>…<|content_text|>) become reasoning — including an
+    UNTERMINATED trailing block (budget ran out mid-thought), which partitions
+    to everything after the opener — so a think-only generation surfaces its
+    reasoning instead of collapsing to an empty answer."""
+    reasoning = []
+    while INK_THINK in text:
+        pre, _, rest = text.partition(INK_THINK)
+        think, _, after = rest.partition(INK_TEXT)
+        reasoning.append(think)
+        text = pre + after
+    return _INK_MARKER.sub("", text), _INK_MARKER.sub("", "".join(reasoning))
 
 
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -399,6 +419,14 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     if not effort_emitted:                       # all-system edge case: fallback
         prompt.append(effort_str)
     prompt.append("<|message_model|>")           # add_generation_prompt
+    # Thinking off: prefill the content channel. Without this the model can still
+    # sample <|content_thinking|> as its first token (the effort hint is only a
+    # soft signal), open a reasoning block, and burn the whole token budget before
+    # reaching <|content_text|> — which the splitter then strips to an empty
+    # answer. Ending the prompt at <|message_model|><|content_text|> forces content
+    # mode; it is exactly the sequence every non-thinking turn is trained on.
+    if eff == 0.0:
+        prompt.append("<|content_text|>")
     return "".join(prompt)
 
 
@@ -1012,19 +1040,25 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
                     self.client_disconnected)
                 text = "".join(output)
+                reasoning = ""
                 if ARCH == "inkling":
-                    text = strip_inkling_markers(text)
+                    text, reasoning = split_inkling(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
                     if calls:
                         message["tool_calls"] = calls
                     finish = "tool_calls" if calls else length_finish
                     choice = {"index": 0, "message": message, "logprobs": None, "finish_reason": finish}
                 else:
-                    choice = ({"index": 0, "message": {"role": "assistant", "content": text,
-                               "refusal": None}, "logprobs": None, "finish_reason": length_finish} if chat else
+                    _msg = {"role": "assistant", "content": text, "refusal": None}
+                    if reasoning:
+                        _msg["reasoning_content"] = reasoning
+                    choice = ({"index": 0, "message": _msg,
+                               "logprobs": None, "finish_reason": length_finish} if chat else
                               {"index": 0, "text": text, "logprobs": None, "finish_reason": length_finish})
                 self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
                     "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
@@ -1090,7 +1124,12 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
-            splitter = InklingStreamSplit(emit) if ARCH == "inkling" else None
+            def emit_reasoning(text):     # thinking → reasoning_content deltas (chat only)
+                event([{"index": 0, "delta": {"reasoning_content": text},
+                        "logprobs": None, "finish_reason": None}])
+
+            splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
+                        if ARCH == "inkling" else None)
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
