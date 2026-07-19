@@ -64,6 +64,35 @@ token-exact reference from `InklingForCausalLM`**. Validation is two-layer: a
 hand-rolled torch reference (reusing `InklingDecoderLayer`) for C-impl fidelity,
 and acceptance rate on the real model for recipe correctness.
 
+## Phase 2 — torch reference DONE
+
+`tools/make_tiny_mtp.py` builds a tiny MTP head (random weights in the real
+`model.mtp.{k}.*` layout) and a **module-0 teacher-forced reference**: module 0
+uses `t_{i+1}` (always committed), so its per-position predictions have no
+circular dependency and pin the recipe cleanly. The reference drives
+transformers' own `InklingDecoderLayer` for the block math.
+
+Decisions pinned while building it:
+- **Module 0's input hidden is the main model's PRE-final-norm hidden** (each
+  module re-norms via its own `hidden_norm`; post-norm would double-norm). In C
+  this is the residual stream `x` after the last layer, before `final_norm`.
+  Verified in the reference by swapping `model.model.norm` to identity.
+- Concat order is `[hidden ; embedding]` (`mtp_hidden_states_first=True`).
+- MTP modules share the main `final_norm` + `lm_head`; `mup` logit scaling applies.
+
+C integration points (mapped, ready to implement):
+- Load: replicate the `LD`/`LDW` pattern (model_init:604-631) with a
+  `model.mtp.%d.` prefix, reading from a **separate shards** for
+  `out-mtp.safetensors` (`MTP=<dir>`; defaults to the snapshot dir). Store each
+  module as `Layer` + `input_proj` (Wt) + `embed_norm` + `hidden_norm`.
+- KV/conv: give module `k` a slot at index `n_layers+k` — set
+  `c->local[n_layers+k]` (attention type), allocate `m->cs[j][n_layers+k]` and
+  extend `kv_alloc` to `n_layers+n_mtp`, so `attention()` is reused verbatim.
+- Expose the pre-final-norm hidden from `step()` (add an optional `float
+  *hid_out` out-param).
+- Oracle harness: `--mtp-oracle <ref_mtp.json>` runs main forward → pre-norm
+  hidden → module-0 forward over positions → compare argmax to `mtp0_pred`.
+
 ## Phase 2 — remaining work
 
 1. **C loader** `mtp_load()` — parse `out-mtp.safetensors` into 8 `Layer`
