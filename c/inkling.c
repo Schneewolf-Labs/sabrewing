@@ -101,6 +101,7 @@ typedef struct {
     uint8_t *p13, *p2; float *s13, *s2;   /* container: packed rows + row scales */
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
+    void *d13, *ds13, *d2, *ds2; int gpu; /* VRAM copies (device ptrs): int4 expert matmul on the GPU */
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
@@ -832,6 +833,13 @@ static void slot_fill(Model *m, int layer, Slot *s) {
  * Toggles: PIN=off (or PIN=0) skips cache warming entirely (no seeding, no
  * pins, cold LRU start); PIN_N=0 seeds the ranking from the history but pins
  * nothing; PIN=<path> uses an alternate history file; PIN_N=<n> pin depth. */
+/* sort pinned-expert indices by usage descending (for VRAM upload order) */
+static const uint32_t *g_pin_use;
+static int pin_use_desc(const void *a, const void *b) {
+    uint32_t ua = g_pin_use[*(const int*)a], ub = g_pin_use[*(const int*)b];
+    return ua < ub ? 1 : ua > ub ? -1 : 0;
+}
+
 static void pins_load(Model *m, const char *snap) {
     Cfg *c = &m->c; int E = c->n_experts;
     char up[2048];
@@ -885,6 +893,40 @@ static void pins_load(Model *m, const char *snap) {
         for (int j = 0; j < np; j++) slot_fill(m, pl[j], ps[j]);
         fprintf(stderr, "[pin] %d experts pinned (%d/layer) from %s in %.1fs\n",
                 np, m->npin, up, now_s()-t0);
+#ifdef COLI_CUDA
+        /* GPU expert tier: upload the hottest pinned experts (int4 container) into
+         * VRAM so their matmul runs on-device — the weight read is the bottleneck
+         * and VRAM feeds it ~12x DDR5. Budget = free VRAM after residents, less a
+         * 3 GB headroom for activation staging. CUDA_EXPERT_GB caps it. */
+        if (g_cuda && m->xq && m->rb13*2 == c->hidden && !(getenv("NOGPU"))) {
+            int64_t I = c->moe_inter, D = c->hidden;
+            size_t per = (size_t)m->rb13*2*I + (size_t)2*I*4 + (size_t)m->rb2*D + (size_t)D*4;
+            size_t budget = ink_cuda_free_bytes();
+            budget = budget > (3ULL<<30) ? budget - (3ULL<<30) : 0;
+            if (getenv("CUDA_EXPERT_GB")) {
+                size_t cap_b = (size_t)(atof(getenv("CUDA_EXPERT_GB"))*1e9);
+                if (cap_b < budget) budget = cap_b;
+            }
+            /* upload globally-hottest experts first, so every layer gets its top
+             * experts on-device instead of filling the first few layers */
+            int *ord = malloc((size_t)np*sizeof(int));
+            uint32_t *pu = malloc((size_t)np*sizeof(uint32_t));
+            for (int j = 0; j < np; j++) { ord[j] = j; pu[j] = m->eusage[pl[j]][ps[j]->eid]; }
+            g_pin_use = pu; qsort(ord, np, sizeof(int), pin_use_desc);
+            size_t used = 0; int nv = 0; double tv = now_s();
+            for (int oi = 0; oi < np && used + per <= budget; oi++) {
+                Slot *s = ps[ord[oi]];
+                s->d13  = ink_cuda_upload(s->p13, (size_t)m->rb13*2*I);
+                s->ds13 = ink_cuda_upload(s->s13, (size_t)2*I*4);
+                s->d2   = ink_cuda_upload(s->p2,  (size_t)m->rb2*D);
+                s->ds2  = ink_cuda_upload(s->s2,  (size_t)D*4);
+                if (s->d13 && s->ds13 && s->d2 && s->ds2) { s->gpu = 1; used += per; nv++; }
+            }
+            free(ord); free(pu);
+            fprintf(stderr, "[cuda] %d experts resident in VRAM (%.1f GB) in %.1fs\n",
+                    nv, used/1e9, now_s()-tv);
+        }
+#endif
     }
     free(tmp); free(ps); free(pl);
 }
@@ -1087,6 +1129,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             Slot *e = use[(int64_t)s*K + kk];
             /* gate+up (fused rows: gate then up) */
             if (m->xq) {
+#ifdef COLI_CUDA
+                if (q4 && e->gpu) ink_cuda_matmul_q4(g, xs, e->d13, e->ds13, 1, D, 2*I); else
+#endif
                 if (q4) matmul_q4(g, xs, e->p13, e->s13, D, 2*I);
                 else    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
             } else if (m->quant_bits) matmul_q(g, xs, e->q13, e->s13, D, 2*I);
@@ -1095,6 +1140,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
             /* down */
             if (m->xq) {
+#ifdef COLI_CUDA
+                if (q4 && e->gpu) ink_cuda_matmul_q4(hh, g, e->d2, e->ds2, 1, I, D); else
+#endif
                 if (q4) matmul_q4(hh, g, e->p2, e->s2, I, D);
                 else    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
             } else if (m->quant_bits) matmul_q(hh, g, e->q2, e->s2, I, D);
