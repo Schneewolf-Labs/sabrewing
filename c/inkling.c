@@ -681,7 +681,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     /* usage counters; seeded from a previous run's history when present */
     m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
-    if (!getenv("MTP") || strcmp(getenv("MTP"), "0")) mtp_load(m);
+    /* opt-in: the 10.5 GB draft head only loads when speculation is requested
+     * (MTP=1, or the --mtp-* / spec paths force-load it). Normal serve/decode
+     * pays nothing until the spec serve loop is wired up. */
+    if (getenv("MTP") && strcmp(getenv("MTP"), "0")) mtp_load(m);
     m->dense_load_s = now_s() - t0;
 }
 
@@ -1748,6 +1751,7 @@ int main(int argc, char **argv) {
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
     }
+    (void)cuda_q4_test;   /* only read under COLI_CUDA */
 
 #ifdef COLI_CUDA
     if (cuda_q4_test) {   /* GPU int4 GEMM vs CPU matmul_q4 (run with IDOT=0 for the scalar ref) */
@@ -1841,6 +1845,7 @@ int main(int argc, char **argv) {
     /* MTP chain teacher-forced oracle: main forward -> pre-norm hidden -> run the
      * module chain over positions, argmax at each depth vs the transformers ref. */
     if (mtp_oracle) {
+        if (!m.n_mtp) mtp_load(&m);   /* these modes force-load the head */
         if (!m.n_mtp) { fprintf(stderr, "[mtp-oracle] no MTP head in %s\n", snap); return 1; }
         jval *mpred = json_get(ref, "mtp_pred");
         int nmods = (mpred && mpred->t == J_ARR) ? mpred->len : 0;
@@ -1874,6 +1879,7 @@ int main(int argc, char **argv) {
      * the expected accepted draft length (the speculative speedup) using only the
      * validated teacher-forced chain — no serve loop required. */
     if (mtp_accept) {
+        if (!m.n_mtp) mtp_load(&m);   /* force-load the head */
         if (!m.n_mtp) { fprintf(stderr, "[mtp-accept] no MTP head in %s\n", snap); return 1; }
         int nt = 0; int *seq = full;                       /* prefer full_ids; else prompt_ids */
         if (seq) nt = nfull; else seq = read_int_array(ref, "prompt_ids", &nt);

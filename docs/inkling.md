@@ -3,7 +3,8 @@
 `c/inkling.c` runs [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling)
 (975B total / 41B active, Apache 2.0) with colibri's expert-streaming approach:
 dense weights resident (RAM or VRAM), routed experts streamed from disk with an
-LRU + pinned cache. Text-only; vision/audio encoders and the MTP head are not loaded.
+LRU + pinned cache. Text-only; vision/audio encoders are not loaded. The MTP
+draft head loads on demand for speculative decode (`MTP=1`; see below).
 
 ## Quickstart
 
@@ -83,7 +84,26 @@ ranking is barely ahead of plain LRU; hit rate (and therefore decode speed)
 grows toward the trained-prompt number as real-use history accumulates.
 
 Phase profile at high hit rates: ~90% CPU expert matmul — the next lever is
-expert compute on the GPU, not more I/O work.
+expert compute on the GPU, not more I/O work. The GPU int4 expert GEMM kernel
+(`ink_cuda_matmul_q4`) is in place and validated (`--cuda-q4-test`); the VRAM
+expert cache tier that feeds it is the remaining piece — see
+`docs/gpu-experts-design.md`.
+
+## Speculative decode (MTP)
+
+The checkpoint ships an 8-module MTP draft head (`out-mtp.safetensors`). The
+depth-0 drafter is wired and **lossless** (output identical to plain greedy) — on
+the real base head it accepts its next-next-token guess ~38.5% of the time, ~1.4×
+decode. It is **opt-in** (`MTP=1`) so a normal serve pays nothing for the 10.5 GB
+head until asked. The multi-depth chain (toward 2–3×) and sampling-serve wiring
+are pending — see `docs/mtp-design.md`. Diagnostics:
+
+```sh
+# per-depth acceptance on a token sequence (measures the speedup ceiling)
+MTP=1 SNAP=~/Models/inkling_i4 ./inkling 0 0 --mtp-accept tokens.json
+# token-exact vs the transformers reference on the tiny fixture
+SNAP=tiny_inkling ./inkling 8 0 --mtp-oracle tiny_inkling/ref_mtp.json
+```
 
 ## Chat serving & reasoning effort (OpenAI gateway)
 

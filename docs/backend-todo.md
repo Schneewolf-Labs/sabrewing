@@ -5,9 +5,14 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 
 ## 🔴 Correctness — quietly wrong or unverified
 
-- [ ] **MTP speculative decode** — the checkpoint ships an 8-layer MTP head; we
-  skip it. Free ~2–3× decode via draft+verify, and wiring it also exercises the
-  draft path against real weights. *(in progress)*
+- [~] **MTP speculative decode** — draft+verify with the shipped 8-module head.
+  Phase 1 (n-gram scaffolding + conv rollback) and depth-0 drafting are DONE and
+  lossless-validated; the depth-0 recipe is correct (real acceptance 38.5% → the
+  greedy `generate_spec_mtp` path is ~1.4×). Remaining: (a) the multi-depth chain
+  is still ~random for depth ≥1 — needs the checkpoint's `mtp_model.py` (not in
+  the public HF repo) to pin, would lift toward 2–3×; (b) wire the drafter into
+  the *sampling* serve loop (rejection sampling) and gate the head-load behind a
+  spec flag (currently opt-in via `MTP=1`). Full writeup: `docs/mtp-design.md`.
 - [x] **Real-checkpoint perplexity oracle** — engine now reports teacher-forced
   perplexity; `make_tiny_inkling.py` emits the transformers `ppl_ref`. f32 matches
   to 0.00% (bit-faithful forward), int4 within quant noise (converter faithful).
@@ -33,7 +38,11 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 
 ## 🟢 Performance — known, roadmapped (not loose ends)
 
-- [ ] GPU expert compute — ~90% of warm decode is CPU expert matmul
+- [~] GPU expert compute — ~90% of warm decode is CPU expert matmul. The int4
+  expert GEMM kernel (`ink_cuda_matmul_q4`) is DONE and validated token-exact vs
+  the CPU path (`--cuda-q4-test`). Next: the VRAM expert cache tier (hold hot
+  experts on-device so the kernel runs without per-token PCIe upload) + dispatch
+  in `moe()`. Design + steps: `docs/gpu-experts-design.md`.
 - [ ] mmap expert path — RAM ≥ model machines (the R740 story): page cache = expert cache
 - [ ] int8 residents — smaller-VRAM GPUs and 128 GB boxes
 - [ ] speculative cache warming — measure (token,layer,expert) routing predictability first
