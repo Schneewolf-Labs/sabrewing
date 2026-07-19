@@ -1735,7 +1735,7 @@ int main(int argc, char **argv) {
      * equivalent of -l (the gateway passes it through). */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
     const char *lora_dir = getenv("LORA");
-    int cap = -1, bits = 0, n_new = 256, npos = 0, mtp_oracle = 0, mtp_accept = 0;
+    int cap = -1, bits = 0, n_new = 256, npos = 0, mtp_oracle = 0, mtp_accept = 0, cuda_q4_test = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
@@ -1743,10 +1743,45 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mtp-oracle") && i+1 < argc) { mtp_oracle = 1; refpath = argv[++i]; }
         else if (!strcmp(argv[i], "--mtp-accept") && i+1 < argc) { mtp_accept = 1; refpath = argv[++i]; }
+        else if (!strcmp(argv[i], "--cuda-q4-test")) cuda_q4_test = 1;
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
     }
+
+#ifdef COLI_CUDA
+    if (cuda_q4_test) {   /* GPU int4 GEMM vs CPU matmul_q4 (run with IDOT=0 for the scalar ref) */
+        if (ink_cuda_init(getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0) != 0) {
+            fprintf(stderr, "[q4-test] CUDA init failed\n"); return 1; }
+        srand(1234);
+        int I = 6144, O = 6144;
+        uint8_t *packed = malloc((size_t)O*(I/2));
+        float *scale = malloc((size_t)O*4), *x = malloc((size_t)I*4);
+        for (size_t j = 0; j < (size_t)O*(I/2); j++) packed[j] = (uint8_t)(rand() & 0xFF);
+        for (int o = 0; o < O; o++) scale[o] = ((rand()%2000)-1000)/100000.f;
+        for (int i = 0; i < I; i++) x[i] = ((rand()%2000)-1000)/1000.f;
+        float *ycpu = malloc((size_t)O*4), *ygpu = malloc((size_t)O*4);
+        matmul_q4(ycpu, x, packed, scale, I, O);
+        void *dp = ink_cuda_upload(packed, (size_t)O*(I/2)), *ds = ink_cuda_upload(scale, (size_t)O*4);
+        if (!dp || !ds || ink_cuda_matmul_q4(ygpu, x, dp, ds, 1, I, O) != 0) {
+            fprintf(stderr, "[q4-test] GPU path failed\n"); return 1; }
+        double maxabs = 0, meany = 0;
+        for (int o = 0; o < O; o++) {
+            double d = fabs((double)ycpu[o] - ygpu[o]);
+            if (d > maxabs) maxabs = d;
+            meany += fabs((double)ycpu[o]);
+        }
+        meany /= O;
+        /* per-element relative error is meaningless on near-zero outputs; the
+         * meaningful metric is max abs error vs the output scale (f32 reorder). */
+        double rel = maxabs / (meany + 1e-9);
+        int ok = rel < 1e-3;
+        printf("q4 GPU vs CPU (I=%d O=%d): max abs %.2e, mean|y| %.3f, scaled-rel %.2e  %s\n",
+               I, O, maxabs, meany, rel, ok ? "[OK]" : "[FAIL]");
+        return ok ? 0 : 1;
+    }
+#endif
+
     int serve = getenv("SERVE") && *getenv("SERVE") == '1';
     if (cap < 0) cap = (prompt || pfile || serve) ? 0 : 16;   /* generate/serve default to RAM-sized auto cap */
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
