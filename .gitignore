@@ -10,7 +10,7 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
-c/glm
+c/colibri
 c/glm.exe
 c/olmoe
 c/inkling
@@ -73,7 +73,7 @@ c/tests/test_uring
 # build artifacts
 *.o
 c/inkling
-c/glm
+c/colibri
 c/olmoe
 
 # but DO ship the built web UI so `swing api` works on clone

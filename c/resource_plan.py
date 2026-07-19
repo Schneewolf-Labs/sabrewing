@@ -203,6 +203,22 @@ def physical_cpu_count():
     return os.cpu_count() or 1
 
 
+def cpu_socket_count():
+    """Return the number of physical CPU sockets visible to this process."""
+    if not sys.platform.startswith("linux"):
+        return 1
+    try:
+        result = subprocess.run(["lscpu", "-p=socket"], text=True,
+                                capture_output=True, check=True, timeout=5)
+        sockets = {int(line) for line in result.stdout.splitlines()
+                   if line and not line.startswith("#")}
+        if sockets:
+            return len(sockets)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 1
+
+
 POLICIES = {
     "quality": {"preserve_quantization": True, "preserve_router": True},
     "balanced": {"preserve_quantization": True, "preserve_router": True},
@@ -212,11 +228,12 @@ POLICIES = {
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
-               policy="quality", physical_cpus=None):
+               policy="quality", physical_cpus=None, cpu_sockets=None):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
+    cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     cfg = info["config"]
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
@@ -286,6 +303,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                    "quality_preserving": policy != "experimental-fast"},
         "model": {key: value for key, value in info.items() if key != "config"},
         "cpu": {"physical_cores": max(1, int(physical_cpus)),
+                "sockets": max(1, int(cpu_sockets)),
                 "thread_policy": "physical-cores"},
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
@@ -318,6 +336,10 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         # ("Affinity not supported on this configuration"): non impostarle li'.
         result.setdefault("OMP_PROC_BIND", "spread")
         result.setdefault("OMP_PLACES", "cores")
+    if sys.platform.startswith("linux") and plan["cpu"].get("sockets", 1) > 1:
+        # Selectively interleave large expert/dense slabs across memory controllers.
+        # Unlike blanket numactl interleave, this leaves CUDA staging buffers local.
+        result.setdefault("COLI_NUMA", "1")
     if plan["policy"]["name"] == "balanced":
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]

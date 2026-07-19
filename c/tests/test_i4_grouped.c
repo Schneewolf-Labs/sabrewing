@@ -18,7 +18,7 @@
  * index, a wrong group boundary or a swapped nibble cannot hide under it —
  * those are O(1) relative errors, not O(1e-6). */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static uint32_t rng_state=0xC0FFEEu;
