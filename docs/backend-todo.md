@@ -52,3 +52,12 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - **Perplexity oracle** — teacher-forced PPL vs transformers `ppl_ref`; f32 0.00%
   diff (forward bit-faithful), int4 within noise (converter faithful). Doubles as
   a real-model health check on any token list.
+- **LoRA adapter serving** (`c/lora.h`) — Tinker raw adapters: residents merge at
+  load (`W += (α/r)·B·A`, RNE into bf16), routed experts stay int4 with a resident
+  f32 low-rank correction hoisted out of the expert loop by linearity (<1% cost).
+  Token-exact oracle (`make_tiny_lora.py`) passes both paths, 0.00% ppl vs merged
+  transformers. `-l <dir>` / `LORA=<dir>` / gateway `--lora`.
+- **Gateway thinking-effort handling** — `reasoning_effort` off prefills the
+  content channel so the model can't open a thinking block and strand the answer
+  as empty (was a seed-dependent failure); thinking-on is surfaced as
+  `reasoning_content` in both stream and non-stream instead of being dropped.

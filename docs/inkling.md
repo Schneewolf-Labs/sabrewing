@@ -85,6 +85,34 @@ grows toward the trained-prompt number as real-use history accumulates.
 Phase profile at high hit rates: ~90% CPU expert matmul — the next lever is
 expert compute on the GPU, not more I/O work.
 
+## Chat serving & reasoning effort (OpenAI gateway)
+
+`openai_server.py` renders Inkling's chat template and exposes an
+OpenAI-compatible API (`--engine ./inkling --model <snapshot>`). Reasoning is
+controlled per request by `reasoning_effort`, mapped to Inkling's thinking hint:
+
+| `reasoning_effort` | thinking hint | behavior |
+|---|---|---|
+| unset / `none` | `0` | **thinking off** — the prompt is prefilled to the content channel (`<\|message_model\|><\|content_text\|>`) so the model answers directly |
+| `minimal` / `low` | 0.1 / 0.2 | brief reasoning |
+| `medium` | 0.7 | moderate reasoning |
+| `high` / `max` | 0.9 / 0.99 | full reasoning |
+
+The effort hint is only a *soft* signal. With it set to 0 but no prefill, the
+model can still sample `<\|content_thinking\|>` as its first token, open a
+reasoning block, and spend the entire `max_tokens` planning — never reaching
+`<\|content_text\|>`, which the marker splitter then strips to an empty answer
+(the failure is seed-dependent, so it looks intermittent). The content-channel
+prefill forecloses that when thinking is off, and is exactly the token sequence
+every non-thinking turn is trained on.
+
+When thinking is on, the reasoning is surfaced as `reasoning_content` (streamed
+as `reasoning_content` deltas, or in the final message's `reasoning_content`
+field) instead of being mixed into — or silently dropped from — the answer.
+Reasoning consumes the token budget, so pair `reasoning_effort: high` with a
+generous `max_tokens` or the whole budget can go to thinking before any answer
+is emitted.
+
 ## LoRA adapter serving (Tinker raw format)
 
 Fine-tune on [Tinker](https://thinkingmachines.ai/tinker), serve the adapter
@@ -133,5 +161,7 @@ dense gate_up, fused shared experts) plus a merged-model reference, and
 SNAP=tiny_inkling LORA=tiny_lora ./inkling 8 0 tiny_lora/ref_inkling_lora.json
 ```
 
-must reproduce it token-for-token — which pins down the name mapping, the
-fused row order, the alpha/r scale, and both application paths at once.
+reproduces it token-for-token (0.00% perplexity vs the merged transformers
+reference, 24/24 continuation tokens), which pins down the name mapping, the
+fused row order, the alpha/r scale, and both application paths at once. The
+oracle needs an Inkling-capable transformers (`>= 5.4`) to build the reference.
