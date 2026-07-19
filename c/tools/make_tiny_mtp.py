@@ -31,7 +31,10 @@ STD = 0.05
 
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else "tiny_inkling"
-    out = sys.argv[2] if len(sys.argv) > 2 else "tiny_mtp"
+    # write the head + ref INTO the snapshot dir, so the engine's shards index
+    # (st_init scans every *.safetensors) picks up model.mtp.* automatically —
+    # exactly how out-mtp.safetensors sits beside the real checkpoint.
+    out = sys.argv[2] if len(sys.argv) > 2 else src
     os.makedirs(out, exist_ok=True)
     torch.manual_seed(1)
 
@@ -83,7 +86,8 @@ def main():
             x = in_proj(cat)
             mask = torch.ones(1, 1, S-1, S-1, dtype=torch.bool).tril()   # True = attend (causal)
             hp = blk(x, attention_mask=mask)                  # [1,S-1,D]
-            logits = lm_head(final_norm(hp) / mup)
+            unpad = base.unpadded_vocab_size or base.vocab_size
+            logits = lm_head(final_norm(hp) / mup)[..., :unpad]   # engine emits over unpadded vocab
             pred = logits.argmax(-1)[0].tolist()
             if k == 0:
                 mod0_pred = pred

@@ -84,6 +84,12 @@ typedef struct {
     Wt sh_g, sh_u, sh_d;                  /* shared experts [ns][I,D] etc. */
 } Layer;
 
+/* MTP head module: a full (dense) Inkling block plus the three MTP-specific
+ * tensors. Module k predicts token t+k+1 from [hidden_norm(h) ; embed_norm(emb)]
+ * projected through in_proj; shares the main final_norm + lm_head. Its KV/conv
+ * live at index n_layers+k so attention()/sconv_apply() are reused verbatim. */
+typedef struct { Layer L; Wt in_proj; float *embed_norm, *hidden_norm; int inter; } MtpMod;
+
 /* ---------- routed-expert cache: LRU + optional pinned set ----------
  * Container snapshots keep the expert rows PACKED in RAM (int4 stays 4-bit:
  * ~28 MB/expert instead of ~57 unpacked, so the same budget caches twice the
@@ -107,6 +113,7 @@ typedef struct {
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
     Layer *L;
+    MtpMod *mtp; int n_mtp;              /* speculative-draft head (0 = absent) */
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
@@ -573,6 +580,8 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 
 static double mem_avail_bytes(void);
 
+static void mtp_load(Model *m);
+
 static void model_init(Model *m, const char *snap, int cap, int bits, const char *lora_dir) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
@@ -672,7 +681,65 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     /* usage counters; seeded from a previous run's history when present */
     m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
+    if (!getenv("MTP") || strcmp(getenv("MTP"), "0")) mtp_load(m);
     m->dense_load_s = now_s() - t0;
+}
+
+/* Load the MTP speculative-draft head (out-mtp.safetensors, indexed by the same
+ * shards as the main model). Each module reuses the Layer struct + the dense
+ * block primitives; its KV/conv live at slot n_layers+k so attention() and
+ * sconv_apply() are reused verbatim. MTP=0 disables. */
+static void mtp_load(Model *m) {
+    Cfg *c = &m->c; int D = c->hidden, K = c->conv_k;
+    char nm[320];
+    int nmax = 0;
+    for (int k = 0; c->n_layers + k < MAXL; k++) {
+        snprintf(nm, sizeof(nm), "model.mtp.%d.input_proj.weight", k);
+        if (!st_has(&m->S, nm)) break;
+        nmax = k + 1;
+    }
+    if (!nmax) return;
+    m->n_mtp = nmax;
+    m->mtp = calloc(nmax, sizeof(MtpMod));
+    for (int j = 0; j < 4; j++)
+        m->cs[j] = realloc(m->cs[j], (int64_t)(c->n_layers + nmax) * sizeof(float*));
+    for (int k = 0; k < nmax; k++) {
+        MtpMod *mm = &m->mtp[k]; Layer *l = &mm->L; int li = c->n_layers + k;
+        /* gpu_ok=0: keep the draft head resident in RAM. It is small and its
+         * forward is cheap, and on the real model VRAM is already ~full with the
+         * main bf16 residents — uploading 10 GB more would OOM the A6000. */
+        #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.mtp.%d." suffix,k); l->field = load_t(m,nm)
+        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.mtp.%d." suffix,k); l->field = load_w(m,nm,0)
+        LD(in_ln,  "input_layernorm.weight");
+        LD(post_ln,"post_attention_layernorm.weight");
+        LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
+        LDW(v, "self_attn.v_proj.weight"); LDW(r, "self_attn.r_proj.weight");
+        LDW(o, "self_attn.o_proj.weight");
+        LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
+        LD(relp, "self_attn.rel_logits_proj.proj");
+        LD(k_cw, "self_attn.k_sconv.conv1d.weight");
+        LD(v_cw, "self_attn.v_sconv.conv1d.weight");
+        LD(a_cw, "attn_sconv.conv1d.weight");
+        LD(m_cw, "mlp_sconv.conv1d.weight");
+        LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
+        snprintf(nm,sizeof(nm),"model.mtp.%d.mlp.global_scale",k); l->dgs = load_scalar(m,nm,1.f);
+        #undef LD
+        #undef LDW
+        snprintf(nm,sizeof(nm),"model.mtp.%d.input_proj.weight",k);  mm->in_proj     = load_w(m,nm,0);
+        snprintf(nm,sizeof(nm),"model.mtp.%d.embed_norm.weight",k);  mm->embed_norm  = load_t(m,nm);
+        snprintf(nm,sizeof(nm),"model.mtp.%d.hidden_norm.weight",k); mm->hidden_norm = load_t(m,nm);
+        snprintf(nm,sizeof(nm),"model.mtp.%d.mlp.gate_proj.weight",k);
+        mm->inter = (int)(st_numel(&m->S, nm) / D);
+        snprintf(nm,sizeof(nm),"model.mtp.%d.self_attn.rel_logits_proj.proj",k);
+        int ext = (int)(st_numel(&m->S, nm) / c->d_rel);
+        c->local[li] = (ext == c->window) ? 1 : 0;      /* sliding vs global */
+        int kvdim = L_KV(c,li) * L_HD(c,li);
+        for (int j = 0; j < 4; j++) {
+            int Cc = (j < 2) ? kvdim : D;
+            m->cs[j][li] = calloc((int64_t)Cc * (K-1), sizeof(float));
+        }
+    }
+    fprintf(stderr, "[mtp] %d draft modules loaded\n", nmax);
 }
 
 static double mem_avail_bytes(void) {
@@ -924,8 +991,8 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
 }
 
 /* ---------- dense MLP ---------- */
-static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
-    Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
+static void dense_mlp_i(Model *m, Layer *l, float *x, int S, float *out, int I) {
+    Cfg *c = &m->c; int D = c->hidden;
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
     matmul_w(g, x, l->dg, S, D, I);
     matmul_w(u, x, l->du, S, D, I);
@@ -933,6 +1000,9 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     matmul_w(out, g, l->dd, S, I, D);
     for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] *= l->dgs;
     free(g); free(u);
+}
+static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
+    dense_mlp_i(m, l, x, S, out, m->c.dense_inter);
 }
 
 /* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ----------
@@ -1048,7 +1118,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits of the last token (unpadded vocab). If tf_out is
  * non-NULL also writes the per-position argmax (teacher-forcing check). */
-static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, double *nll_sum) {
+static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, double *nll_sum, float *hid_out) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) {
@@ -1071,6 +1141,7 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, doubl
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos0 + S;
+    if (hid_out) memcpy(hid_out, x, (int64_t)S*D*sizeof(float));   /* pre-final-norm residual (MTP input) */
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
     if (tf_out || nll_sum) {
@@ -1103,7 +1174,7 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, doubl
 static void state_reset(Model *m) {
     Cfg *c = &m->c;
     m->kv_len = 0;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_layers + m->n_mtp; i++) {   /* MTP slots at n_layers+k too */
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++)
             memset(m->cs[j][i], 0, (int64_t)((j < 2) ? kvdim : c->hidden) * (c->conv_k-1) * sizeof(float));
@@ -1112,12 +1183,13 @@ static void state_reset(Model *m) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
+    int nl = c->n_layers + m->n_mtp;             /* MTP modules keep KV at n_layers+k */
     if (m->K && max_t <= m->max_t) return;   /* reuse across prompts when big enough */
-    if (m->K) for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
+    if (m->K) for (int i = 0; i < nl; i++) { free(m->K[i]); free(m->V[i]); }
     free(m->K); free(m->V);
     m->max_t = max_t;
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
+    m->K = calloc(nl, sizeof(float*)); m->V = calloc(nl, sizeof(float*));
+    for (int i = 0; i < nl; i++) {
         m->K[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
         m->V[i] = falloc((int64_t)L_KV(c,i) * max_t * L_HD(c,i));
     }
@@ -1126,7 +1198,7 @@ static void kv_alloc(Model *m, int max_t) {
 /* greedy generation, olmoe.c-style */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
-    float *logit = step(m, prompt, np, 0, NULL, NULL);
+    float *logit = step(m, prompt, np, 0, NULL, NULL, NULL);
     int len = np;
     Cfg *c = &m->c;
     for (int s = 0; s < n_new; s++) {
@@ -1136,8 +1208,57 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         out[len++] = best;
         if (s == n_new - 1) break;
         int one = best;
-        logit = step(m, &one, 1, len - 1, NULL, NULL);
+        logit = step(m, &one, 1, len - 1, NULL, NULL, NULL);
     }
+}
+
+/* ---------- MTP draft head ----------
+ * One MTP module = a dense Inkling block (same op sequence as step()'s layer
+ * loop) over the module's KV/conv slot li = n_layers+k. */
+static void mtp_block(Model *m, MtpMod *mm, int li, float *xin, int S, int pos0, float *xout) {
+    Cfg *c = &m->c; int D = c->hidden; Layer *l = &mm->L;
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    memcpy(xout, xin, (int64_t)S*D*sizeof(float));
+    for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, xout + (int64_t)s*D, l->in_ln, D, c->eps);
+    attention(m, l, li, nrm, S, pos0, tmp);
+    sconv_apply(tmp, S, D, l->a_cw, m->cs[2][li], c->conv_k, NULL);
+    for (int64_t j = 0; j < (int64_t)S*D; j++) xout[j] += tmp[j];
+    for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, xout + (int64_t)s*D, l->post_ln, D, c->eps);
+    dense_mlp_i(m, l, nrm, S, tmp, mm->inter);
+    sconv_apply(tmp, S, D, l->m_cw, m->cs[3][li], c->conv_k, NULL);
+    for (int64_t j = 0; j < (int64_t)S*D; j++) xout[j] += tmp[j];
+    free(nrm); free(tmp);
+}
+
+/* fuse [hidden_norm(h) ; embed_norm(emb(tok))] -> in_proj -> block input row */
+static void mtp_fuse(Model *m, MtpMod *mm, const float *h, int tok, float *xrow) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *e = malloc((size_t)D*sizeof(float)), *cat = malloc((size_t)2*D*sizeof(float));
+    wt_row_f32(m->embed, (int64_t)tok*D, e, D);
+    rmsnorm_row(e, e, mm->embed_norm, D, c->eps);
+    rmsnorm_row(cat, h, mm->hidden_norm, D, c->eps);        /* hidden first */
+    memcpy(cat + D, e, (size_t)D*sizeof(float));
+    matmul_w(xrow, cat, mm->in_proj, 1, 2*D, D);
+    free(e); free(cat);
+}
+
+/* module-0 teacher-forced oracle: predict t_{i+2} at positions i=0..S-2 from the
+ * main pre-norm hidden hid[i] and emb(tok[i+1]). Fills pred[0..S-2]. */
+static void mtp_module0_tf(Model *m, const int *tok, const float *hid, int S, int *pred) {
+    Cfg *c = &m->c; int D = c->hidden, P = S - 1;
+    MtpMod *mm = &m->mtp[0]; int li = c->n_layers;
+    float *xin = falloc((int64_t)P*D), *xout = falloc((int64_t)P*D);
+    for (int i = 0; i < P; i++) mtp_fuse(m, mm, hid + (int64_t)i*D, tok[i+1], xin + (int64_t)i*D);
+    mtp_block(m, mm, li, xin, P, 0, xout);
+    float *last = falloc(D), *logit = falloc(c->unpad_vocab);
+    for (int i = 0; i < P; i++) {
+        rmsnorm_row(last, xout + (int64_t)i*D, m->final_norm, D, c->eps);
+        for (int d = 0; d < D; d++) last[d] /= c->mup;
+        matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+        int best = 0; for (int v = 1; v < c->unpad_vocab; v++) if (logit[v] > logit[best]) best = v;
+        pred[i] = best;
+    }
+    free(xin); free(xout); free(last); free(logit);
 }
 
 /* ---------- speculative decode (Phase 1: n-gram draft + batched verify) ----------
@@ -1206,7 +1327,7 @@ static double generate_spec(Model *m, const int *prompt, int np, int n_new, int 
     int *batch = malloc((size_t)(1 + G) * sizeof(int));
     int *draft = malloc((size_t)G * sizeof(int));
 
-    float *logit = step(m, prompt, np, 0, NULL, NULL);
+    float *logit = step(m, prompt, np, 0, NULL, NULL, NULL);
     int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
     free(logit);
 
@@ -1219,7 +1340,7 @@ static double generate_spec(Model *m, const int *prompt, int np, int n_new, int 
         batch[0] = best; for (int i = 0; i < g; i++) batch[1 + i] = draft[i];
         int S = 1 + g;
         m->vck_on = 1;
-        step(m, batch, S, kv, tf, NULL);     /* verify: fills tf[kv..kv+g], conv ckpts */
+        step(m, batch, S, kv, tf, NULL, NULL);   /* verify: fills tf[kv..kv+g], conv ckpts */
         m->vck_on = 0; fwd++;
         int a = 0;
         while (a < g && tf[kv + a] == draft[a]) { out[kv + 1 + a] = draft[a]; a++; }
@@ -1247,7 +1368,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
     double t0 = now_s(), t1 = 0;
-    float *logit = step(m, ids, np, 0, NULL, NULL);
+    float *logit = step(m, ids, np, 0, NULL, NULL, NULL);
     int len = np;
     char buf[512];
     for (int s = 0; s < n_new; s++) {
@@ -1261,7 +1382,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         int one = best;
         len++;
         if (s == n_new - 1) break;
-        logit = step(m, &one, 1, len - 1, NULL, NULL);
+        logit = step(m, &one, 1, len - 1, NULL, NULL, NULL);
     }
     double dt = now_s() - t1;
     int gen = len - np;
@@ -1388,7 +1509,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     uint64_t h0 = m->hits, m0 = m->miss;
     /* per-turn phase snapshot for the PROF line (timers accumulate globally) */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
-    float *logit = step(m, ids, np, 0, NULL, NULL);
+    float *logit = step(m, ids, np, 0, NULL, NULL, NULL);
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
@@ -1413,7 +1534,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
-        logit = step(m, &tk, 1, len - 1, NULL, NULL);
+        logit = step(m, &tk, 1, len - 1, NULL, NULL, NULL);
     }
     free(logit);
     double dt = now_s() - t0;
@@ -1556,12 +1677,13 @@ int main(int argc, char **argv) {
      * equivalent of -l (the gateway passes it through). */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
     const char *lora_dir = getenv("LORA");
-    int cap = -1, bits = 0, n_new = 256, npos = 0;
+    int cap = -1, bits = 0, n_new = 256, npos = 0, mtp_oracle = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
         else if (!strcmp(argv[i], "-l") && i+1 < argc) lora_dir = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mtp-oracle") && i+1 < argc) { mtp_oracle = 1; refpath = argv[++i]; }
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
@@ -1621,6 +1743,25 @@ int main(int argc, char **argv) {
            m.c.n_kv, m.c.swa_kv, m.c.head_dim, m.c.window, m.c.d_rel, m.c.rel_extent,
            m.c.n_experts, m.c.n_shared, m.c.topk);
     printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
+
+    /* MTP module-0 teacher-forced oracle: main forward -> pre-norm hidden ->
+     * module-0 draft over positions, argmax vs the transformers reference. */
+    if (mtp_oracle) {
+        if (!m.n_mtp) { fprintf(stderr, "[mtp-oracle] no MTP head in %s\n", snap); return 1; }
+        int npred; int *mp = read_int_array(ref, "mtp0_pred", &npred);
+        int P = np - 1;
+        kv_alloc(&m, np + 8); state_reset(&m);
+        float *hid = falloc((int64_t)np * m.c.hidden);
+        float *lg = step(&m, pids, np, 0, NULL, NULL, hid); free(lg);
+        int *pred = malloc((size_t)(P > 0 ? P : 1) * sizeof(int));
+        mtp_module0_tf(&m, pids, hid, np, pred);
+        int match = 0;
+        printf("MTP mod-0 ref: "); for (int i=0;i<P;i++) printf("%d ", mp[i]);
+        printf("\nMTP mod-0 C  : "); for (int i=0;i<P;i++) { printf("%d ", pred[i]); if (i<npred && pred[i]==mp[i]) match++; }
+        printf("\nMTP module-0: %d/%d match %s\n", match, P, match==P ? "[OK]" : "[FAIL]");
+        free(hid); free(pred);
+        return (match == P) ? 0 : 1;
+    }
     kv_alloc(&m, nfull + 8);
 
     /* pass 1: teacher-forced perplexity (+ argmax match if tf_pred present).
@@ -1631,7 +1772,7 @@ int main(int argc, char **argv) {
         int have_tf = tfref && ntf == nfull;
         int *tf = have_tf ? malloc(nfull * sizeof(int)) : NULL;
         double nll = 0;
-        float *lg = step(&m, full, nfull, 0, tf, &nll);
+        float *lg = step(&m, full, nfull, 0, tf, &nll, NULL);
         free(lg);
         double ppl = exp(nll / (nfull - 1));
         if (have_tf) {
