@@ -93,6 +93,33 @@ C integration points (mapped, ready to implement):
 - Oracle harness: `--mtp-oracle <ref_mtp.json>` runs main forward → pre-norm
   hidden → module-0 forward over positions → compare argmax to `mtp0_pred`.
 
+## Phase 2 — recipe corrected & real-validated (depth 0)
+
+The inferred recipe was wrong in three norm-boundary places — all invisible to
+the self-consistent tiny oracle (C and the torch reference shared the wrong
+assumptions; a self-consistent test only catches *disagreements*). The real
+trained head, via `--mtp-accept`, exposed them. Corrected against vLLM's Day-0
+Inkling source (`vllm/models/inkling/nvidia/{mtp,model}.py`):
+
+1. **Embedding double-normed**: backbone `embed_norm` (whitening) THEN the depth's
+   own `embed_norm` (near-identity trim).
+2. **Input hidden is POST-final-norm**: the base `forward` returns
+   `self.norm(hidden)`, which is also the drafter's `previous_hidden_states`.
+3. **Output → `lm_head` directly**, no `final_norm` (mup is argmax-invariant).
+
+Result on the real base head (175 tokens of prose), depth-0 acceptance:
+**~3% → 38.5%**. Depth-0 alone is ~1.39x; the (imperfect) chain reaches ~1.48x.
+
+**Multi-depth chain is unresolved.** vLLM ports only depth 0 (raises on
+`spec_step_idx != 0`), and the checkpoint's reference `mtp_model.py` is not in the
+public HF repo, so the exact 8-module chaining can't be read off. Measured
+empirically (`--mtp-accept`, `MTP_MAIN_HIDDEN` toggle):
+- sequential (module k from module k-1's output): depths 1-7 ≈ 20% (partial signal)
+- parallel (all modules off the main hidden): depths 1-7 ≈ 1% (worse)
+So the chain is sequential but the exact hidden/position/norm handling for depth
+≥1 is still off. Needs the reference file, or more empirical search. Depth-0 is
+the solid, validated win.
+
 ## Phase 2 — remaining work
 
 1. **C loader** `mtp_load()` — parse `out-mtp.safetensors` into 8 `Layer`

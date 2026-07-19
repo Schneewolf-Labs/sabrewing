@@ -1812,7 +1812,9 @@ int main(int argc, char **argv) {
         memcpy(hk, hid, (int64_t)nt * D * sizeof(float));
         int *toks = malloc((size_t)nt * sizeof(int)), *pred = malloc((size_t)nt * sizeof(int));
         double chain = 1.0, exp_len = 1.0;
-        printf("MTP acceptance on %d tokens (%d depths):\n", nt, m.n_mtp);
+        int chain_main = getenv("MTP_MAIN_HIDDEN") != NULL;   /* modules off the main hidden vs chained */
+        printf("MTP acceptance on %d tokens (%d depths, hidden=%s):\n", nt, m.n_mtp,
+               chain_main ? "main" : "chained");
         for (int k = 0; k < m.n_mtp; k++) {
             int P = nt - (k + 1); if (P <= 0) break;
             for (int i = 0; i < P; i++) toks[i] = seq[i + k + 1];
@@ -1823,7 +1825,7 @@ int main(int argc, char **argv) {
             double ak = n ? (double)match / n : 0.0;
             chain *= ak; exp_len += chain;
             printf("  depth %d: accept %5.1f%% (%d/%d)  chained %5.1f%%\n", k, 100*ak, match, n, 100*chain);
-            memcpy(hk, hout, (int64_t)P * D * sizeof(float));
+            if (!chain_main) memcpy(hk, hout, (int64_t)P * D * sizeof(float));   /* else keep h^0 */
             free(hout);
         }
         printf("expected tokens/verify: %.2f (max %d)  -> ~%.2fx decode\n", exp_len, m.n_mtp + 1, exp_len);
