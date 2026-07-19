@@ -1372,6 +1372,46 @@ static double generate_spec(Model *m, const int *prompt, int np, int n_new, int 
     return fwd ? (double)n_new / (double)fwd : 0.0;
 }
 
+/* greedy speculative decode with the MTP depth-0 drafter (1 draft/round). Output
+ * is token-identical to generate(). Module 0 only ever processes CONFIRMED
+ * positions (draft input = [hid_confirmed ; emb(committed)]), so its KV/conv grow
+ * monotonically and never need rollback — the draft prediction is a pure read. */
+static double generate_spec_mtp(Model *m, const int *prompt, int np, int n_new, int *out) {
+    Cfg *c = &m->c; int D = c->hidden;
+    if (m->n_mtp < 1) return 0;
+    for (int i = 0; i < np; i++) out[i] = prompt[i];
+    int cap = np + n_new + 4;
+    MtpMod *mm = &m->mtp[0]; int li = c->n_layers;
+    float *hid = falloc((int64_t)cap * D);          /* confirmed main post-norm hiddens */
+    int *tf = calloc((size_t)cap, sizeof(int));
+    float *xin = falloc((int64_t)cap * D), *xout = falloc((int64_t)cap * D);
+    int *pr = malloc((size_t)cap * sizeof(int));
+
+    float *logit = step(m, prompt, np, 0, NULL, NULL, hid);     /* hid[0..np-1] */
+    int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
+    free(logit);
+
+    int kv = np, gen = 0, mtp_abs = 0; long fwd = 0;
+    while (gen < n_new) {
+        out[kv] = best; gen++;
+        if (gen >= n_new) break;
+        int p = kv - 1;                             /* module-0 draft position */
+        int s0 = mtp_abs, S = p - s0 + 1;           /* absorb the gap [mtp_abs..p], all confirmed */
+        for (int i = 0; i < S; i++) mtp_fuse(m, mm, hid + (int64_t)(s0+i)*D, out[s0+i+1], xin + (int64_t)i*D);
+        mtp_block(m, mm, li, xin, S, s0, xout);
+        mtp_head(m, xout, S, pr);
+        int draft0 = pr[S-1];                        /* candidate for position kv+1 */
+        mtp_abs = p + 1;
+        int batch[2] = { best, draft0 };
+        step(m, batch, 2, kv, tf, NULL, hid + (int64_t)kv*D);    /* hid[kv],hid[kv+1]; tf[kv],tf[kv+1] */
+        fwd++;
+        if (tf[kv] == draft0) { out[kv+1] = draft0; gen++; best = tf[kv+1]; kv += 2; }
+        else                  { best = tf[kv]; kv += 1; }
+    }
+    free(hid); free(tf); free(xin); free(xout); free(pr);
+    return fwd ? (double)n_new / (double)fwd : 0.0;
+}
+
 static const char *prompt_reject(Cfg *c, const int *ids, int np, int want);
 
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
@@ -1894,6 +1934,16 @@ int main(int argc, char **argv) {
             int ok = (sm == N); if (!ok) spec_ok = 0;
             printf("SPEC G=%d: %d/%d vs greedy | %.2f tok/verify | %.1f tok/s %s\n",
                    G, sm, N, tpf, dts>0?N/dts:0.0, ok ? "[LOSSLESS]" : "[DIVERGED]");
+            free(sout);
+        }
+        if (m.n_mtp >= 1) {                               /* MTP depth-0 drafter path */
+            state_reset(&m);
+            int *sout = malloc((size_t)(np + N) * sizeof(int));
+            double tpf = generate_spec_mtp(&m, pids, np, N, sout);
+            int sm = 0; for (int i = np; i < np + N; i++) if (sout[i] == gout[i]) sm++;
+            int ok = (sm == N); if (!ok) spec_ok = 0;
+            printf("SPEC MTP: %d/%d vs greedy | %.2f tok/verify %s\n",
+                   sm, N, tpf, ok ? "[LOSSLESS]" : "[DIVERGED]");
             free(sout);
         }
         free(gout);
