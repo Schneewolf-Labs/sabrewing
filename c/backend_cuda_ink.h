@@ -17,6 +17,10 @@ size_t ink_cuda_total_bytes(void);
 void  *ink_cuda_upload(const void *h, size_t n);   /* NULL = OOM/error */
 /* y[S,O] = x[S,I] @ W^T, W = device bf16 [O,I]; x,y host f32. 0 = ok */
 int    ink_cuda_matmul_bf16(float *y, const float *x, const void *W, int S, int I, int O);
+/* y[S,O] = x[S,I] @ dequant(W)^T, W = device packed int4 [O,I/2] + device f32
+ * row scales [O] (nibble-8, per-row scale). Matches CPU matmul_q4. 0 = ok */
+int    ink_cuda_matmul_q4(float *y, const float *x, const void *packed,
+                          const void *scale, int S, int I, int O);
 
 #ifdef __cplusplus
 }

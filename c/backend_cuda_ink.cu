@@ -95,3 +95,55 @@ extern "C" int ink_cuda_matmul_bf16(float *y, const float *x, const void *W, int
     memcpy(y, g_hy, yn);
     return 0;
 }
+
+/* Routed-expert int4 GEMM. Matches the CPU scalar matmul_q4 (IDOT=0) contract:
+ * packed nibbles (low = even col, high = odd col, value = nibble-8), per-output
+ * row f32 scale, f32 accumulate (no activation quantization). packed/scale are
+ * DEVICE pointers (a VRAM-resident expert). One warp per output row. */
+__global__ void mm_q4_kernel(const unsigned char * __restrict__ P,
+                             const float * __restrict__ scale,
+                             const float * __restrict__ x,
+                             float * __restrict__ y, int I, int O) {
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y;
+    if (o >= O) return;
+    const unsigned char *w = P + (size_t)o * (I >> 1);   /* I/2 bytes per output row */
+    const float *xs = x + (size_t)s * I;
+    int nb = I >> 1;
+    float acc = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        unsigned char byte = w[b];
+        acc += xs[2*b]     * (float)((int)(byte & 0xF) - 8)
+             + xs[2*b + 1] * (float)((int)(byte >> 4)  - 8);
+    }
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (!lane) y[(size_t)s * O + o] = acc * scale[o];
+}
+
+extern "C" int ink_cuda_matmul_q4(float *y, const float *x, const void *packed,
+                                  const void *scale, int S, int I, int O) {
+    if (!g_ok || (I & 1)) return -1;
+    size_t xn = (size_t)S * I * 4, yn = (size_t)S * O * 4;
+    if (xn > g_xcap) {
+        cudaFree(g_dx); cudaFreeHost(g_hx);
+        if (cudaMalloc(&g_dx, xn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hx, xn * 2) != cudaSuccess) { g_dx = g_hx = nullptr; g_xcap = 0; return -1; }
+        g_xcap = xn * 2;
+    }
+    if (yn > g_ycap) {
+        cudaFree(g_dy); cudaFreeHost(g_hy);
+        if (cudaMalloc(&g_dy, yn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hy, yn * 2) != cudaSuccess) { g_dy = g_hy = nullptr; g_ycap = 0; return -1; }
+        g_ycap = yn * 2;
+    }
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
+    mm_q4_kernel<<<grid, 128, 0, g_st>>>((const unsigned char *)packed, (const float *)scale,
+                                         g_dx, g_dy, I, O);
+    cudaMemcpyAsync(g_hy, g_dy, yn, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(y, g_hy, yn);
+    return 0;
+}

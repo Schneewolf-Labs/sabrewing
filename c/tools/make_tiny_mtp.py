@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Build a tiny Inkling MTP-head fixture for inkling.c's MTP draft forward.
+
+transformers drops the MTP head (`_keys_to_ignore_on_load_unexpected`), so there
+is no reference from InklingForCausalLM. We fabricate random MTP module weights
+in the real `model.mtp.{k}.*` tensor layout, then compute a *teacher-forced*
+reference for MTP module 0 by driving transformers' own InklingDecoderLayer — so
+the reference shares the block math but pins the C engine's name-mapping, fused
+rows, input_proj fusion, and shared-head arithmetic.
+
+Module 0 predicts t_{i+2} from [hidden_norm(h_i) ; embed_norm(emb(t_{i+1}))] where
+h_i is the main model's last-layer (pre-final-norm) hidden. t_{i+1} is always a
+committed token, so the teacher-forced check has no circular dependency.
+
+Usage: python3 make_tiny_mtp.py <tiny_model_dir> [outdir]
+Then:  SNAP=<tiny_model_dir> MTP=<outdir> ./inkling --mtp-oracle <outdir>/ref_mtp.json
+"""
+import copy
+import json
+import os
+import sys
+
+import torch
+from safetensors.torch import save_file
+
+from transformers import InklingForCausalLM, InklingTextConfig
+from transformers.models.inkling.modeling_inkling import InklingDecoderLayer, InklingRMSNorm
+
+STD = 0.05
+
+
+def main():
+    src = sys.argv[1] if len(sys.argv) > 1 else "tiny_inkling"
+    # write the head + ref INTO the snapshot dir, so the engine's shards index
+    # (st_init scans every *.safetensors) picks up model.mtp.* automatically —
+    # exactly how out-mtp.safetensors sits beside the real checkpoint.
+    out = sys.argv[2] if len(sys.argv) > 2 else src
+    os.makedirs(out, exist_ok=True)
+    torch.manual_seed(1)
+
+    model = InklingForCausalLM.from_pretrained(src, torch_dtype=torch.float32).eval()
+    base = model.config.get_text_config()
+    D = base.hidden_size
+
+    NM = 2  # tiny MTP modules
+    # MTP block config: dense MLP, global ("hybrid") attention, one layer.
+    bcfg = copy.deepcopy(base)
+    bcfg.num_hidden_layers = 1
+    bcfg.layer_types = ["hybrid"]
+    bcfg.mlp_layer_types = ["dense"]
+    bcfg.intermediate_size = base.intermediate_size            # dense width
+
+    prompt = [7, 42, 199, 3, 88, 154, 21, 60, 9, 133, 77, 245, 30, 61, 5, 200]
+    ids = torch.tensor([prompt], dtype=torch.long)
+
+    with torch.no_grad():
+        # MTP module 0's input is the main model's POST-final-norm hidden (vLLM:
+        # the base forward returns self.norm(hidden), which is also the drafter's
+        # previous_hidden_states). The module then applies its own hidden_norm.
+        h_pre = model.model(ids).last_hidden_state   # [1,S,D], post-final-norm
+        embed = model.get_input_embeddings()
+        lm_head = model.lm_head
+        mup = base.logits_mup_width_multiplier
+
+        tensors, preds = {}, []
+        h_chain = h_pre                                       # h^0 = main pre-norm hidden
+        for k in range(NM):
+            blk = InklingDecoderLayer(bcfg, 0).eval().float()
+            for p in blk.parameters():
+                p.data.normal_(0, STD)
+            in_proj = torch.nn.Linear(2 * D, D, bias=False); in_proj.weight.data.normal_(0, STD)
+            e_norm = InklingRMSNorm(D, base.rms_norm_eps); e_norm.weight.data.normal_(1, STD)
+            h_norm = InklingRMSNorm(D, base.rms_norm_eps); h_norm.weight.data.normal_(1, STD)
+
+            S = len(prompt)
+            # module k (depth k+1): [hidden_norm(h^k_i) ; embed_norm(emb(t_{i+k+1}))]
+            # at positions i=0..P-1, predicts t_{i+k+2}. Chain is same-position,
+            # previous-depth output (no shift).
+            P = S - (k + 1)
+            toks = ids[:, k+1 : k+1+P]                         # t_{i+k+1}, i=0..P-1
+            # depth layers see the BACKBONE-normed embedding, then their own trim
+            emb = e_norm(model.model.embed_norm(embed(toks)))  # [1,P,D]
+            hn = h_norm(h_chain[:, :P, :])                     # h^k at 0..P-1
+            cat = torch.cat([hn, emb], dim=-1)                 # hidden first
+            x = in_proj(cat)
+            mask = torch.ones(1, 1, P, P, dtype=torch.bool).tril()   # True = attend (causal)
+            hp = blk(x, attention_mask=mask)                   # h^{k+1}, [1,P,D]
+            unpad = base.unpadded_vocab_size or base.vocab_size
+            logits = lm_head(hp / mup)[..., :unpad]   # depth output -> lm_head directly (no final_norm)
+            preds.append(logits.argmax(-1)[0].tolist())
+            h_chain = hp                                       # same-position previous-depth
+
+            # collect weights under model.mtp.k.*
+            pref = f"model.mtp.{k}."
+            sd = blk.state_dict()
+            name_map = {
+                "self_attn.q_proj.weight": "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight": "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight": "self_attn.v_proj.weight",
+                "self_attn.r_proj.weight": "self_attn.r_proj.weight",
+                "self_attn.o_proj.weight": "self_attn.o_proj.weight",
+                "self_attn.q_norm.weight": "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight": "self_attn.k_norm.weight",
+                "self_attn.rel_logits_proj.proj": "self_attn.rel_logits_proj.proj",
+                "self_attn.k_sconv.conv1d.weight": "self_attn.k_sconv.conv1d.weight",
+                "self_attn.v_sconv.conv1d.weight": "self_attn.v_sconv.conv1d.weight",
+                "attn_sconv.conv1d.weight": "attn_sconv.conv1d.weight",
+                "mlp_sconv.conv1d.weight": "mlp_sconv.conv1d.weight",
+                "input_layernorm.weight": "input_layernorm.weight",
+                "post_attention_layernorm.weight": "post_attention_layernorm.weight",
+                "mlp.gate_proj.weight": "mlp.gate_proj.weight",
+                "mlp.up_proj.weight": "mlp.up_proj.weight",
+                "mlp.down_proj.weight": "mlp.down_proj.weight",
+            }
+            for a, b in name_map.items():
+                if a in sd:
+                    tensors[pref + b] = sd[a].clone().contiguous()
+            tensors[pref + "input_proj.weight"] = in_proj.weight.clone().contiguous()
+            tensors[pref + "embed_norm.weight"] = e_norm.weight.clone().contiguous()
+            tensors[pref + "hidden_norm.weight"] = h_norm.weight.clone().contiguous()
+            if "mlp.global_scale" in sd:
+                tensors[pref + "mlp.global_scale"] = sd["mlp.global_scale"].clone().contiguous()
+
+    save_file(tensors, f"{out}/out-mtp.safetensors")
+    ref = {"prompt_ids": prompt, "num_mtp_layers": NM,
+           "mtp0_pred": preds[0], "mtp_pred": preds}
+    with open(f"{out}/ref_mtp.json", "w") as f:
+        json.dump(ref, f)
+    print(f"saved {len(tensors)} MTP tensors + ref_mtp.json to {out}/  (NM={NM})")
+    for k, p in enumerate(preds):
+        print(f"module-{k} teacher-forced preds:", p)
+
+
+if __name__ == "__main__":
+    main()
