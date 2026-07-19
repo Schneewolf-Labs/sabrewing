@@ -21,7 +21,8 @@ REMOTE=colibri
 BRANCH=dev
 
 VENDORED=(
-  c/glm.c c/olmoe.c c/st.h c/json.h c/tok_unicode.h c/compat.h c/tier.h
+  c/colibri.c c/quant.h c/sample.h c/kv_persist.h c/telemetry.h c/uring.h
+  c/olmoe.c c/st.h c/json.h c/tok_unicode.h c/compat.h c/tier.h
   c/grammar.h c/schema_gbnf.h c/decode_batch.h c/backend_cuda.cu c/backend_cuda.h
   c/backend_metal.h c/backend_metal.mm c/backend_loader.c c/iobench.c
   c/coli c/doctor.py c/resource_plan.py

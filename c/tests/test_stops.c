@@ -20,7 +20,7 @@
  * Defense 2 is what makes this robust against checkpoints we don't control:
  * even with BOTH configs mutilated, a control token cannot leak into a reply. */
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static const char *TOKJSON =
