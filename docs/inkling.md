@@ -85,6 +85,37 @@ grows toward the trained-prompt number as real-use history accumulates.
 Phase profile at high hit rates: ~90% CPU expert matmul — the next lever is
 expert compute on the GPU, not more I/O work.
 
+## LoRA adapter serving (Tinker raw format)
+
+Fine-tune on [Tinker](https://thinkingmachines.ai/tinker), serve the adapter
+here — point the engine at the *raw* Tinker checkpoint directory
+(`adapter_model.safetensors` + `adapter_config.json`; not the PEFT
+conversion, which materializes Tinker's shared factors per-expert and is 3x
+the size for no gain):
+
+```sh
+SNAP=~/models/inkling_i4 ./inkling -l /path/to/adapter -p "..." -n 128
+python3 openai_server.py --engine ./inkling --model ~/models/inkling_i4 --lora /path/to/adapter
+```
+
+`LORA=<dir>` is the env equivalent of `-l`; `LORA_SCALE=<f>` multiplies the
+adapter's `alpha/r`. One adapter per process.
+
+Two application paths, split by weight class:
+
+- **Residents** (attention, dense MLP, shared experts, `lm_head`) are merged
+  into the resident weights at load — `W += (alpha/r)·B·A`, round-to-nearest-even
+  into bf16, before any CUDA upload. Zero decode-time cost.
+- **Routed experts** are *never* merged: a rank-32 delta is smaller than the
+  int4 quantization step, so baking it in would destroy most of the adapter
+  signal (and would mean requantizing the container per adapter). Instead the
+  A/B tensors stay resident (~19 GB f32 for the 975B rank-32 adapter, loaded
+  before the cache auto-cap sizes itself) and a low-rank correction wraps each
+  expert's int4 matmul. Tinker's factor sharing (one `lora_A` per layer for
+  gate/up, one `lora_B` per layer for down) keeps the overhead under 1% of
+  expert compute, and the expert LRU cache and pinned set are untouched —
+  hit rates and warmed histories carry over unchanged.
+
 ## Validation
 
 Every mode is token-exact against HF transformers on a tiny random-init oracle
@@ -93,3 +124,14 @@ scalar), bf16 residents on CPU, and bf16 residents through the CUDA kernel.
 The tokenizer (o200k family, auto-detected by `tok.h`) encodes 357/357 test
 strings identically to HF `tokenizers`. The converter round-trips a fabricated
 TML-layout checkpoint back through the engine exactly (`--selftest-e2e`).
+
+The LoRA paths have their own fixture: `c/tools/make_tiny_lora.py` builds a
+random adapter in the exact Tinker tensor structure (shared factors, fused
+dense gate_up, fused shared experts) plus a merged-model reference, and
+
+```sh
+SNAP=tiny_inkling LORA=tiny_lora ./inkling 8 0 tiny_lora/ref_inkling_lora.json
+```
+
+must reproduce it token-for-token — which pins down the name mapping, the
+fused row order, the alpha/r scale, and both application paths at once.

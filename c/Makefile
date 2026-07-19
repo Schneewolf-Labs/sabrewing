@@ -274,7 +274,7 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
+inkling$(EXE): inkling.c st.h lora.h json.h compat.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a

@@ -32,6 +32,7 @@
 #include <sys/select.h>
 #endif
 #include "st.h"
+#include "lora.h"
 #include "tok.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
@@ -100,6 +101,7 @@ typedef struct { Slot *slots; int n, cap; } LCache;
 typedef struct {
     Cfg c;
     shards S;
+    Lora lora;                            /* LoRA adapter (lora.on = active) */
     int quant_bits;                       /* 0 = f32 experts (oracle mode) */
     int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
     Wt embed, lm_head;
@@ -492,6 +494,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
     if (t->dtype == 0) {
         w.h = malloc(t->nbytes); if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
         pread_all(t->fd, w.h, t->nbytes, t->off);
+        lora_merge_resident(&m->lora, name, w.h, NULL, t->numel);
 #ifdef COLI_CUDA
         /* keep 3 GB VRAM headroom for the activation buffers + future tiers */
         if (g_cuda && gpu_ok && ink_cuda_free_bytes() > (size_t)t->nbytes + (3ULL<<30)) {
@@ -504,6 +507,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
     } else {
         w.f = falloc(t->numel);
         st_read_f32(&m->S, name, w.f, 0);
+        lora_merge_resident(&m->lora, name, NULL, w.f, t->numel);
     }
     return w;
 }
@@ -559,7 +563,7 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 
 static double mem_avail_bytes(void);
 
-static void model_init(Model *m, const char *snap, int cap, int bits) {
+static void model_init(Model *m, const char *snap, int cap, int bits, const char *lora_dir) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
@@ -567,6 +571,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
+    /* open the adapter before residents load: load_w merges resident deltas
+     * in place as each tensor is read (and before any CUDA upload) */
+    if (lora_dir) lora_open(&m->lora, lora_dir, c->n_layers, D, c->moe_inter,
+                            c->n_shared, c->n_experts, c->sparse);
 #ifdef COLI_CUDA
     if (!getenv("NOGPU")) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
@@ -619,6 +627,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
         }
     }
+    /* routed-expert LoRA tensors go resident now, BEFORE the cache auto-cap
+     * reads MemAvailable, so the budget accounts for them */
+    lora_load_experts(&m->lora);
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
     int64_t I = c->moe_inter, E = c->n_experts;
@@ -976,34 +987,39 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * halves the number of (expensive to open) parallel regions per expert */
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    /* LoRA runtime path: shared-A projections t1/t3 computed once per token;
+     * the per-expert down deltas accumulate as weighted rank-r vectors in
+     * acc2 so the shared B2 applies once per token, not once per expert */
+    Lora *lr = &m->lora;
+    int lact = lr->experts_on && lr->b1[layer];
+    float *lt = lact ? falloc(3*lr->r) : NULL;
+    float *lt1 = lt, *lt3 = lact ? lt + lr->r : NULL, *acc2 = lact ? lt + 2*lr->r : NULL;
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s*D;
         float *os = out + (int64_t)s*D;
         float *w = wgt + (int64_t)s*(K+ns);
         double te = now_s();
+        if (lact) { lora_moe_pre(lr, layer, xs, lt1, lt3); memset(acc2, 0, lr->r*sizeof(float)); }
         for (int kk = 0; kk < K; kk++) {
             Slot *e = use[(int64_t)s*K + kk];
+            /* gate+up (fused rows: gate then up) */
             if (m->xq) {
-                if (q4) {
-                    matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
-                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                    matmul_q4(hh, g, e->p2, e->s2, I, D);
-                } else {
-                    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
-                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
-                }
-            } else if (m->quant_bits) {
-                matmul_q(g, xs, e->q13, e->s13, D, 2*I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul_q(hh, g, e->q2, e->s2, I, D);
-            } else {
-                matmul(g, xs, e->f13, 1, D, 2*I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul(hh, g, e->f2, 1, I, D);
-            }
+                if (q4) matmul_q4(g, xs, e->p13, e->s13, D, 2*I);
+                else    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
+            } else if (m->quant_bits) matmul_q(g, xs, e->q13, e->s13, D, 2*I);
+            else                      matmul(g, xs, e->f13, 1, D, 2*I);
+            if (lact) lora_moe_gu(lr, layer, e->eid, lt1, lt3, g);
+            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+            /* down */
+            if (m->xq) {
+                if (q4) matmul_q4(hh, g, e->p2, e->s2, I, D);
+                else    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
+            } else if (m->quant_bits) matmul_q(hh, g, e->q2, e->s2, I, D);
+            else                      matmul(hh, g, e->f2, 1, I, D);
+            if (lact) lora_moe_down_acc(lr, layer, e->eid, g, w[kk], acc2);
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
+        if (lact) lora_moe_down_apply(lr, layer, acc2, os);
         double ts = now_s(); m->t_expert += ts - te;
         /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
         for (int j = 0; j < ns; j++) {
@@ -1016,7 +1032,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         m->t_shared += now_s() - ts;
     }
     free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
-    free(g); free(hh);              /* u aliases g+I */
+    free(g); free(hh); free(lt);    /* u aliases g+I */
 }
 
 /* ---------- one forward pass over S new tokens ----------
@@ -1432,12 +1448,16 @@ int main(int argc, char **argv) {
 #endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
-    /* flags: -p "prompt" [-n N] -> generate mode; positional: [cap] [bits] [ref.json] */
+    /* flags: -p "prompt" [-n N] [-l lora_dir] -> generate mode;
+     * positional: [cap] [bits] [ref.json]. LORA=<dir> env is the serve-mode
+     * equivalent of -l (the gateway passes it through). */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
+    const char *lora_dir = getenv("LORA");
     int cap = -1, bits = 0, n_new = 256, npos = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
+        else if (!strcmp(argv[i], "-l") && i+1 < argc) lora_dir = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
@@ -1448,10 +1468,11 @@ int main(int argc, char **argv) {
     if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
 
     if (prompt || pfile || serve) {
-        Model m; model_init(&m, snap, cap, bits);
+        Model m; model_init(&m, snap, cap, bits, lora_dir);
         if (!serve)
-            printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
-                   m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
+            printf("== Inkling C engine, %d layers, experts @ %s%s, cache %d/layer ==\n",
+                   m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32",
+                   m.lora.on ? " + lora" : "", m.cache[0].cap);
         pins_load(&m, snap);
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -1488,9 +1509,10 @@ int main(int argc, char **argv) {
     int *tfref = read_int_array(ref,"tf_pred",&ntf);
     int ngen = nfull - np;
 
-    Model m; model_init(&m, snap, cap, bits);
-    printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s ==\n",
-           cap, m.xq ? "container (int4/int8 + .qs)" : bits ? "int (runtime quant)" : "f32");
+    Model m; model_init(&m, snap, cap, bits, lora_dir);
+    printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s%s ==\n",
+           cap, m.xq ? "container (int4/int8 + .qs)" : bits ? "int (runtime quant)" : "f32",
+           m.lora.on ? " + lora" : "");
     printf("cfg: D=%d L=%d V=%d(%d) heads=%d/%d kv=%d/%d hd=%d win=%d d_rel=%d ext=%d E=%d+%d topk=%d\n",
            m.c.hidden, m.c.n_layers, m.c.vocab, m.c.unpad_vocab, m.c.n_heads, m.c.swa_heads,
            m.c.n_kv, m.c.swa_kv, m.c.head_dim, m.c.window, m.c.d_rel, m.c.rel_extent,

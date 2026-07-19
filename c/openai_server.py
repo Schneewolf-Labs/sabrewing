@@ -1286,6 +1286,8 @@ def main():
     parser.add_argument("--engine", default=str(HERE / "glm"))
     parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
+    parser.add_argument("--lora", default=os.environ.get("LORA"),
+                        help="LoRA adapter directory (Tinker raw format; inkling engine only)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
@@ -1309,6 +1311,9 @@ def main():
             ARCH = "glm"
     if args.model_id is None:
         args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
+    if args.lora:
+        # the engine reads LORA from its environment (serve-mode twin of -l)
+        os.environ["LORA"] = str(args.lora)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
