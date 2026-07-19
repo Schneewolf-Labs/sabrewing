@@ -66,9 +66,8 @@ def main():
         lm_head = model.lm_head
         mup = base.logits_mup_width_multiplier
 
-        modules, tensors = [], {}
-        h_chain = h_pre
-        mod0_pred = None
+        tensors, preds = {}, []
+        h_chain = h_pre                                       # h^0 = main pre-norm hidden
         for k in range(NM):
             blk = InklingDecoderLayer(bcfg, 0).eval().float()
             for p in blk.parameters():
@@ -78,20 +77,21 @@ def main():
             h_norm = InklingRMSNorm(D, base.rms_norm_eps); h_norm.weight.data.normal_(1, STD)
 
             S = len(prompt)
-            # module k teacher-forced over positions 0..S-2 (needs t_{i+1})
-            toks = ids[:, 1:]                                  # t_{i+1}, i=0..S-2
-            emb = e_norm(embed(toks))                          # [1,S-1,D]
-            hn = h_norm(h_chain[:, :S-1, :])                   # [1,S-1,D]
+            # module k (depth k+1): [hidden_norm(h^k_i) ; embed_norm(emb(t_{i+k+1}))]
+            # at positions i=0..P-1, predicts t_{i+k+2}. Chain is same-position,
+            # previous-depth output (no shift).
+            P = S - (k + 1)
+            toks = ids[:, k+1 : k+1+P]                         # t_{i+k+1}, i=0..P-1
+            emb = e_norm(embed(toks))                          # [1,P,D]
+            hn = h_norm(h_chain[:, :P, :])                     # h^k at 0..P-1
             cat = torch.cat([hn, emb], dim=-1)                 # hidden first
             x = in_proj(cat)
-            mask = torch.ones(1, 1, S-1, S-1, dtype=torch.bool).tril()   # True = attend (causal)
-            hp = blk(x, attention_mask=mask)                  # [1,S-1,D]
+            mask = torch.ones(1, 1, P, P, dtype=torch.bool).tril()   # True = attend (causal)
+            hp = blk(x, attention_mask=mask)                   # h^{k+1}, [1,P,D]
             unpad = base.unpadded_vocab_size or base.vocab_size
             logits = lm_head(final_norm(hp) / mup)[..., :unpad]   # engine emits over unpadded vocab
-            pred = logits.argmax(-1)[0].tolist()
-            if k == 0:
-                mod0_pred = pred
-            h_chain = torch.nn.functional.pad(hp, (0, 0, 1, 0))  # shift for next module's h
+            preds.append(logits.argmax(-1)[0].tolist())
+            h_chain = hp                                       # same-position previous-depth
 
             # collect weights under model.mtp.k.*
             pref = f"model.mtp.{k}."
@@ -125,11 +125,13 @@ def main():
                 tensors[pref + "mlp.global_scale"] = sd["mlp.global_scale"].clone().contiguous()
 
     save_file(tensors, f"{out}/out-mtp.safetensors")
-    ref = {"prompt_ids": prompt, "num_mtp_layers": NM, "mtp0_pred": mod0_pred}
+    ref = {"prompt_ids": prompt, "num_mtp_layers": NM,
+           "mtp0_pred": preds[0], "mtp_pred": preds}
     with open(f"{out}/ref_mtp.json", "w") as f:
         json.dump(ref, f)
     print(f"saved {len(tensors)} MTP tensors + ref_mtp.json to {out}/  (NM={NM})")
-    print("module-0 teacher-forced preds:", mod0_pred)
+    for k, p in enumerate(preds):
+        print(f"module-{k} teacher-forced preds:", p)
 
 
 if __name__ == "__main__":

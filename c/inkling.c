@@ -1242,23 +1242,33 @@ static void mtp_fuse(Model *m, MtpMod *mm, const float *h, int tok, float *xrow)
     free(e); free(cat);
 }
 
-/* module-0 teacher-forced oracle: predict t_{i+2} at positions i=0..S-2 from the
- * main pre-norm hidden hid[i] and emb(tok[i+1]). Fills pred[0..S-2]. */
-static void mtp_module0_tf(Model *m, const int *tok, const float *hid, int S, int *pred) {
-    Cfg *c = &m->c; int D = c->hidden, P = S - 1;
-    MtpMod *mm = &m->mtp[0]; int li = c->n_layers;
-    float *xin = falloc((int64_t)P*D), *xout = falloc((int64_t)P*D);
-    for (int i = 0; i < P; i++) mtp_fuse(m, mm, hid + (int64_t)i*D, tok[i+1], xin + (int64_t)i*D);
-    mtp_block(m, mm, li, xin, P, 0, xout);
+/* MTP head logits at each of P positions: shared final_norm + mup + lm_head. */
+static void mtp_head(Model *m, const float *hp, int P, int *pred) {
+    Cfg *c = &m->c; int D = c->hidden;
     float *last = falloc(D), *logit = falloc(c->unpad_vocab);
     for (int i = 0; i < P; i++) {
-        rmsnorm_row(last, xout + (int64_t)i*D, m->final_norm, D, c->eps);
+        rmsnorm_row(last, hp + (int64_t)i*D, m->final_norm, D, c->eps);
         for (int d = 0; d < D; d++) last[d] /= c->mup;
         matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
         int best = 0; for (int v = 1; v < c->unpad_vocab; v++) if (logit[v] > logit[best]) best = v;
         pred[i] = best;
     }
-    free(xin); free(xout); free(last); free(logit);
+    free(last); free(logit);
+}
+
+/* module k teacher-forced: input h^k rows hin[P*D] + tokens toks[P] (t_{i+k+1});
+ * writes h^{k+1} to hout[P*D] and per-position argmax to pred[P] (if non-NULL).
+ * Resets the module's own conv/KV slot first (fresh teacher-forced pass). */
+static void mtp_module_tf(Model *m, int k, const float *hin, const int *toks, int P, float *hout, int *pred) {
+    Cfg *c = &m->c; int D = c->hidden;
+    MtpMod *mm = &m->mtp[k]; int li = c->n_layers + k;
+    float *xin = falloc((int64_t)P*D);
+    for (int i = 0; i < P; i++) mtp_fuse(m, mm, hin + (int64_t)i*D, toks[i], xin + (int64_t)i*D);
+    int kvdim = L_KV(c,li)*L_HD(c,li);
+    for (int j = 0; j < 4; j++) memset(m->cs[j][li], 0, (int64_t)((j<2)?kvdim:D)*(c->conv_k-1)*sizeof(float));
+    mtp_block(m, mm, li, xin, P, 0, hout);
+    if (pred) mtp_head(m, hout, P, pred);
+    free(xin);
 }
 
 /* ---------- speculative decode (Phase 1: n-gram draft + batched verify) ----------
@@ -1744,23 +1754,35 @@ int main(int argc, char **argv) {
            m.c.n_experts, m.c.n_shared, m.c.topk);
     printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
 
-    /* MTP module-0 teacher-forced oracle: main forward -> pre-norm hidden ->
-     * module-0 draft over positions, argmax vs the transformers reference. */
+    /* MTP chain teacher-forced oracle: main forward -> pre-norm hidden -> run the
+     * module chain over positions, argmax at each depth vs the transformers ref. */
     if (mtp_oracle) {
         if (!m.n_mtp) { fprintf(stderr, "[mtp-oracle] no MTP head in %s\n", snap); return 1; }
-        int npred; int *mp = read_int_array(ref, "mtp0_pred", &npred);
-        int P = np - 1;
+        jval *mpred = json_get(ref, "mtp_pred");
+        int nmods = (mpred && mpred->t == J_ARR) ? mpred->len : 0;
+        int D = m.c.hidden;
         kv_alloc(&m, np + 8); state_reset(&m);
-        float *hid = falloc((int64_t)np * m.c.hidden);
+        float *hid = falloc((int64_t)np * D);
         float *lg = step(&m, pids, np, 0, NULL, NULL, hid); free(lg);
-        int *pred = malloc((size_t)(P > 0 ? P : 1) * sizeof(int));
-        mtp_module0_tf(&m, pids, hid, np, pred);
-        int match = 0;
-        printf("MTP mod-0 ref: "); for (int i=0;i<P;i++) printf("%d ", mp[i]);
-        printf("\nMTP mod-0 C  : "); for (int i=0;i<P;i++) { printf("%d ", pred[i]); if (i<npred && pred[i]==mp[i]) match++; }
-        printf("\nMTP module-0: %d/%d match %s\n", match, P, match==P ? "[OK]" : "[FAIL]");
-        free(hid); free(pred);
-        return (match == P) ? 0 : 1;
+        float *hk = malloc((int64_t)np * D * sizeof(float));
+        memcpy(hk, hid, (int64_t)np * D * sizeof(float));       /* h^0 */
+        int *toks = malloc((size_t)np * sizeof(int)), *pred = malloc((size_t)np * sizeof(int));
+        int all_ok = 1;
+        for (int k = 0; k < nmods && k < m.n_mtp; k++) {
+            int P = np - (k + 1);
+            if (P <= 0) break;
+            for (int i = 0; i < P; i++) toks[i] = pids[i + k + 1];   /* t_{i+k+1} */
+            float *hout = malloc((int64_t)P * D * sizeof(float));
+            mtp_module_tf(&m, k, hk, toks, P, hout, pred);
+            jval *rk = mpred->kids[k];
+            int match = 0; for (int i = 0; i < P && i < rk->len; i++) if (pred[i] == (int)rk->kids[i]->num) match++;
+            int ok = (match == P); if (!ok) all_ok = 0;
+            printf("MTP module-%d: %d/%d match %s\n", k, match, P, ok ? "[OK]" : "[FAIL]");
+            memcpy(hk, hout, (int64_t)P * D * sizeof(float));       /* h^{k+1} for next depth */
+            free(hout);
+        }
+        free(hid); free(hk); free(toks); free(pred);
+        return all_ok ? 0 : 1;
     }
     kv_alloc(&m, nfull + 8);
 
