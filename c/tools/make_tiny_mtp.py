@@ -54,14 +54,10 @@ def main():
     ids = torch.tensor([prompt], dtype=torch.long)
 
     with torch.no_grad():
-        # MTP module 0's input is the main model's PRE-final-norm hidden (each
-        # module re-norms it via its own hidden_norm). Extract it unambiguously by
-        # swapping the final norm to identity — matches the C engine's residual
-        # stream `x` after the last layer, before final_norm.
-        final_norm = model.model.norm
-        model.model.norm = torch.nn.Identity()
-        h_pre = model.model(ids).last_hidden_state   # [1,S,D], pre-final-norm
-        model.model.norm = final_norm
+        # MTP module 0's input is the main model's POST-final-norm hidden (vLLM:
+        # the base forward returns self.norm(hidden), which is also the drafter's
+        # previous_hidden_states). The module then applies its own hidden_norm.
+        h_pre = model.model(ids).last_hidden_state   # [1,S,D], post-final-norm
         embed = model.get_input_embeddings()
         lm_head = model.lm_head
         mup = base.logits_mup_width_multiplier
@@ -82,14 +78,15 @@ def main():
             # previous-depth output (no shift).
             P = S - (k + 1)
             toks = ids[:, k+1 : k+1+P]                         # t_{i+k+1}, i=0..P-1
-            emb = e_norm(embed(toks))                          # [1,P,D]
+            # depth layers see the BACKBONE-normed embedding, then their own trim
+            emb = e_norm(model.model.embed_norm(embed(toks)))  # [1,P,D]
             hn = h_norm(h_chain[:, :P, :])                     # h^k at 0..P-1
             cat = torch.cat([hn, emb], dim=-1)                 # hidden first
             x = in_proj(cat)
             mask = torch.ones(1, 1, P, P, dtype=torch.bool).tril()   # True = attend (causal)
             hp = blk(x, attention_mask=mask)                   # h^{k+1}, [1,P,D]
             unpad = base.unpadded_vocab_size or base.vocab_size
-            logits = lm_head(final_norm(hp) / mup)[..., :unpad]   # engine emits over unpadded vocab
+            logits = lm_head(hp / mup)[..., :unpad]   # depth output -> lm_head directly (no final_norm)
             preds.append(logits.argmax(-1)[0].tolist())
             h_chain = hp                                       # same-position previous-depth
 

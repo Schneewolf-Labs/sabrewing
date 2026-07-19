@@ -1141,7 +1141,10 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, doubl
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos0 + S;
-    if (hid_out) memcpy(hid_out, x, (int64_t)S*D*sizeof(float));   /* pre-final-norm residual (MTP input) */
+    /* MTP module 0 consumes the POST-final-norm hidden (vLLM: the base forward
+     * returns self.norm(hidden), and that same tensor is the drafter's input). */
+    if (hid_out) for (int s = 0; s < S; s++)
+        rmsnorm_row(hid_out + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
     if (tf_out || nll_sum) {
@@ -1235,6 +1238,10 @@ static void mtp_fuse(Model *m, MtpMod *mm, const float *h, int tok, float *xrow)
     Cfg *c = &m->c; int D = c->hidden;
     float *e = malloc((size_t)D*sizeof(float)), *cat = malloc((size_t)2*D*sizeof(float));
     wt_row_f32(m->embed, (int64_t)tok*D, e, D);
+    /* the depth layers were trained on the BACKBONE-normed embedding: apply the
+     * main model's (whitening) embed_norm, then the module's own (near-identity)
+     * embed_norm — matching vLLM's fused_input_cat. */
+    if (m->embed_norm) rmsnorm_row(e, e, m->embed_norm, D, c->eps);
     rmsnorm_row(e, e, mm->embed_norm, D, c->eps);
     rmsnorm_row(cat, h, mm->hidden_norm, D, c->eps);        /* hidden first */
     memcpy(cat + D, e, (size_t)D*sizeof(float));
@@ -1242,13 +1249,14 @@ static void mtp_fuse(Model *m, MtpMod *mm, const float *h, int tok, float *xrow)
     free(e); free(cat);
 }
 
-/* MTP head logits at each of P positions: shared final_norm + mup + lm_head. */
+/* MTP head logits at each of P positions: the depth output goes STRAIGHT to the
+ * shared lm_head (no final_norm — the depth was trained that way), mup-scaled
+ * (argmax-invariant, kept for scale parity). vLLM InklingMTP.compute_logits. */
 static void mtp_head(Model *m, const float *hp, int P, int *pred) {
     Cfg *c = &m->c; int D = c->hidden;
     float *last = falloc(D), *logit = falloc(c->unpad_vocab);
     for (int i = 0; i < P; i++) {
-        rmsnorm_row(last, hp + (int64_t)i*D, m->final_norm, D, c->eps);
-        for (int d = 0; d < D; d++) last[d] /= c->mup;
+        for (int d = 0; d < D; d++) last[d] = hp[(int64_t)i*D + d] / c->mup;
         matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
         int best = 0; for (int v = 1; v < c->unpad_vocab; v++) if (logit[v] > logit[best]) best = v;
         pred[i] = best;
@@ -1687,13 +1695,14 @@ int main(int argc, char **argv) {
      * equivalent of -l (the gateway passes it through). */
     const char *prompt = NULL, *pfile = NULL, *refpath = "ref_inkling.json";
     const char *lora_dir = getenv("LORA");
-    int cap = -1, bits = 0, n_new = 256, npos = 0, mtp_oracle = 0;
+    int cap = -1, bits = 0, n_new = 256, npos = 0, mtp_oracle = 0, mtp_accept = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-f") && i+1 < argc) pfile = argv[++i];
         else if (!strcmp(argv[i], "-l") && i+1 < argc) lora_dir = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mtp-oracle") && i+1 < argc) { mtp_oracle = 1; refpath = argv[++i]; }
+        else if (!strcmp(argv[i], "--mtp-accept") && i+1 < argc) { mtp_accept = 1; refpath = argv[++i]; }
         else if (npos == 0) { cap = atoi(argv[i]); npos++; }
         else if (npos == 1) { bits = atoi(argv[i]); npos++; }
         else refpath = argv[i];
@@ -1783,6 +1792,43 @@ int main(int argc, char **argv) {
         }
         free(hid); free(hk); free(toks); free(pred);
         return all_ok ? 0 : 1;
+    }
+
+    /* MTP acceptance on a real token sequence: for each depth k, how often does
+     * the MTP draft equal the main model's own greedy token k+2 ahead. Estimates
+     * the expected accepted draft length (the speculative speedup) using only the
+     * validated teacher-forced chain — no serve loop required. */
+    if (mtp_accept) {
+        if (!m.n_mtp) { fprintf(stderr, "[mtp-accept] no MTP head in %s\n", snap); return 1; }
+        int nt = 0; int *seq = full;                       /* prefer full_ids; else prompt_ids */
+        if (seq) nt = nfull; else seq = read_int_array(ref, "prompt_ids", &nt);
+        if (nt < 4) { fprintf(stderr, "[mtp-accept] need >= 4 tokens\n"); return 1; }
+        int D = m.c.hidden;
+        kv_alloc(&m, nt + 8); state_reset(&m);
+        int *mainpred = malloc((size_t)nt * sizeof(int));
+        float *hid = falloc((int64_t)nt * D);
+        float *lg = step(&m, seq, nt, 0, mainpred, NULL, hid); free(lg);   /* mainpred[i] = greedy t_{i+1} */
+        float *hk = malloc((int64_t)nt * D * sizeof(float));
+        memcpy(hk, hid, (int64_t)nt * D * sizeof(float));
+        int *toks = malloc((size_t)nt * sizeof(int)), *pred = malloc((size_t)nt * sizeof(int));
+        double chain = 1.0, exp_len = 1.0;
+        printf("MTP acceptance on %d tokens (%d depths):\n", nt, m.n_mtp);
+        for (int k = 0; k < m.n_mtp; k++) {
+            int P = nt - (k + 1); if (P <= 0) break;
+            for (int i = 0; i < P; i++) toks[i] = seq[i + k + 1];
+            float *hout = malloc((int64_t)P * D * sizeof(float));
+            mtp_module_tf(&m, k, hk, toks, P, hout, pred);
+            int match = 0, n = 0;
+            for (int i = 0; i < P && i + k + 1 < nt; i++) { if (pred[i] == mainpred[i + k + 1]) match++; n++; }
+            double ak = n ? (double)match / n : 0.0;
+            chain *= ak; exp_len += chain;
+            printf("  depth %d: accept %5.1f%% (%d/%d)  chained %5.1f%%\n", k, 100*ak, match, n, 100*chain);
+            memcpy(hk, hout, (int64_t)P * D * sizeof(float));
+            free(hout);
+        }
+        printf("expected tokens/verify: %.2f (max %d)  -> ~%.2fx decode\n", exp_len, m.n_mtp + 1, exp_len);
+        free(hid); free(hk); free(toks); free(pred); free(mainpred);
+        return 0;
     }
     kv_alloc(&m, nfull + 8);
 
