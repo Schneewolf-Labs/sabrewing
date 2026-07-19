@@ -1,0 +1,92 @@
+# Inkling MTP speculative decode — design & status
+
+Goal: 2–3× decode via draft+verify using Inkling's shipped 8-module MTP head.
+
+## The key property: losslessness makes MTP a *performance* concern, not a safety one
+
+The verify step only ever emits a draft token that equals the main model's own
+greedy token (or, under sampling, passes a rejection test that preserves the
+target distribution). So a wrong, mis-wired, or approximate MTP head **cannot
+corrupt output** — it can only lower the acceptance rate (slower) or raise it
+(faster). This is why the drafter can be developed and tuned against a live
+model without a token-exact oracle: correctness is guaranteed by the verifier.
+
+## Phase 1 — DONE (`mtp-spec-decode`, commit ef21b06)
+
+Speculative scaffolding + the one genuinely novel Inkling problem: rolling back
+the four stateful causal short-convs on partial acceptance.
+
+- `sconv_apply` optionally checkpoints per-position conv state (`vck` buffers,
+  gated by `vck_on`); `conv_rollback(k)` restores all four convs to batch
+  position `k`. KV is position-indexed, so rejected rows self-overwrite.
+- Verify forward = `step()` over `[committed, draft…]`; its per-position argmax
+  (`tf_out`) is the acceptance signal and the next committed token.
+- `ngram_draft` (zero model cost) is the Phase-1 drafter. `generate_spec()` is
+  greedy and token-identical to `generate()`.
+- **Validated**: `SPEC_TEST=1` — speculative output == plain greedy, 160/160
+  token-exact across draft widths G=1..8 on the tiny oracle (heavy partial-accept
+  rollback stress). Base + LoRA oracles unchanged (0.00%). CUDA build compiles.
+
+## The MTP head recipe (pinned)
+
+Weights: `out-mtp.safetensors`, `model.mtp.{0..7}.*` (8 modules,
+`num_nextn_predict_layers=8`). Each module is a full Inkling **dense** decoder
+block (attention + rel bias + q/k norms + 4 short-convs + dense MLP at 24576)
+plus three MTP-specific tensors:
+
+- `input_proj` `[6144, 12288]` — fuses `[hidden ; embedding]` → hidden.
+- `embed_norm` `[6144]` — RMSNorm on the token embedding.
+- `hidden_norm` `[6144]` — RMSNorm on the incoming hidden.
+
+Modules are **hybrid attention** (`mtp_local_layer_ids [0,2,4,5,6,7]` → 6 sliding
++ 2 global) and share the main model's `final_norm` + `lm_head` (no per-module
+head tensors). Config flags: `mtp_hidden_states_first=True`,
+`chain_hidden_post_norm=False`.
+
+Per module `k` (predicting token *t+k+1*), input token `tok`, incoming hidden `h`:
+
+```
+emb = embed_norm_k( embed(tok) )
+hn  = hidden_norm_k( h )
+x   = input_proj_k( concat[ hn ; emb ] )        # hidden first (mtp_hidden_states_first)
+h'  = InklingBlock_k( x )                        # same op sequence as step()'s layer loop
+logit = lm_head( final_norm(h') / mup )          # shared head
+tok_next = argmax(logit)  →  draft[k]
+# chain: h ← h' (raw, chain_hidden_post_norm=False), tok ← tok_next
+```
+
+Module 0's incoming `h` is the main model's last-layer hidden (pre-final-norm)
+at the current position.
+
+Note: transformers deliberately drops the head
+(`_keys_to_ignore_on_load_unexpected = [r"model\.mtp\..*"]`), so there is **no
+token-exact reference from `InklingForCausalLM`**. Validation is two-layer: a
+hand-rolled torch reference (reusing `InklingDecoderLayer`) for C-impl fidelity,
+and acceptance rate on the real model for recipe correctness.
+
+## Phase 2 — remaining work
+
+1. **C loader** `mtp_load()` — parse `out-mtp.safetensors` into 8 `Layer`
+   structs (the existing struct already has every field) + `input_proj`,
+   `embed_norm`, `hidden_norm` per module. Resident bf16/f32; ~10.5 GB.
+2. **C draft forward** `mtp_draft()` — the chain above, reusing `attention()`,
+   `dense_mlp()`, `sconv_apply()`, `rmsnorm_row()`.
+3. **MTP KV absorb/rollback** (the intricate core) — each module keeps its own
+   attention KV + conv state across draft rounds. On acceptance, absorb the
+   verified tokens into the MTP caches; on partial rejection, roll back (the
+   Phase-1 `vck`/conv-rollback pattern generalizes; KV is position-indexed).
+4. **Wire into `generate_spec`/`serve_one`** behind `DRAFT`/`MTP` env (mirror
+   glm.c's auto-resolve: DRAFT=3 when a head is present).
+5. **Torch reference** `tools/make_tiny_mtp.py` — fabricate tiny MTP weights,
+   compute the draft via `InklingDecoderLayer`, save `ref_mtp.json`; C must match
+   (catches name-mapping / fused-row / arithmetic bugs).
+6. **Acceptance measurement** on the real 975B head — the recipe's ground truth.
+   High acceptance (→ 2–3×) confirms the recipe; low means a subtle recipe bug,
+   but output stays correct throughout.
+
+## Numerical consistency (watch item)
+
+glm.c needed `SPEC_PIN` so the draft (S=1) and verify (S≥2) forwards use matching
+FP accumulation order — near-tie argmax flips otherwise collapse acceptance.
+Inkling's matmuls/attention/convs are per-position independent, so the risk is
+lower, but confirm draft-vs-verify consistency once the MTP drafter is in.
