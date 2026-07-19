@@ -115,6 +115,11 @@ typedef struct {
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
+    /* speculative verify: per-position conv-state checkpoints so a partially
+     * accepted draft batch can roll each of the 4 convs back to the last
+     * accepted position. vck[j][li] is [vck_S][C_j*(K-1)]; vck_on gates the
+     * checkpoint writes inside sconv_apply. */
+    float **vck[4]; int vck_on, vck_S;
     double dense_load_s;
 } Model;
 
@@ -355,7 +360,7 @@ static void softmax_row(float *x, int n) {
 /* ---------- depthwise causal short conv, residual inside (fp32) ----------
  * seq[S,C] in-place: out[t] = sum_j w[c,j]*in[t+j-(K-1)] + in[t], history from
  * state[C*(K-1)] (raw pre-conv inputs), which is updated to the new tail. */
-static void sconv_apply(float *seq, int S, int C, const float *w, float *state, int K) {
+static void sconv_apply(float *seq, int S, int C, const float *w, float *state, int K, float *ckpt) {
     int P = K - 1;
     #pragma omp parallel
     {
@@ -369,6 +374,11 @@ static void sconv_apply(float *seq, int S, int C, const float *w, float *state, 
                 float acc = 0.f;
                 for (int j = 0; j < K; j++) acc += wc[j] * col[t + j];
                 seq[(int64_t)t*C + ch] = acc + col[P + t];
+                /* checkpoint the conv state as it would be AFTER position t: the
+                 * P raw inputs ending at t (col[t+1..t+P]), pre-forward state
+                 * folded in automatically for the first P-1 positions. */
+                if (ckpt) for (int j = 0; j < P; j++)
+                    ckpt[((int64_t)t*C + ch)*P + j] = col[t + 1 + j];
             }
             for (int j = 0; j < P; j++) state[(int64_t)ch*P + j] = col[S + j];
         }
@@ -849,8 +859,8 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     matmul_w(vv, x, l->v, S, D, kvdim);
     matmul_w(rr, x, l->r, S, D, H*c->d_rel);
     /* short convs on K and V (sequence-wise, over the raw projections) */
-    sconv_apply(k,  S, kvdim, l->k_cw, m->cs[0][li], c->conv_k);
-    sconv_apply(vv, S, kvdim, l->v_cw, m->cs[1][li], c->conv_k);
+    sconv_apply(k,  S, kvdim, l->k_cw, m->cs[0][li], c->conv_k, m->vck_on ? m->vck[0][li] : NULL);
+    sconv_apply(vv, S, kvdim, l->v_cw, m->cs[1][li], c->conv_k, m->vck_on ? m->vck[1][li] : NULL);
     /* per-head q/k rmsnorm (scaling below is 1/hd, not 1/sqrt(hd), because of this) */
     for (int s = 0; s < S; s++) {
         for (int h = 0; h < H;  h++) rmsnorm_row(q + (int64_t)s*qdim  + h*hd, q + (int64_t)s*qdim  + h*hd, l->qn, hd, c->eps);
@@ -1052,12 +1062,12 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out, doubl
         double ta = now_s();
         attention(m, l, i, nrm, S, pos0, tmp);
         m->t_attn += now_s() - ta;
-        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k);
+        sconv_apply(tmp, S, D, l->a_cw, m->cs[2][i], c->conv_k, m->vck_on ? m->vck[2][i] : NULL);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
         else dense_mlp(m, l, nrm, S, tmp);
-        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k);
+        sconv_apply(tmp, S, D, l->m_cw, m->cs[3][i], c->conv_k, m->vck_on ? m->vck[3][i] : NULL);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos0 + S;
@@ -1128,6 +1138,99 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         int one = best;
         logit = step(m, &one, 1, len - 1, NULL, NULL);
     }
+}
+
+/* ---------- speculative decode (Phase 1: n-gram draft + batched verify) ----------
+ * The verify forward is just step() over [committed, draft...] with tf_out (the
+ * per-position argmax = the acceptance signal). Inkling's four causal short-convs
+ * are stateful, so a partially accepted batch must roll their state back to the
+ * last accepted position — that is what the vck checkpoints (written in
+ * sconv_apply while vck_on) and conv_rollback() are for. KV is position-indexed,
+ * so rejected rows are simply overwritten by the next forward. */
+
+static void vck_alloc(Model *m, int maxS) {
+    Cfg *c = &m->c;
+    if (m->vck[0] && maxS <= m->vck_S) return;
+    int P = c->conv_k - 1;
+    for (int j = 0; j < 4; j++) {
+        if (m->vck[j]) { for (int i = 0; i < c->n_layers; i++) free(m->vck[j][i]); free(m->vck[j]); }
+        m->vck[j] = calloc(c->n_layers, sizeof(float*));
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        int64_t kvdim = (int64_t)L_KV(c,i) * L_HD(c,i);
+        m->vck[0][i] = falloc((int64_t)maxS * kvdim * P);
+        m->vck[1][i] = falloc((int64_t)maxS * kvdim * P);
+        m->vck[2][i] = falloc((int64_t)maxS * c->hidden * P);
+        m->vck[3][i] = falloc((int64_t)maxS * c->hidden * P);
+    }
+    m->vck_S = maxS;
+}
+
+/* roll every conv's live state back to the state AFTER batch position k
+ * (0-based within the just-verified batch). */
+static void conv_rollback(Model *m, int k) {
+    Cfg *c = &m->c;
+    int64_t P = c->conv_k - 1;
+    for (int i = 0; i < c->n_layers; i++) {
+        int64_t kvdim = (int64_t)L_KV(c,i) * L_HD(c,i);
+        memcpy(m->cs[0][i], m->vck[0][i] + (int64_t)k*kvdim*P, kvdim*P*sizeof(float));
+        memcpy(m->cs[1][i], m->vck[1][i] + (int64_t)k*kvdim*P, kvdim*P*sizeof(float));
+        memcpy(m->cs[2][i], m->vck[2][i] + (int64_t)k*c->hidden*P, (int64_t)c->hidden*P*sizeof(float));
+        memcpy(m->cs[3][i], m->vck[3][i] + (int64_t)k*c->hidden*P, (int64_t)c->hidden*P*sizeof(float));
+    }
+}
+
+/* n-gram drafter: the most recent prior occurrence of the last committed token
+ * predicts the tokens that followed it. Zero model cost; cheap correctness
+ * exercise for the verify/rollback machinery before the MTP head lands. */
+static int ngram_draft(const int *hist, int n, int G, int *draft) {
+    if (n < 2) return 0;
+    int last = hist[n-1];
+    for (int p = n - 2; p >= 0; p--) {
+        if (hist[p] == last) {
+            int d = 0;
+            for (int g = 0; g < G && p + 1 + g < n; g++) draft[d++] = hist[p + 1 + g];
+            return d;
+        }
+    }
+    return 0;
+}
+
+/* greedy speculative decode. Output is token-identical to generate(); returns
+ * tokens-per-verify-forward (>1 = speedup). */
+static double generate_spec(Model *m, const int *prompt, int np, int n_new, int *out, int G) {
+    Cfg *c = &m->c;
+    for (int i = 0; i < np; i++) out[i] = prompt[i];
+    vck_alloc(m, 1 + G);
+    int *tf = calloc((int64_t)(np + n_new + G + 2), sizeof(int));
+    int *batch = malloc((size_t)(1 + G) * sizeof(int));
+    int *draft = malloc((size_t)G * sizeof(int));
+
+    float *logit = step(m, prompt, np, 0, NULL, NULL);
+    int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > logit[best]) best = i;
+    free(logit);
+
+    int kv = np, gen = 0; long fwd = 0;
+    while (gen < n_new) {
+        out[kv] = best; gen++;
+        if (gen >= n_new) break;
+        int Gc = G; if (Gc > n_new - gen) Gc = n_new - gen;
+        int g = ngram_draft(out, kv + 1, Gc, draft);
+        batch[0] = best; for (int i = 0; i < g; i++) batch[1 + i] = draft[i];
+        int S = 1 + g;
+        m->vck_on = 1;
+        step(m, batch, S, kv, tf, NULL);     /* verify: fills tf[kv..kv+g], conv ckpts */
+        m->vck_on = 0; fwd++;
+        int a = 0;
+        while (a < g && tf[kv + a] == draft[a]) { out[kv + 1 + a] = draft[a]; a++; }
+        gen += a;
+        best = tf[kv + a];                    /* next committed = pred after last accepted */
+        conv_rollback(m, a);
+        m->kv_len = kv + 1 + a;
+        kv += 1 + a;
+    }
+    free(tf); free(batch); free(draft);
+    return fwd ? (double)n_new / (double)fwd : 0.0;
 }
 
 static const char *prompt_reject(Cfg *c, const int *ids, int np, int want);
@@ -1559,6 +1662,31 @@ int main(int argc, char **argv) {
     double tot = m.hits + m.miss;
     printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
            rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
+
+    /* Phase-1 lossless self-test: speculative decode must reproduce plain greedy
+     * token-for-token over a long generation (frequent mispredicts stress the
+     * partial-acceptance conv rollback). SPEC_TEST=1; SPEC_N sets length. */
+    int spec_ok = 1;
+    if (getenv("SPEC_TEST")) {
+        int N = getenv("SPEC_N") ? atoi(getenv("SPEC_N")) : 128; if (N < 8) N = 8;
+        int maxG = getenv("DRAFT") ? atoi(getenv("DRAFT")) : 8; if (maxG < 1) maxG = 8;
+        kv_alloc(&m, np + N + maxG + 8);
+        int *gout = malloc((size_t)(np + N) * sizeof(int));
+        state_reset(&m); generate(&m, pids, np, N, gout);       /* greedy reference */
+        for (int G = 1; G <= maxG; G++) {
+            state_reset(&m);
+            int *sout = malloc((size_t)(np + N) * sizeof(int));
+            double ts = now_s();
+            double tpf = generate_spec(&m, pids, np, N, sout, G);
+            double dts = now_s() - ts;
+            int sm = 0; for (int i = np; i < np + N; i++) if (sout[i] == gout[i]) sm++;
+            int ok = (sm == N); if (!ok) spec_ok = 0;
+            printf("SPEC G=%d: %d/%d vs greedy | %.2f tok/verify | %.1f tok/s %s\n",
+                   G, sm, N, tpf, dts>0?N/dts:0.0, ok ? "[LOSSLESS]" : "[DIVERGED]");
+            free(sout);
+        }
+        free(gout);
+    }
     free(buf); free(arena);
-    return (match == ngen) ? 0 : 1;
+    return (match == ngen && spec_ok) ? 0 : 1;
 }
