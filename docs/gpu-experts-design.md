@@ -59,8 +59,36 @@ scheduling). Payoff: the 90% moves to ~12× bandwidth for VRAM-resident experts 
 the largest single decode win available, and it **multiplies** with MTP
 speculative decode (fewer, fuller forwards, each faster).
 
-## First step
+## First step — DONE
 
-`backend_cuda_ink.cu`: add `ink_cuda_matmul_q4(y, x, packed, scales, S, In, Out)`,
-validate token-exact against `matmul_q4` via the tiny oracle (bits=0 container),
-before any caching work.
+`ink_cuda_matmul_q4` added + validated token-exact vs the CPU path
+(`--cuda-q4-test`, scaled-rel 1.6e-5).
+
+## v1 — LANDED (static VRAM expert tier)
+
+`Slot` gained device copies (`d13`/`ds13`/`d2`/`ds2`) + a `gpu` flag; `pins_load`
+uploads the globally-hottest pinned experts (by usage) into VRAM up to a budget
+(free VRAM − 3 GB headroom, `CUDA_EXPERT_GB` cap); `moe()` pass 3 dispatches the
+GPU kernel for VRAM-resident experts. All `#ifdef COLI_CUDA`; CPU builds
+byte-identical (oracle 0.00%).
+
+**Measured on the real base head (A6000, 48 tokens, novel prompt):**
+- 402 experts → 11.4 GB VRAM in 1.0s; output coherent.
+- `expert-mm`: GPU 18.8s vs CPU 21.4s (~12%).
+
+**Why the win is small (and what it means):**
+1. **VRAM-capacity bound** — only 402 of ~2496 hot experts fit in ~11 GB free
+   (residents eat ~37 GB), so most cache hits still land on RAM (CPU). Only the
+   top ~2.4% of experts are on-device.
+2. **Novel-prompt decode is disk-bound, not compute-bound** — `fill` (NVMe misses)
+   is 167–222s vs `expert-mm` ~20s. GPU expert compute is a **warm-regime lever**
+   (trained cache, ~100% hit, the docs' 2.5 tok/s scenario), not a novel-prompt one.
+
+## Next (to actually unlock it)
+
+1. **int8 residents** — frees ~18 GB VRAM → ~3× more experts on-device. Biggest
+   single multiplier; already on backend-todo.
+2. **Batched GPU expert calls** (colibri.c `coli_cuda_expert_group`) — amortize
+   per-call launch/sync overhead across a token's experts.
+3. **Dynamic RAM↔VRAM repin** (colibri.c `repin_pass`) — keep the *actually-routed*
+   experts on-device, not just the statically-hottest.
