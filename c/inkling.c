@@ -1505,6 +1505,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
     double t0 = now_s(), t1 = 0;
+    /* phase timers accumulate globally (across prompts in -f mode); snapshot to
+     * report THIS prompt's deltas, or 'other' goes negative on later prompts */
+    double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
     float *logit = step(m, ids, np, 0, NULL, NULL, NULL);
     int len = np;
     char buf[512];
@@ -1526,9 +1529,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
     double wall = now_s() - t0;
+    double pf = m->t_fill-f0, pe = m->t_expert-e0, ps = m->t_shared-s0, pa = m->t_attn-a0;
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
-           m->t_fill, m->t_expert, m->t_shared, m->t_attn,
-           wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
+           pf, pe, ps, pa, wall - pf - pe - ps - pa);
     free(ids);
 }
 
