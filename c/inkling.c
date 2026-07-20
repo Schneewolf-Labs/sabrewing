@@ -120,6 +120,8 @@ typedef struct {
     uint32_t **eusage;                    /* per-layer expert selection counts */
     uint8_t **seen;                       /* per-layer: expert touched this generation (miss classification) */
     int **prev_topm; int topm;            /* previous decode token's top-M router picks per layer (overfetch probe) */
+    int qsim_bits, qsim_all, qsim_hotkeep;/* heat-tiered quant SIM: degrade cold experts to N-bit (quality probe) */
+    uint32_t *qsim_thr;                   /* per-layer usage threshold: >= keeps int4, < degrades */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss, miss_cold, miss_churn, cold_recover, cold_novel;
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
@@ -843,6 +845,38 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
     return s;
 }
 
+/* heat-tiered quant SIM (quality probe only): degrade a packed-int4 weight matrix
+ * to `bits`-bit effective precision, per row, in place — re-quantize the int4
+ * integer part (nibble-8) to a 2^bits symmetric grid sharing the same row scale.
+ * Lets us measure sub-int4 perplexity with no new format/kernel. */
+static void qsim_row(uint8_t *p, int64_t rows, int64_t nb /*bytes/row = cols/2*/, int bits) {
+    int lv = 1 << (bits - 1);   /* qi in [-lv, lv-1]; bits=2 -> 4 levels */
+    for (int64_t r = 0; r < rows; r++) {
+        uint8_t *row = p + r*nb;
+        int mx = 0;
+        for (int64_t b = 0; b < nb; b++) {
+            int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
+            if (abs(lo) > mx) mx = abs(lo); if (abs(hi) > mx) mx = abs(hi);
+        }
+        if (mx == 0) continue;
+        float step = (float)mx / lv;
+        for (int64_t b = 0; b < nb; b++) {
+            int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
+            int qlo = lrintf(lo/step); if (qlo < -lv) qlo = -lv; if (qlo > lv-1) qlo = lv-1;
+            int qhi = lrintf(hi/step); if (qhi < -lv) qhi = -lv; if (qhi > lv-1) qhi = lv-1;
+            int vlo = lrintf(qlo*step)+8; if (vlo < 0) vlo = 0; if (vlo > 15) vlo = 15;
+            int vhi = lrintf(qhi*step)+8; if (vhi < 0) vhi = 0; if (vhi > 15) vhi = 15;
+            row[b] = (uint8_t)(vlo | (vhi<<4));
+        }
+    }
+}
+/* is this expert "cold" for the heat-tiered probe? (below the per-layer keep threshold) */
+static int qsim_cold(Model *m, int layer, int eid) {
+    if (!m->qsim_bits) return 0;
+    if (m->qsim_all) return 1;
+    return m->eusage[layer] && m->qsim_thr && m->eusage[layer][eid] < m->qsim_thr[layer];
+}
+
 /* pure I/O (+ optional requant): safe to run in parallel across slots */
 static void slot_fill(Model *m, int layer, Slot *s) {
     Cfg *c = &m->c;
@@ -858,6 +892,10 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         read_u8_slice(&m->S, nm, s->p2, eid*D*m->rb2, D*m->rb2);
         snprintf(qs,sizeof(qs),"%s.qs",nm);
         read_f32_slice(&m->S, qs, s->s2, eid*D, D);
+        if (qsim_cold(m, layer, (int)eid)) {   /* heat-tiered quant probe */
+            qsim_row(s->p13, 2*I, m->rb13, m->qsim_bits);
+            qsim_row(s->p2,  D,   m->rb2,  m->qsim_bits);
+        }
     } else if (m->quant_bits) {
         float *tmp = falloc(n13 > n2 ? n13 : n2);
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
@@ -884,6 +922,10 @@ static void slot_fill(Model *m, int layer, Slot *s) {
  * nothing; PIN=<path> uses an alternate history file; PIN_N=<n> pin depth. */
 /* sort pinned-expert indices by usage descending (for VRAM upload order) */
 static const uint32_t *g_pin_use;
+static int u32_desc(const void *a, const void *b) {
+    uint32_t ua = *(const uint32_t*)a, ub = *(const uint32_t*)b;
+    return ua < ub ? 1 : ua > ub ? -1 : 0;
+}
 static int pin_use_desc(const void *a, const void *b) {
     uint32_t ua = g_pin_use[*(const int*)a], ub = g_pin_use[*(const int*)b];
     return ua < ub ? 1 : ua > ub ? -1 : 0;
@@ -914,6 +956,13 @@ static void pins_load(Model *m, const char *snap) {
     m->npin = getenv("PIN_N") ? atoi(getenv("PIN_N")) : cap/2;
     if (m->npin > cap - 8) m->npin = cap - 8;
     if (m->npin < 0) m->npin = 0;
+    /* heat-tiered quant probe: QSIM_BITS=2|3 degrades cold experts to N-bit;
+     * QSIM_ALL=1 degrades all (uniform control); QSIM_HOT_KEEP=N experts/layer
+     * kept at int4 (default = npin, i.e. the pinned hot set). */
+    m->qsim_bits = getenv("QSIM_BITS") ? atoi(getenv("QSIM_BITS")) : 0;
+    m->qsim_all  = getenv("QSIM_ALL") ? 1 : 0;
+    m->qsim_hotkeep = getenv("QSIM_HOT_KEEP") ? atoi(getenv("QSIM_HOT_KEEP")) : m->npin;
+    if (m->qsim_bits && !m->qsim_all) m->qsim_thr = calloc(c->n_layers, 4);
     uint32_t *tmp = malloc((size_t)E * 4);
     Slot **ps = malloc((size_t)c->n_layers * m->npin * sizeof(Slot*));
     int *pl = malloc((size_t)c->n_layers * m->npin * sizeof(int));
@@ -922,6 +971,13 @@ static void pins_load(Model *m, const char *snap) {
         if (fread(tmp, 4, E, f) != (size_t)E) break;
         if (!c->sparse[i] || !m->npin) continue;
         memcpy(m->eusage[i], tmp, (size_t)E * 4);          /* seed the ranking */
+        if (m->qsim_thr) {   /* per-layer keep threshold = hotkeep-th largest count */
+            uint32_t *cp = malloc((size_t)E*4); memcpy(cp, tmp, (size_t)E*4);
+            qsort(cp, E, 4, u32_desc);
+            int k = m->qsim_hotkeep; if (k < 1) k = 1; if (k > E) k = E;
+            m->qsim_thr[i] = cp[k-1];
+            free(cp);
+        }
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
@@ -2039,6 +2095,10 @@ int main(int argc, char **argv) {
            m.c.n_kv, m.c.swa_kv, m.c.head_dim, m.c.window, m.c.d_rel, m.c.rel_extent,
            m.c.n_experts, m.c.n_shared, m.c.topk);
     printf("resident weights loaded in %.1fs | RSS: %.2f GB\n", m.dense_load_s, rss_gb());
+    /* opt-in only (preserves the oracle's cold-cache default): seed the heat
+     * ranking + pin hot experts. Numerically a no-op — pins only pre-load — but
+     * enables the heat-tiered quant probe's per-layer keep threshold. */
+    if (getenv("PIN") || getenv("QSIM_BITS")) pins_load(&m, snap);
 
     /* MTP chain teacher-forced oracle: main forward -> pre-norm hidden -> run the
      * module chain over positions, argmax at each depth vs the transformers ref. */
