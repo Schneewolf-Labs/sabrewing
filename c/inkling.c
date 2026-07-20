@@ -119,8 +119,9 @@ typedef struct {
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
     uint8_t **seen;                       /* per-layer: expert touched this generation (miss classification) */
+    int **prev_topm; int topm;            /* previous decode token's top-M router picks per layer (overfetch probe) */
     int npin;                             /* pinned experts per sparse layer */
-    uint64_t clock, hits, miss, miss_cold, miss_churn;
+    uint64_t clock, hits, miss, miss_cold, miss_churn, cold_recover, cold_novel;
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
@@ -716,6 +717,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
      * → prefetchable). Decides whether prefetch is the right lever. */
     m->seen = calloc(c->n_layers, sizeof(uint8_t*));
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->seen[i] = calloc(E, 1);
+    /* overfetch probe: track prev decode token's top-M router ranking per layer,
+     * to see if cold-first-touch experts were recent near-misses (i.e. catchable
+     * by over-fetching the router's runners-up — a lossless prefetch). */
+    m->topm = getenv("OVERFETCH_M") ? atoi(getenv("OVERFETCH_M")) : 16;
+    if (m->topm > E) m->topm = E;
+    m->prev_topm = calloc(c->n_layers, sizeof(int*));
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+        m->prev_topm[i] = malloc(m->topm * sizeof(int));
+        for (int j = 0; j < m->topm; j++) m->prev_topm[i][j] = -1;
+    }
     /* opt-in: the 10.5 GB draft head only loads when speculation is requested
      * (MTP=1, or the --mtp-* / spec paths force-load it). Normal serve/decode
      * pays nothing until the spec serve loop is wired up. */
@@ -1140,12 +1151,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 m->miss++;
                 if (m->seen[layer]) {   /* cold first-touch vs evicted-and-back */
                     if (m->seen[layer][eid]) m->miss_churn++;
-                    else { m->miss_cold++; m->seen[layer][eid] = 1; }
+                    else {
+                        m->miss_cold++; m->seen[layer][eid] = 1;
+                        if (S == 1) {   /* was this cold expert a recent near-miss? */
+                            int in = 0;
+                            for (int j = 0; j < m->topm; j++) if (m->prev_topm[layer][j] == eid) { in = 1; break; }
+                            if (in) m->cold_recover++; else m->cold_novel++;
+                        }
+                    }
                 }
                 e = slot_acquire(m, layer, eid);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
             use[(int64_t)s*K + kk] = e;
+        }
+        /* record this decode token's top-M router ranking for next token's probe */
+        if (S == 1 && m->prev_topm[layer]) {
+            int *tm = m->prev_topm[layer];
+            for (int r = 0; r < m->topm; r++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    int taken = 0; for (int j = 0; j < r; j++) if (tm[j]==e){taken=1;break;}
+                    float ch = sigmoidf(lg[e]) + l->rbias[e];
+                    if (!taken && ch > bv) { bv = ch; best = e; }
+                }
+                tm[r] = best;
+            }
         }
     }
     /* pass 2: one parallel burst for every miss in this layer call */
@@ -1528,8 +1559,11 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
      * report THIS prompt's deltas, or 'other' goes negative on later prompts */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
     /* fresh miss-classification window for this prompt */
-    uint64_t mc0 = m->miss_cold, mh0 = m->miss_churn;
-    for (int i = 0; i < c->n_layers; i++) if (m->seen[i]) memset(m->seen[i], 0, c->n_experts);
+    uint64_t mc0 = m->miss_cold, mh0 = m->miss_churn, cr0 = m->cold_recover, cn0 = m->cold_novel;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (m->seen[i]) memset(m->seen[i], 0, c->n_experts);
+        if (m->prev_topm[i]) for (int j = 0; j < m->topm; j++) m->prev_topm[i][j] = -1;
+    }
     float *logit = step(m, ids, np, 0, NULL, NULL, NULL);
     int len = np;
     char buf[512];
@@ -1558,6 +1592,10 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     printf("[misses] %llu total | cold-first-touch %llu (%.0f%%) | churn/re-evict %llu (%.0f%%)\n",
            (unsigned long long)mt, (unsigned long long)mc, mt?100.0*mc/mt:0.0,
            (unsigned long long)mh, mt?100.0*mh/mt:0.0);
+    uint64_t cr = m->cold_recover - cr0, cn = m->cold_novel - cn0, ct = cr + cn;
+    printf("[overfetch probe M=%d] decode cold-touches %llu | recent near-miss %llu (%.0f%%, catchable) | truly-novel %llu (%.0f%%)\n",
+           m->topm, (unsigned long long)ct, (unsigned long long)cr, ct?100.0*cr/ct:0.0,
+           (unsigned long long)cn, ct?100.0*cn/ct:0.0);
     free(ids);
 }
 
