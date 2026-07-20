@@ -10,32 +10,30 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
+*.o
 c/colibri
-c/glm.exe
-c/olmoe
+c/colibri.exe
 c/inkling
+c/inkling.exe
+c/olmoe
 c/olmoe.exe
+c/glm.exe
 c/iobench
 c/iobench.exe
 c/tok_test
-c/backend_cuda.o
 c/backend_cuda_test
-c/backend_loader.o
+c/backend_metal_test
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
-c/tests/test_json
-c/tests/test_json.exe
-c/tests/test_st
-c/tests/test_st.exe
-c/tests/test_tier
-c/tests/test_tier.exe
-c/tests/test_grammar
-c/tests/test_grammar.exe
-c/tests/test_schema_gbnf
-c/tests/test_schema_gbnf.exe
-c/tests/test_compat_direct
-c/tests/test_compat_direct.exe
+
+# test/bench binaries build next to their sources: ignore everything in
+# c/tests except the sources themselves (add !patterns here for any fixtures)
+c/tests/*
+!c/tests/*.c
+!c/tests/*.cu
+!c/tests/*.mm
+!c/tests/*.py
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
@@ -60,21 +58,6 @@ stats*.txt
 /quant_test.py
 /profile_run.py
 /sweep.py
-c/backend_metal.o
-c/backend_metal_test
-c/tests/test_tier
-c/mio_env/
-c/bench/
-c/tests/test_decode_batch
-c/tests/test_i4_acc512
-c/tests/test_idot
-c/tests/test_uring
-
-# build artifacts
-*.o
-c/inkling
-c/colibri
-c/olmoe
 
 # but DO ship the built web UI so `swing api` works on clone
 !web/dist
