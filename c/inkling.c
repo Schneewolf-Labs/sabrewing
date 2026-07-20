@@ -69,7 +69,7 @@ typedef struct {
  * move to VRAM (dev set, host freed): decode reads ~35 GB of residents per
  * token, so this trades the DDR5 bandwidth wall for VRAM bandwidth AND
  * frees the same RAM for the expert cache. */
-typedef struct { float *f; uint16_t *h; void *dev; } Wt;
+typedef struct { float *f; uint16_t *h; void *dev; void *dq8, *dqs; } Wt;  /* dq8/dqs: int8 residents in VRAM */
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -213,6 +213,10 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 /* dispatch on where the weight lives */
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
 #ifdef COLI_CUDA
+    if (W.dq8) {   /* int8 resident in VRAM */
+        if (ink_cuda_matmul_q8(y, x, W.dq8, W.dqs, S, I, O) == 0) return;
+        fprintf(stderr, "cuda int8 matmul failed and host copy was freed\n"); exit(1);
+    }
     if (W.dev) {
         if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
         fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
@@ -505,7 +509,7 @@ static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
  * checkpoint, halves RAM), anything else as f32 (tiny oracle: bit-exact).
  * gpu_ok: bf16 tensors move to VRAM while budget lasts (embed stays host —
  * it's a row lookup, not a matmul). */
-static Wt load_w(Model *m, const char *name, int gpu_ok) {
+static Wt load_w(Model *m, const char *name, int gpu_ok, int O) {
     Wt w = {0};
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
@@ -514,13 +518,33 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
         pread_all(t->fd, w.h, t->nbytes, t->off);
         lora_merge_resident(&m->lora, name, w.h, NULL, t->numel);
 #ifdef COLI_CUDA
+        /* Q8=1: quantize this resident to per-row int8 and keep it in VRAM at half
+         * the bf16 footprint (frees VRAM for the expert tier). O>0 = a plain [O,I]
+         * matmul weight (attention/dense/lm_head); O=0 skips (fused/sliced tensors). */
+        if (g_cuda && gpu_ok && O > 0 && getenv("Q8") &&
+            ink_cuda_free_bytes() > (size_t)t->numel + (size_t)O*4 + (3ULL<<30)) {
+            int64_t In = t->numel / O;
+            int8_t *q8 = malloc(t->numel); float *qs = malloc((size_t)O*4);
+            #pragma omp parallel for schedule(static)
+            for (int64_t o = 0; o < O; o++) {
+                float mx = 0.f;
+                for (int64_t i = 0; i < In; i++) { float a = fabsf(bf16_to_f32(w.h[o*In+i])); if (a>mx) mx=a; }
+                float sc = mx/127.f; if (sc < 1e-12f) sc = 1e-12f;
+                qs[o] = sc; float inv = 1.f/sc;
+                for (int64_t i = 0; i < In; i++) q8[o*In+i] = (int8_t)lrintf(bf16_to_f32(w.h[o*In+i])*inv);
+            }
+            w.dq8 = ink_cuda_upload(q8, t->numel); w.dqs = ink_cuda_upload(qs, (size_t)O*4);
+            free(q8); free(qs);
+            if (w.dq8 && w.dqs) { free(w.h); w.h = NULL; return w; }
+            w.dq8 = w.dqs = NULL;   /* upload failed: fall through to bf16 */
+        }
         /* keep 3 GB VRAM headroom for the activation buffers + future tiers */
         if (g_cuda && gpu_ok && ink_cuda_free_bytes() > (size_t)t->nbytes + (3ULL<<30)) {
             w.dev = ink_cuda_upload(w.h, t->nbytes);
             if (w.dev) { free(w.h); w.h = NULL; }
         }
 #else
-        (void)gpu_ok;
+        (void)gpu_ok; (void)O;
 #endif
     } else {
         w.f = falloc(t->numel);
@@ -531,7 +555,7 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
 }
 static Wt wt_off(Wt w, int64_t off) {
     Wt r = { w.f ? w.f + off : NULL, w.h ? w.h + off : NULL,
-             w.dev ? (char*)w.dev + off*2 : NULL };   /* dev is always bf16 */
+             w.dev ? (char*)w.dev + off*2 : NULL, NULL, NULL };   /* bf16 only (shared experts) */
     return r;
 }
 static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
@@ -605,21 +629,22 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
         } else fprintf(stderr, "[cuda] init failed, running on CPU\n");
     }
 #endif
-    m->embed      = load_w(m, "model.embed_tokens.weight", 0);
+    m->embed      = load_w(m, "model.embed_tokens.weight", 0, 0);
     m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
     m->final_norm = load_t(m, "model.norm.weight");
-    m->lm_head    = load_w(m, "lm_head.weight", 1);
+    m->lm_head    = load_w(m, "lm_head.weight", 1, c->unpad_vocab);
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[320];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
+        int H = L_HEADS(c,i), KV = L_KV(c,i), hd = L_HD(c,i);   /* for per-row int8 quant (O = out rows) */
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
-        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
+        #define LDW(field, suffix, O) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1,O)
         LD(in_ln,  "input_layernorm.weight");
         LD(post_ln,"post_attention_layernorm.weight");
-        LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
-        LDW(v, "self_attn.v_proj.weight"); LDW(r, "self_attn.r_proj.weight");
-        LDW(o, "self_attn.o_proj.weight");
+        LDW(q, "self_attn.q_proj.weight", H*hd);  LDW(k, "self_attn.k_proj.weight", KV*hd);
+        LDW(v, "self_attn.v_proj.weight", KV*hd); LDW(r, "self_attn.r_proj.weight", H*c->d_rel);
+        LDW(o, "self_attn.o_proj.weight", D);
         LD(qn,"self_attn.q_norm.weight"); LD(kn,"self_attn.k_norm.weight");
         LD(relp, "self_attn.rel_logits_proj.proj");
         LD(k_cw, "self_attn.k_sconv.conv1d.weight");
@@ -627,15 +652,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
         LD(a_cw, "attn_sconv.conv1d.weight");
         LD(m_cw, "mlp_sconv.conv1d.weight");
         if (!c->sparse[i]) {
-            LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
+            LDW(dg, "mlp.gate_proj.weight", c->dense_inter); LDW(du, "mlp.up_proj.weight", c->dense_inter);
+            LDW(dd, "mlp.down_proj.weight", D);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.global_scale",i); l->dgs = load_scalar(m,nm,1.f);
         } else {
             LD(router, "mlp.gate.weight");
             LD(rbias,  "mlp.gate.e_score_correction_bias");
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.global_scale",i); l->rgs = load_scalar(m,nm,1.f);
-            LDW(sh_g, "mlp.shared_experts.gate_proj");
-            LDW(sh_u, "mlp.shared_experts.up_proj");
-            LDW(sh_d, "mlp.shared_experts.down_proj");
+            LDW(sh_g, "mlp.shared_experts.gate_proj", 0);   /* fused/sliced (wt_off) -> keep bf16 */
+            LDW(sh_u, "mlp.shared_experts.up_proj", 0);
+            LDW(sh_d, "mlp.shared_experts.down_proj", 0);
         }
         #undef LD
         #undef LDW
@@ -713,7 +739,7 @@ static void mtp_load(Model *m) {
          * forward is cheap, and on the real model VRAM is already ~full with the
          * main bf16 residents — uploading 10 GB more would OOM the A6000. */
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.mtp.%d." suffix,k); l->field = load_t(m,nm)
-        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.mtp.%d." suffix,k); l->field = load_w(m,nm,0)
+        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.mtp.%d." suffix,k); l->field = load_w(m,nm,0,0)
         LD(in_ln,  "input_layernorm.weight");
         LD(post_ln,"post_attention_layernorm.weight");
         LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
@@ -729,7 +755,7 @@ static void mtp_load(Model *m) {
         snprintf(nm,sizeof(nm),"model.mtp.%d.mlp.global_scale",k); l->dgs = load_scalar(m,nm,1.f);
         #undef LD
         #undef LDW
-        snprintf(nm,sizeof(nm),"model.mtp.%d.input_proj.weight",k);  mm->in_proj     = load_w(m,nm,0);
+        snprintf(nm,sizeof(nm),"model.mtp.%d.input_proj.weight",k);  mm->in_proj     = load_w(m,nm,0,0);
         snprintf(nm,sizeof(nm),"model.mtp.%d.embed_norm.weight",k);  mm->embed_norm  = load_t(m,nm);
         snprintf(nm,sizeof(nm),"model.mtp.%d.hidden_norm.weight",k); mm->hidden_norm = load_t(m,nm);
         snprintf(nm,sizeof(nm),"model.mtp.%d.mlp.gate_proj.weight",k);
