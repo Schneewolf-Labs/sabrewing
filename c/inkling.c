@@ -1110,6 +1110,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             si[kk] = best;
         }
+        /* FORCE_EXPERTS=1: pin routing to a fixed expert set (0..K-1) so every
+         * token hits the same cached experts — zero misses, isolates the compute
+         * ceiling from disk. Output is garbage (wrong experts); timing is real. */
+        static int fce = -1;
+        if (fce < 0) fce = getenv("FORCE_EXPERTS") ? 1 : 0;
+        if (fce) for (int kk = 0; kk < K; kk++) si[kk] = kk % E;
         /* combine weights: sigmoids of the raw logits of (topK routed + shared),
          * normalized to sum 1 over all K+ns, x route_scale x gate.global_scale */
         float *w = wgt + (int64_t)s*(K+ns); float sum = 0.f;
