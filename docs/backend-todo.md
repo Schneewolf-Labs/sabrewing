@@ -44,7 +44,14 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   experts on-device so the kernel runs without per-token PCIe upload) + dispatch
   in `moe()`. Design + steps: `docs/gpu-experts-design.md`.
 - [ ] mmap expert path — RAM ≥ model machines (the R740 story): page cache = expert cache
-- [ ] int8 residents — smaller-VRAM GPUs and 128 GB boxes
+- [~] int8 residents (`Q8=1`) — per-row int8 quant of the plain [O,I] residents
+  (attention, dense, lm_head) kept in VRAM at half the bf16 footprint, freeing
+  room for the GPU expert tier (and helping smaller-VRAM GPUs). Lossless on the
+  real model (ppl 8.01 bf16 → 7.35 int8; the int8 path uses full-f32 activations).
+  `ink_cuda_matmul_q8` validated vs CPU. **Measured: the GPU expert tier went
+  402 → 780 experts (11.4 → 22.1 GB VRAM), ~1.94x, from the ~11 GB freed.**
+  Remaining: int8 the fused shared experts too (currently bf16); make it the CUDA
+  default once proven.
 - [ ] speculative cache warming — measure (token,layer,expert) routing predictability first
 
 ## Done
