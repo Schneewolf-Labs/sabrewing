@@ -969,6 +969,9 @@ static int usage_save(Model *m, const char *snap) {
     const char *env = getenv("PIN");
     const char *sv = getenv("USAGE_SAVE");
     if (sv && *sv == '0') return 0;
+    /* FORCE_EXPERTS routes to a fixed set (diagnostic) — never let that garbage
+     * routing overwrite the real usage ranking, or it poisons the pins. */
+    if (getenv("FORCE_EXPERTS")) return 0;
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
