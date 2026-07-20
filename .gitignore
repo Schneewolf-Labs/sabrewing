@@ -69,6 +69,12 @@ c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
 c/tests/test_uring
+c/tests/test_dsa_select
+c/tests/test_logit_nan
+c/tests/test_qsim_group
+c/tests/test_sample_nan
+c/tests/test_st_pread
+c/tests/test_topp
 
 # build artifacts
 *.o
