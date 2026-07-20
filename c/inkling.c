@@ -639,7 +639,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     char nm[320];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        int H = L_HEADS(c,i), KV = L_KV(c,i), hd = L_HD(c,i);   /* for per-row int8 quant (O = out rows) */
+        int H = L_HEADS(c,i), hd = L_HD(c,i);   /* o_proj input dim = H*hd, for per-row int8 quant */
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         #define LDW(field, suffix, O) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1,O)
         LD(in_ln,  "input_layernorm.weight");
