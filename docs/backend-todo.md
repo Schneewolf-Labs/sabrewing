@@ -52,14 +52,24 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   402 → 780 experts (11.4 → 22.1 GB VRAM), ~1.94x, from the ~11 GB freed.**
   Remaining: int8 the fused shared experts too (currently bf16); make it the CUDA
   default once proven.
-- [~] **router-driven prefetch** — THE lever for the novel-prompt disk wall.
-  Measured (2026-07-20, `gpu-experts-design.md`): novel prompts are ~82% hit /
-  0.12 tok/s, disk-bound (`fill` 289 s vs `expert-mm` 18 s); the compute ceiling
-  at 100% hit is 2.20 tok/s (`FORCE_EXPERTS=1`), so disk costs ~18×. Pin quality
-  is irrelevant on novel prompts (needed experts were never in history), and no
-  static residency fits 465 GB in 195 GB. Fix: the instant the router picks top-k,
-  kick the async load so the ~35 ms miss overlaps compute. Zero quality cost,
-  helps first-touch regardless of distribution.
+- [x] **router-driven prefetch — RULED OUT by measurement.** Instrumented the miss
+  composition (`[misses]` line): on a novel prompt, **94% of misses are
+  cold-first-touch** (expert never seen this generation) vs only **6% churn**
+  (evicted then re-needed). History/temporal prefetch (prev-token, recent-window)
+  can only catch the 6% churn tail — the 94% are experts reached for the first
+  time, absent from all prior routing, so no history-based predictor can prefetch
+  them. The only prefetch that *could* help is a speculative cross-layer
+  router-preview (predict layer L+1's routing from L's hidden state, to load ahead
+  of the sequential dependency) — research-grade, uncertain, deprioritized.
+- [ ] **capacity is the lever** (94% cold-first-touch ⇒ the expert must be resident
+  before first use). Sub-levers, in order: (1) int8 residents as the CUDA default
+  (frees VRAM → 780 vs 402 experts on-device; proven lossless); (2) **REAP** —
+  shrink the 256-expert universe so a fixed RAM+VRAM budget covers a larger
+  fraction AND routing redistributes onto hotter (more-likely-resident) experts;
+  needs an Inkling converter + ppl-gated depth sweep (GLM's safe point was
+  K=192/256); (3) push the RAM cache cap toward the ~87/layer RAM ceiling. Hard
+  ceiling: 465 GB experts vs ~195 GB addressable — capacity narrows the gap
+  (coverage → fewer cold touches) but cannot fully close it without a RAM upgrade.
 
 ## Done
 
