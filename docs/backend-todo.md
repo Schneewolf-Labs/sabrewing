@@ -52,7 +52,14 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   402 → 780 experts (11.4 → 22.1 GB VRAM), ~1.94x, from the ~11 GB freed.**
   Remaining: int8 the fused shared experts too (currently bf16); make it the CUDA
   default once proven.
-- [ ] speculative cache warming — measure (token,layer,expert) routing predictability first
+- [~] **router-driven prefetch** — THE lever for the novel-prompt disk wall.
+  Measured (2026-07-20, `gpu-experts-design.md`): novel prompts are ~82% hit /
+  0.12 tok/s, disk-bound (`fill` 289 s vs `expert-mm` 18 s); the compute ceiling
+  at 100% hit is 2.20 tok/s (`FORCE_EXPERTS=1`), so disk costs ~18×. Pin quality
+  is irrelevant on novel prompts (needed experts were never in history), and no
+  static residency fits 465 GB in 195 GB. Fix: the instant the router picks top-k,
+  kick the async load so the ~35 ms miss overlaps compute. Zero quality cost,
+  helps first-touch regardless of distribution.
 
 ## Done
 

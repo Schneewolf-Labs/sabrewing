@@ -92,3 +92,37 @@ byte-identical (oracle 0.00%).
    per-call launch/sync overhead across a token's experts.
 3. **Dynamic RAM↔VRAM repin** (colibri.c `repin_pass`) — keep the *actually-routed*
    experts on-device, not just the statically-hottest.
+
+## Coverage measurement (2026-07-20) — where the disk wall really is
+
+Grounded the "does it fit" question. Model: 256 experts/layer × 64 sparse layers,
+~28 MB int4 each = **~465 GB experts** vs 176 GB free RAM + 48 GB VRAM.
+
+**Cold coverage** (analytic, from the `.coli_usage` histogram — fraction of routing
+mass in the top-X hottest experts per layer): top-40 → 63%, top-79 → 82%,
+top-192 → 99%. But top-192 = 355 GB, does not fit RAM.
+
+**Two regimes** (the actual finding):
+- *Warm / in-distribution*: LRU reuse within a generation lifts the live hit ~20 pts
+  above cold coverage. ~80/layer (146 GB, fits RAM today) → ~90–96% hit. Basically
+  fits now; REAP not required.
+- *Novel prompt*: measured 82.3% hit / 0.12 tok/s at 40 pins, disk-bound (`fill`
+  289 s vs `expert-mm` 18 s). **Pin quality is irrelevant here** — a clean ranking
+  (82.3%) ≈ a FORCE-poisoned one (83.5%), because a novel domain routes to experts
+  that were never in the history, so they miss regardless of what's pinned.
+
+**Compute ceiling** (`FORCE_EXPERTS=1`, fixed expert set, 100% hit): 2.20 tok/s —
+so the disk tail costs the novel-prompt run ~18×, and `expert-mm` (~18 s) is
+near-identical warm or cold, i.e. compute is not the bottleneck.
+
+**Fit arithmetic**: addressable ≈ 176 GB RAM + ~30 GB VRAM (int8 residents) ≈
+195 GB. Zero-disk fit needs experts ≤195 GB → prune to K≈107/256 (42%), deeper
+than GLM's repetition-loop threshold (144) — quality-fatal. REAP-192 (safe) + RAM
++ VRAM ≈ 55% resident → ~92% cold / ~97% warm; halves the novel gap but is not a
+full fit. **Conclusion: the residual novel-prompt cold-touch is a _prefetch_
+problem, not a capacity one** — prefetch (overlap the ~35 ms load with compute)
+is the only lever that helps first-touch regardless of distribution, at zero
+quality cost. REAP + int8 + RAM raise the ceiling but cannot make 465 GB fit 195 GB.
+
+Diagnostic knob: `FORCE_EXPERTS=1` (routes every token to experts 0..K-1; implies
+`USAGE_SAVE=0` so it can't poison the ranking).
