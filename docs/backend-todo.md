@@ -58,9 +58,12 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   (evicted then re-needed). History/temporal prefetch (prev-token, recent-window)
   can only catch the 6% churn tail — the 94% are experts reached for the first
   time, absent from all prior routing, so no history-based predictor can prefetch
-  them. The only prefetch that *could* help is a speculative cross-layer
-  router-preview (predict layer L+1's routing from L's hidden state, to load ahead
-  of the sequential dependency) — research-grade, uncertain, deprioritized.
+  them. Router near-miss overfetch also ruled out (`[overfetch probe]`): at M=16
+  only 15% of cold-touches were in the previous token's top-16, 85% jump into the
+  top-6 from below rank 16 — and overfetching top-16 is 2.7× the disk traffic to
+  catch 15%, net-negative. The only prefetch that *could* help is a speculative
+  cross-layer router-preview (predict layer L+1's routing from L's hidden state,
+  to load ahead of the sequential dependency) — research-grade, deprioritized.
 - [ ] **capacity is the lever** (94% cold-first-touch ⇒ the expert must be resident
   before first use). Sub-levers, in order: (1) int8 residents as the CUDA default
   (frees VRAM → 780 vs 402 experts on-device; proven lossless); (2) **REAP** —
