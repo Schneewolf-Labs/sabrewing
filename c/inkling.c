@@ -121,6 +121,7 @@ typedef struct {
     uint8_t **seen;                       /* per-layer: expert touched this generation (miss classification) */
     int **prev_topm; int topm;            /* previous decode token's top-M router picks per layer (overfetch probe) */
     int qsim_bits, qsim_all, qsim_hotkeep;/* heat-tiered quant SIM: degrade cold experts to N-bit (quality probe) */
+    int qsim_group;                       /* scale-group size in cols for the SIM (0 = per-row) */
     uint32_t *qsim_thr;                   /* per-layer usage threshold: >= keeps int4, < degrades */
     int npin;                             /* pinned experts per sparse layer */
     uint64_t clock, hits, miss, miss_cold, miss_churn, cold_recover, cold_novel;
@@ -846,27 +847,35 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
 }
 
 /* heat-tiered quant SIM (quality probe only): degrade a packed-int4 weight matrix
- * to `bits`-bit effective precision, per row, in place — re-quantize the int4
- * integer part (nibble-8) to a 2^bits symmetric grid sharing the same row scale.
+ * to `bits`-bit effective precision, in place — re-quantize the int4 integer part
+ * (nibble-8) to a 2^bits symmetric grid sharing the same row scale. `gb` = bytes
+ * per scale group along the input dim (0 = whole row); QSIM_GROUP=64 simulates
+ * int2-g64, the measured ~0.43-vs-0.55 rel-err lever (docs/heat-quant-design.md).
+ * The result still snaps back onto the int4 nibble grid, so the sim is a
+ * pessimistic floor for a real format storing one f32 scale per group.
  * Lets us measure sub-int4 perplexity with no new format/kernel. */
-static void qsim_row(uint8_t *p, int64_t rows, int64_t nb /*bytes/row = cols/2*/, int bits) {
+static void qsim_row(uint8_t *p, int64_t rows, int64_t nb /*bytes/row = cols/2*/, int bits, int64_t gb) {
     int lv = 1 << (bits - 1);   /* qi in [-lv, lv-1]; bits=2 -> 4 levels */
+    if (gb <= 0 || gb > nb) gb = nb;
     for (int64_t r = 0; r < rows; r++) {
         uint8_t *row = p + r*nb;
-        int mx = 0;
-        for (int64_t b = 0; b < nb; b++) {
-            int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
-            if (abs(lo) > mx) mx = abs(lo); if (abs(hi) > mx) mx = abs(hi);
-        }
-        if (mx == 0) continue;
-        float step = (float)mx / lv;
-        for (int64_t b = 0; b < nb; b++) {
-            int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
-            int qlo = lrintf(lo/step); if (qlo < -lv) qlo = -lv; if (qlo > lv-1) qlo = lv-1;
-            int qhi = lrintf(hi/step); if (qhi < -lv) qhi = -lv; if (qhi > lv-1) qhi = lv-1;
-            int vlo = lrintf(qlo*step)+8; if (vlo < 0) vlo = 0; if (vlo > 15) vlo = 15;
-            int vhi = lrintf(qhi*step)+8; if (vhi < 0) vhi = 0; if (vhi > 15) vhi = 15;
-            row[b] = (uint8_t)(vlo | (vhi<<4));
+        for (int64_t g = 0; g < nb; g += gb) {
+            int64_t ge = g + gb < nb ? g + gb : nb;   /* partial last group */
+            int mx = 0;
+            for (int64_t b = g; b < ge; b++) {
+                int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
+                if (abs(lo) > mx) mx = abs(lo); if (abs(hi) > mx) mx = abs(hi);
+            }
+            if (mx == 0) continue;
+            float step = (float)mx / lv;
+            for (int64_t b = g; b < ge; b++) {
+                int lo = (row[b]&0xF)-8, hi = (row[b]>>4)-8;
+                int qlo = lrintf(lo/step); if (qlo < -lv) qlo = -lv; if (qlo > lv-1) qlo = lv-1;
+                int qhi = lrintf(hi/step); if (qhi < -lv) qhi = -lv; if (qhi > lv-1) qhi = lv-1;
+                int vlo = lrintf(qlo*step)+8; if (vlo < 0) vlo = 0; if (vlo > 15) vlo = 15;
+                int vhi = lrintf(qhi*step)+8; if (vhi < 0) vhi = 0; if (vhi > 15) vhi = 15;
+                row[b] = (uint8_t)(vlo | (vhi<<4));
+            }
         }
     }
 }
@@ -893,8 +902,8 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         snprintf(qs,sizeof(qs),"%s.qs",nm);
         read_f32_slice(&m->S, qs, s->s2, eid*D, D);
         if (qsim_cold(m, layer, (int)eid)) {   /* heat-tiered quant probe */
-            qsim_row(s->p13, 2*I, m->rb13, m->qsim_bits);
-            qsim_row(s->p2,  D,   m->rb2,  m->qsim_bits);
+            qsim_row(s->p13, 2*I, m->rb13, m->qsim_bits, m->qsim_group/2);
+            qsim_row(s->p2,  D,   m->rb2,  m->qsim_bits, m->qsim_group/2);
         }
     } else if (m->quant_bits) {
         float *tmp = falloc(n13 > n2 ? n13 : n2);
@@ -958,10 +967,14 @@ static void pins_load(Model *m, const char *snap) {
     if (m->npin < 0) m->npin = 0;
     /* heat-tiered quant probe: QSIM_BITS=2|3 degrades cold experts to N-bit;
      * QSIM_ALL=1 degrades all (uniform control); QSIM_HOT_KEEP=N experts/layer
-     * kept at int4 (default = npin, i.e. the pinned hot set). */
+     * kept at int4 (default = npin, i.e. the pinned hot set); QSIM_GROUP=N
+     * re-scales per N input cols instead of per row (int2-g64 sim). */
     m->qsim_bits = getenv("QSIM_BITS") ? atoi(getenv("QSIM_BITS")) : 0;
     m->qsim_all  = getenv("QSIM_ALL") ? 1 : 0;
     m->qsim_hotkeep = getenv("QSIM_HOT_KEEP") ? atoi(getenv("QSIM_HOT_KEEP")) : m->npin;
+    m->qsim_group = getenv("QSIM_GROUP") ? atoi(getenv("QSIM_GROUP")) : 0;
+    if (m->qsim_group < 0) m->qsim_group = 0;
+    if (m->qsim_group & 1) { fprintf(stderr, "QSIM_GROUP must be even (2 cols per packed byte)\n"); exit(1); }
     if (m->qsim_bits && !m->qsim_all) m->qsim_thr = calloc(c->n_layers, 4);
     uint32_t *tmp = malloc((size_t)E * 4);
     Slot **ps = malloc((size_t)c->n_layers * m->npin * sizeof(Slot*));

@@ -39,10 +39,20 @@ Usage
         --tasks hellaswag,arc_challenge,mmlu --limit 200 \
         --schemes fp16,int4,int4-g64,int4-g128
 
-Scheme grammar: fp16 | int{2,4,8}[-g<N>][-nohead]
+Scheme grammar: fp16 | int{2,4,8}[-g<N>][-nohead] | heat<K>-<hot>+<cold>
     int4          per-row absmax int4 -- what the converter ships today
     int4-g64      one scale per 64 input weights instead of per row
     int4-nohead   as int4, but lm_head/embed kept in fp16
+    heat10-int4+int2-g64
+                  heat-tiered experts (docs/heat-quant-design.md): rank experts
+                  per layer by routing mass measured on --calib-ctx calibration
+                  contexts, keep the top K at the <hot> scheme, degrade the rest
+                  to <cold>; non-expert tensors get <hot>. This is the fast
+                  quality harness for the sabre heat-tiering plan: it turns the
+                  weight-space reconstruction proxy into task accuracy on a
+                  small MoE in minutes (a GLM full forward is disk-bound).
+                  OLMoE has 64 experts/layer vs GLM's 256, so GLM top-40 (16%)
+                  ~ OLMoE heat10, GLM top-79 (31%) ~ OLMoE heat20.
 """
 import argparse
 import json
@@ -196,6 +206,8 @@ def _quant_e8(x, group, ball):
 
 
 SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?)?(-rot)?(-nohead)?$")
+HEAT_RE   = re.compile(r"^heat(\d+)-(int[2348](?:-g\d+)?)\+(int[2348](?:-g\d+)?)$")
+_SUB_RE   = re.compile(r"^int(\d)(?:-g(\d+))?$")
 
 
 def parse_scheme(name):
@@ -204,14 +216,103 @@ def parse_scheme(name):
         return None
     m = SCHEME_RE.match(name)
     if not m:
-        raise SystemExit(f"bad scheme '{name}' (expected fp16 | int{{2,3,4,8}}[-g<N>][-e8|-e8u][-rot][-nohead])")
+        raise SystemExit(f"bad scheme '{name}' (expected fp16 | int{{2,3,4,8}}[-g<N>][-e8|-e8u][-rot][-nohead]"
+                         f" | heat<K>-int<B>[-g<N>]+int<B>[-g<N>])")
     return int(m.group(1)), int(m.group(2) or 0), m.group(3) or "", bool(m.group(4)), bool(m.group(5))
+
+
+def parse_heat(name):
+    """'heat10-int4+int2-g64' -> (K, (hot_bits, hot_group), (cold_bits, cold_group)); None if not heat."""
+    m = HEAT_RE.match(name)
+    if not m:
+        return None
+    sub = lambda s: (int(_SUB_RE.match(s).group(1)), int(_SUB_RE.match(s).group(2) or 0))
+    return int(m.group(1)), sub(m.group(2)), sub(m.group(3))
 
 
 def is_router(name):
     # The router (mlp.gate.weight) stays f32 in the converter -- convert_fp8_to_int4.py:14.
     # Careful: expert weights are gate_proj/up_proj/down_proj and DO get quantized.
     return name.endswith("mlp.gate.weight")
+
+
+# --------------------------------------------------------------------------------------
+# Heat-tiered expert quantization (docs/heat-quant-design.md). The sabre analysis showed
+# per-expert quant error is UNIFORM across heat, so tiering is purely a mass-weighting
+# win: rank experts by routing mass on calibration text, keep the top-K per layer at the
+# hot scheme, push the tail to the cold one. Reconstruction error is only a proxy for
+# quality (naive round, no error correction, MoE redundancy) — this harness closes that
+# gap with real task accuracy on a model small enough to iterate on.
+# --------------------------------------------------------------------------------------
+LAYER_RE       = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+EXPERT_NAME_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")   # per-expert nn.Linear layout
+
+
+@torch.no_grad()
+def measure_expert_mass(model, tk, ctxs, device):
+    """Per-(layer, expert) routing mass: sum over calibration tokens of the softmax
+    probability of each top-k-selected expert. Mirrors what .coli_usage measures on
+    sabre (selection counts), but mass-weighted and on a controllable corpus."""
+    top_k = getattr(model.config, "num_experts_per_tok", None) or 8
+    mass, hooks = {}, []
+
+    def mk_hook(layer):
+        def fn(mod, inp, out):
+            logits = out[0] if isinstance(out, tuple) else out
+            p = torch.softmax(logits.float().reshape(-1, logits.shape[-1]), dim=-1)
+            v, i = p.topk(top_k, dim=-1)
+            acc = mass.setdefault(layer, torch.zeros(p.shape[-1], dtype=torch.float64))
+            acc.index_add_(0, i.reshape(-1).cpu(), v.reshape(-1).double().cpu())
+        return fn
+
+    for name, mod in model.named_modules():
+        if name.endswith("mlp.gate"):
+            hooks.append(mod.register_forward_hook(mk_hook(int(LAYER_RE.search(name).group(1)))))
+    if not hooks:
+        raise SystemExit("no *.mlp.gate modules found — cannot rank experts for a heat scheme")
+    for ctx in ctxs:
+        ids = tk(ctx, add_special_tokens=False).input_ids[:512]
+        model(torch.tensor([ids], device=device))
+    for h in hooks:
+        h.remove()
+    return mass
+
+
+def apply_heat_scheme(model, scheme, mass):
+    """Top-K experts/layer by mass -> hot scheme; the rest -> cold; everything else
+    (attn, dense mlp, shared experts, embed/head) -> hot. Router stays float."""
+    k, (hb, hg), (cb, cg) = parse_heat(scheme)
+    hot = {L: set(m.topk(min(k, m.numel())).indices.tolist()) for L, m in mass.items()}
+    fr = [sorted(m.tolist(), reverse=True) for m in mass.values()]
+    kept = sum(sum(r[:k]) / max(sum(r), 1e-9) for r in fr) / max(len(fr), 1)
+    total = sum(p.numel() for p in model.parameters())
+    n = qp = nhot = ncold = 0
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.ndim < 2 or is_router(name):
+                continue
+            em = EXPERT_NAME_RE.search(name)
+            if em:                                        # per-expert 2D layout (OLMoE)
+                L = int(LAYER_RE.search(name).group(1))
+                cold = int(em.group(1)) not in hot[L]
+                bits, group = (cb, cg) if cold else (hb, hg)
+                ncold += cold; nhot += not cold
+            elif p.ndim == 3 and ".experts." in name:     # fused [E, in, out] layout (GLM)
+                L = int(LAYER_RE.search(name).group(1))
+                qh = quantize_param(p.data.float(), hb, hg)
+                qc = quantize_param(p.data.float(), cb, cg)
+                is_hot = torch.tensor([e in hot[L] for e in range(p.shape[0])], device=p.device)
+                p.data.copy_(torch.where(is_hot[:, None, None], qh, qc).to(p.dtype))
+                nhot += int(is_hot.sum()); ncold += int((~is_hot).sum())
+                n += 1; qp += p.numel()
+                continue
+            else:                                         # attn / dense / shared / embed / head
+                bits, group = hb, hg
+            p.data.copy_(quantize_param(p.data.float(), bits, group).to(p.dtype))
+            n += 1; qp += p.numel()
+    print(f"  [heat] top-{k}/layer kept hot ({100*kept:.1f}% of routing mass); "
+          f"expert tensors: {nhot} hot / {ncold} cold", flush=True)
+    return n, qp, total
 
 
 def is_head_or_embed(name):
@@ -312,7 +413,12 @@ def main():
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--schemes", default="fp16,int4,int4-g128",
-                    help="comma list: fp16 | int{2,4,8}[-g<N>][-nohead]")
+                    help="comma list: fp16 | int{2,4,8}[-g<N>][-nohead] | heat<K>-int<B>[-g<N>]+int<B>[-g<N>] "
+                         "(e.g. heat10-int4+int2-g64: top-10 experts/layer by measured routing mass stay "
+                         "int4, the rest drop to int2-g64)")
+    ap.add_argument("--calib-ctx", type=int, default=32,
+                    help="calibration contexts (from the first task) used to rank experts by "
+                         "routing mass for heat-* schemes")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--min-coverage", type=float, default=95.0,
                     help="fail if a scheme quantized less than this %% of params (catches the "
@@ -325,7 +431,8 @@ def main():
     tasks = a.tasks.split(",")
     schemes = a.schemes.split(",")
     for s in schemes:
-        parse_scheme(s)                              # fail fast on a typo
+        if parse_heat(s) is None:
+            parse_scheme(s)                          # fail fast on a typo
 
     tk = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     prefix = detect_prefix(tk) if a.prefix is None else a.prefix
@@ -334,7 +441,7 @@ def main():
           flush=True)
     docs = {t: load_docs(t, a.data, a.limit, a.seed, prefix) for t in tasks}
 
-    means, rows = {}, {}
+    means, rows, mass = {}, {}, None
     for scheme in schemes:
         model = AutoModelForCausalLM.from_pretrained(
             a.model, dtype=torch.float16, low_cpu_mem_usage=True,
@@ -343,7 +450,14 @@ def main():
         if a.device != "cuda":
             model.to(a.device)
 
-        n, qp, tp = apply_scheme(model, scheme)
+        if parse_heat(scheme):
+            if mass is None:                         # rank once, on fp16 weights, reuse across heat schemes
+                calib = [d["ctx"] for d in docs[tasks[0]][:a.calib_ctx]]
+                print(f"[calib] measuring routing mass on {len(calib)} contexts...", flush=True)
+                mass = measure_expert_mass(model, tk, calib, a.device)
+            n, qp, tp = apply_heat_scheme(model, scheme, mass)
+        else:
+            n, qp, tp = apply_scheme(model, scheme)
         cov = 100 * qp / tp if tp else 0.0
         print(f"[{scheme}] {n} tensors · {qp/1e9:.2f}B/{tp/1e9:.2f}B params ({cov:.1f}% coverage)",
               flush=True)

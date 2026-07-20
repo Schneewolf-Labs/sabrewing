@@ -70,23 +70,52 @@ on the orthogonal (bytes-per-expert) axis, and the two **compose**.
 
 ## Probe scaffold (shipped, env-gated, default off)
 
-`slot_fill` degrades a cold expert's int4 nibbles to N-bit in place (per-row,
-sharing the int4 row scale — the naive floor). Controls:
+`slot_fill` degrades a cold expert's int4 nibbles to N-bit in place (sharing the
+int4 row scale — the naive floor). Controls:
 - `QSIM_BITS=2|3` — target bits for degraded (cold) experts.
 - `QSIM_HOT_KEEP=N` — experts/layer kept at int4 (default = `PIN_N`, the pinned
   hot set); heat computed from the `.coli_usage`-seeded per-layer threshold.
 - `QSIM_ALL=1` — degrade every expert (uniform control).
+- `QSIM_GROUP=N` — re-scale per N input columns instead of per row (int2-g64
+  sim; even N, 0 = per-row). Values still snap back onto the int4 nibble grid,
+  so the sim is a pessimistic floor for a real format storing an f32 scale per
+  group. Exactness + monotonicity covered by `tests/test_qsim_group.c`.
 
 This is a *quality* probe (perf irrelevant). A real implementation would store
 mixed-precision experts on disk + add an int2 GEMM path (and ideally group scales
 + error correction). The weight-space Pareto analysis above (instant, no forward)
 is the tool for iterating the scheme before that build.
 
+## Fast quality harness (shipped): heat schemes in `tools/quant_ablation.py`
+
+The full-model teacher-forced forward on sabre is disk-bound (>7 min for 20
+tokens), so quality iteration runs on OLMoE via the existing ablation harness,
+now extended with heat-tiered schemes:
+
+```sh
+python tools/quant_ablation.py --model allenai/OLMoE-1B-7B-0924 --data ./bench \
+    --schemes fp16,int4,int2-g64,heat10-int4+int2-g64,heat20-int4+int2-g64
+```
+
+`heat<K>-<hot>+<cold>` ranks experts per layer by routing mass measured on
+`--calib-ctx` calibration contexts (forward hooks on every `mlp.gate`), keeps
+the top K at the hot scheme, degrades the rest to cold; non-expert tensors get
+the hot scheme, the router stays float. Both expert layouts are handled
+(fused 3D `[E,in,out]` and per-expert 2D Linears). OLMoE has 64 experts/layer
+vs GLM's 256, so GLM top-40 (16%) ≈ OLMoE `heat10`, GLM top-79 (31%) ≈
+`heat20`. The interesting readout: does `heat10-int4+int2-g64` beat uniform
+`int3` on task accuracy the way it does on weight-space damage (the Pareto
+claim above), and how much of the int2 tail's damage do group scales recover.
+Covered by `tests/test_quant_ablation_heat.py` (skips itself when torch is
+absent — dev-only dep, the engine stays dependency-free).
+
 ## Recommended next steps
 
-1. **Group scales for the int2 path** (int2-g64) — the single biggest quality
-   lever, already measured (~0.43 vs 0.55). Prerequisite for viable sub-int4.
-2. **A fast ppl harness** — offline expert-only error → output MSE on a fixed
-   activation set, or a tiny calibration model, to turn the reconstruction proxy
-   into a real quality number without the disk-bound full forward.
-3. **Then** build the mixed-precision storage + int2 GEMM, gated on that ppl.
+1. ~~Group scales for the int2 path~~ — **shipped in the probe** (`QSIM_GROUP`,
+   see above) and in the harness (`int2-g64` / `heat…+int2-g64` schemes).
+2. ~~A fast quality harness~~ — **shipped** (heat schemes on OLMoE, above). Run
+   it: if heat-tiering's task-accuracy Pareto matches the weight-space one,
+   the scheme is validated; if not, the reconstruction proxy is misleading and
+   the scheme needs error correction (GPTQ/AWQ-style) before any format work.
+3. **Then** build the mixed-precision storage + int2 GEMM (with group scales),
+   gated on that quality number.
