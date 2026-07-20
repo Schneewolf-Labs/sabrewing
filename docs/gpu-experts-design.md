@@ -86,12 +86,21 @@ byte-identical (oracle 0.00%).
 
 ## Next (to actually unlock it)
 
-1. **int8 residents** — frees ~18 GB VRAM → ~3× more experts on-device. Biggest
-   single multiplier; already on backend-todo.
-2. **Batched GPU expert calls** (colibri.c `coli_cuda_expert_group`) — amortize
-   per-call launch/sync overhead across a token's experts.
+1. [x] **int8 residents — DEFAULT under CUDA** (`Q8=0` opts out). Frees VRAM so the
+   expert tier went **402 → 780 resident (22.1 GB)**. Lossless (ppl 7.35 vs 8.01).
+2. [x] **Fused GPU expert kernel** (`ink_cuda_expert_q4`) — gate+up → silu-glu →
+   down in one launch/sync on device, no host silu bounce, 2→1 syncs per expert.
+   Decode-only (S=1), no-LoRA; token-exact (`--cuda-q4-test`, scaled-rel 2.2e-5).
+   The VRAM experts are the hottest (~1/3 of routing mass in-distribution), so this
+   is where the warm-decode per-expert overhead actually is. (colibri.c parallel:
+   `coli_cuda_expert_group` — this is the Inkling equivalent.)
 3. **Dynamic RAM↔VRAM repin** (colibri.c `repin_pass`) — keep the *actually-routed*
    experts on-device, not just the statically-hottest.
+
+Note (2026-07-20): these are **warm-regime** levers (compute efficiency on the
+resident tier). They do **not** help the novel-prompt disk wall — that's 94%
+cold-first-touch (capacity-bound, see the coverage measurement above and
+`backend-todo.md`). Warm and cold are separate problems; these ship the warm side.
 
 ## Coverage measurement (2026-07-20) — where the disk wall really is
 

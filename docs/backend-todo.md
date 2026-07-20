@@ -50,8 +50,8 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   real model (ppl 8.01 bf16 → 7.35 int8; the int8 path uses full-f32 activations).
   `ink_cuda_matmul_q8` validated vs CPU. **Measured: the GPU expert tier went
   402 → 780 experts (11.4 → 22.1 GB VRAM), ~1.94x, from the ~11 GB freed.**
-  Remaining: int8 the fused shared experts too (currently bf16); make it the CUDA
-  default once proven.
+  **Now the CUDA default** (2026-07-20, `Q8=0` opts out): 402 → 780 resident.
+  Remaining: int8 the fused shared experts too (currently bf16).
 - [x] **router-driven prefetch — RULED OUT by measurement.** Instrumented the miss
   composition (`[misses]` line): on a novel prompt, **94% of misses are
   cold-first-touch** (expert never seen this generation) vs only **6% churn**
