@@ -1830,7 +1830,23 @@ int main(int argc, char **argv) {
         int ok = rel < 1e-3;
         printf("q4 GPU vs CPU (I=%d O=%d): max abs %.2e, mean|y| %.3f, scaled-rel %.2e  %s\n",
                I, O, maxabs, meany, rel, ok ? "[OK]" : "[FAIL]");
-        return ok ? 0 : 1;
+
+        /* int8 residents kernel: signed int8 weights + per-row scale vs CPU matmul_q */
+        int8_t *q8 = malloc((size_t)O*I);
+        float *q8s = malloc((size_t)O*4);
+        for (size_t j = 0; j < (size_t)O*I; j++) q8[j] = (int8_t)((rand()%255)-127);
+        for (int o = 0; o < O; o++) q8s[o] = ((rand()%2000)-1000)/1000000.f;
+        matmul_q(ycpu, x, q8, q8s, I, O);
+        void *dq8 = ink_cuda_upload(q8, (size_t)O*I), *dq8s = ink_cuda_upload(q8s, (size_t)O*4);
+        int ok8 = 0;
+        if (dq8 && dq8s && ink_cuda_matmul_q8(ygpu, x, dq8, dq8s, 1, I, O) == 0) {
+            double ma = 0, my = 0;
+            for (int o = 0; o < O; o++) { double d = fabs((double)ycpu[o]-ygpu[o]); if (d>ma) ma=d; my += fabs((double)ycpu[o]); }
+            my /= O; double r8 = ma/(my+1e-9); ok8 = r8 < 1e-3;
+            printf("q8 GPU vs CPU (I=%d O=%d): max abs %.2e, mean|y| %.3f, scaled-rel %.2e  %s\n",
+                   I, O, ma, my, r8, ok8 ? "[OK]" : "[FAIL]");
+        } else fprintf(stderr, "[q8-test] GPU path failed\n");
+        return (ok && ok8) ? 0 : 1;
     }
 #endif
 
