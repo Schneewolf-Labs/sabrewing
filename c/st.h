@@ -40,6 +40,9 @@ typedef struct {
     int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
     char      *paths[512];
     int        nfd;
+    int        mfds[512];  /* MIRROR: fds of the second model copy (dual-SSD), -1 = absent */
+    int        mdfds[512]; /* O_DIRECT twins of the second copy, -1 = absent */
+    int        nmirror;    /* files accepted into the mirror (0 = mirror inactive) */
     int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
                            * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
                            * costava decine di secondi/token (misurato sul primo run reale) */
@@ -99,9 +102,79 @@ static int st_open_fd(shards *S, const char *path) {
 
 /* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
  * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
-static int st_direct_fd(shards *S, int fd) {
-    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return S->dfds[i];
+static int st_fidx(shards *S, int fd) {
+    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return i;
     return -1;
+}
+static int st_direct_fd(shards *S, int fd) {
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->dfds[i];
+}
+
+/* ---- MIRROR (dual-SSD): second read-only copy of the model on another drive ----
+ * st_fd_rep/st_direct_fd_rep: fd of replica `rep` (0 = primary, 1 = mirror) for
+ * the SAME file identified by its primary fd. -1 if that replica is absent. */
+static int st_fd_rep(shards *S, int fd, int rep) {
+    if (!rep) return fd;
+    if (!S->nmirror) return -1;
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mfds[i];
+}
+static int st_direct_fd_rep(shards *S, int fd, int rep) {
+    if (!rep) return st_direct_fd(S, fd);
+    if (!S->nmirror) return -1;
+    int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[i];
+}
+
+/* Registers <dir>/<basename> as a read replica of every already-indexed shard.
+ * A file is accepted ONLY if its size and safetensors header are byte-identical
+ * to the primary: the data_offsets then match by construction, so every pread
+ * is valid on either copy. Missing or divergent files simply stay on the
+ * primary (the mirror may be partial, e.g. a smaller SSD holding only the
+ * expert shards). Returns the number of accepted files. The mirror is NEVER
+ * written to: .coli_usage/.coli_kv keep deriving from the primary alone. */
+static int st_mirror_init(shards *S, const char *dir) {
+    if (S->nmirror) for (int i = 0; i < S->nfd; i++) {   /* re-init: drop the old replica */
+        if (S->mfds[i] >= 0) close(S->mfds[i]);
+        if (S->mdfds[i] >= 0) close(S->mdfds[i]);
+    }
+    for (int i = 0; i < ST_MAX_SHARDS; i++) { S->mfds[i] = -1; S->mdfds[i] = -1; }
+    S->nmirror = 0;
+    for (int i = 0; i < S->nfd; i++) {
+        const char *base = strrchr(S->paths[i], '/');
+#ifdef _WIN32
+        const char *b2 = strrchr(S->paths[i], '\\');
+        if (b2 && (!base || b2 > base)) base = b2;
+#endif
+        base = base ? base + 1 : S->paths[i];
+        char mp[2048]; snprintf(mp, sizeof(mp), "%s/%s", dir, base);
+        int mfd = open(mp, COMPAT_O_RDONLY);
+        if (mfd < 0) continue;               /* partial mirror: this shard stays on the primary */
+        int64_t sza = lseek(S->fds[i], 0, SEEK_END), szb = lseek(mfd, 0, SEEK_END);
+        if (sza != szb) {
+            fprintf(stderr, "[MIRROR] %s: size differs from the primary copy — file skipped\n", mp);
+            close(mfd); continue;
+        }
+        uint64_t ha = 0, hb = 0; int ok = 1;   /* identical header => identical data_offsets */
+        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8 ||
+            ha != hb || ha == 0 || ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza) ok = 0;
+        if (ok) {
+            char *ba = malloc(ha), *bb = malloc(ha);
+            if (!ba || !bb || pread(S->fds[i], ba, ha, 8) != (ssize_t)ha ||
+                pread(mfd, bb, ha, 8) != (ssize_t)ha || memcmp(ba, bb, ha)) ok = 0;
+            free(ba); free(bb);
+        }
+        if (!ok) {
+            fprintf(stderr, "[MIRROR] %s: header differs from the primary copy — file skipped\n", mp);
+            close(mfd); continue;
+        }
+        S->mfds[i] = mfd;
+#ifdef O_DIRECT
+        S->mdfds[i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
+#elif defined(__APPLE__)
+        S->mdfds[i] = compat_open_direct(mp);
+#endif
+        S->nmirror++;
+    }
+    return S->nmirror;
 }
 
 /* indicizza tutti i model-*.safetensors in snap_dir */
@@ -254,6 +327,16 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+}
+
+/* like st_prefetch, but on replica `rep`'s drive: the WILLNEED must warm the
+ * page cache of the SAME fd the later demand pread will hit. */
+static void st_prefetch_rep(shards *S, const char *name, int rep) {
+    st_tensor *t = st_find(S, name);
+    if (!t) return;
+    int fd = st_fd_rep(S, t->fd, rep);
+    if (fd < 0) fd = t->fd;
+    posix_fadvise(fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).

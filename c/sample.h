@@ -116,6 +116,16 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     int nsp = 0;
     if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++)
         if (T->id_special[id] && !is_stop(id)) { g_stop[g_nstop++] = id; nsp++; }
+    /* #401: in serve mode keep ONLY <|endoftext|>. Role markers <|user|>/<|observation|>
+     * (config stops + tokenizer special set) are boundaries the Python server owns; as
+     * hard stops they cut generation the moment the model opens a <tool_call> block,
+     * because int4 argmax noise picks a stop-token ID over the correct '<' token. */
+    if (getenv("SERVE") && tok_eos >= 0) {
+        int kept = 0;
+        for (int i = 0; i < g_nstop; i++) if (g_stop[i] == tok_eos) g_stop[kept++] = g_stop[i];
+        if (kept < g_nstop) fprintf(stderr, "[stop] serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n", g_nstop - kept);
+        g_nstop = kept; nsp = 0;
+    }
     fprintf(stderr, "[stop] %d stop tokens:", g_nstop);
     for (int i = 0; i < g_nstop; i++) fprintf(stderr, " %d", g_stop[i]);
     if (nsp) fprintf(stderr, " (%d from the tokenizer's special set)", nsp);

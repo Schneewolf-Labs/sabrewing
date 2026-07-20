@@ -13,15 +13,18 @@ the Inkling engine and everything around it is ours.
 upstream's version.
 
 **MERGED** — we changed them, usually with a matching upstream PR open:
-`tok.h` (o200k → colibri PR #330), `Makefile` (inkling/swing targets),
-`openai_server.py` (inkling arch + serve). Sync only *reports* drift; you merge
-by hand. **When the upstream PR lands, move the file to VENDORED and pull** — the
-upstream version then contains our change and the divergence disappears.
+`Makefile` (inkling targets), `openai_server.py` (inkling arch + serve). Sync
+only *reports* drift; you merge by hand. **When the upstream PR lands, move the
+file to VENDORED and pull** — the upstream version then contains our change and
+the divergence disappears. (`tok.h` followed this path: o200k landed upstream
+as colibri PR #330, so it is VENDORED now.)
 
 **OWNED** — sabrewing-only, sync never touches: `inkling.c`,
 `backend_cuda_ink.*`, `tok_unicode_o200k.h`, `swing`,
-`tools/convert_inkling_int4.py`, `tools/make_tiny_inkling.py`, `docs/`,
-`README.md`, `NOTICE`, `web/` (rewritten in Vue).
+`tools/convert_inkling_int4.py`, `tools/make_tiny_inkling.py`, `docs/`
+(except `ENVIRONMENT.md` and `grammar-draft.md`, which document the vendored
+substrate and are pulled from upstream), `README.md`, `NOTICE`, `web/`
+(rewritten in Vue), `.github/workflows/ci.yml`.
 
 ## Routine
 

@@ -20,8 +20,8 @@ class FakeEngine:
         self.calls = []
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
-        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
+                 cancelled=None, grammar=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot, grammar))
         on_text("Hé")
         on_text("llo")
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
@@ -34,7 +34,7 @@ class BlockingEngine(FakeEngine):
         self.release = threading.Event()
 
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
+                 cancelled=None, grammar=None):
         self.entered.set()
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
@@ -71,11 +71,11 @@ class TemplateTest(unittest.TestCase):
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
-                         (4, 0.0, 1.0))
+                         (4, 0.0, 1.0, None))
         # max_tokens above the server cap is clamped, not rejected (#260): OpenAI
         # clients default to large values; erroring breaks them.
         self.assertEqual(generation_options({"max_tokens": 9, "temperature": 0, "top_p": 1}, 8),
-                         (8, 0.0, 1.0))
+                         (8, 0.0, 1.0, None))
         # non-positive / non-int max_tokens is still a hard error
         with self.assertRaises(APIError):
             generation_options({"max_tokens": 0}, 8)
@@ -84,7 +84,31 @@ class TemplateTest(unittest.TestCase):
         with self.assertRaises(APIError):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
-                         (8, 0.7, 0.9))
+                         (8, 0.7, 0.9, None))
+        # response_format -> grammar plumbing (draft source, never a constraint)
+        opts = generation_options({"max_tokens": 4, "response_format": {"type": "json_object"}}, 8)
+        self.assertIn("root ::=", opts[3])
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        opts = generation_options({"max_tokens": 4, "response_format":
+                                   {"type": "json_schema", "json_schema": {"schema": schema}}}, 8)
+        self.assertEqual(json.loads(opts[3]), schema)
+        opts = generation_options({"max_tokens": 4, "response_format":
+                                   {"type": "gbnf", "grammar": 'root ::= "x"'}}, 8)
+        self.assertEqual(opts[3], 'root ::= "x"')
+        with self.assertRaises(APIError):
+            generation_options({"response_format": {"type": "yaml"}}, 8)
+        with self.assertRaises(APIError):
+            generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        with self.assertRaises(APIError):   # non-dict response_format
+            generation_options({"response_format": "json"}, 8)
+        with self.assertRaises(APIError):   # empty gbnf
+            generation_options({"response_format": {"type": "gbnf", "grammar": "  "}}, 8)
+        with self.assertRaises(APIError):   # oversized grammar (> 1 MiB pre-check)
+            generation_options({"response_format": {"type": "gbnf", "grammar": "x" * ((1 << 20) + 1)}}, 8)
+        # malformed GBNF passes the gateway by design: the ENGINE fail-softs it
+        # (draft source only — bad grammar costs the speedup, never the request)
+        opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
+        self.assertEqual(opts[3], "not a grammar ::=")
 
 
 class ProtocolTest(unittest.TestCase):

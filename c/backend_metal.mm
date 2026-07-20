@@ -219,6 +219,63 @@ kernel void r_top8(device const float* sig [[buffer(0)]], device const float* bi
   if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
   for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
 }
+// parallel replica of r_top8's selection on ONE SIMDGROUP per row instead of one serial
+// thread (bench/kernels @ 27bfe83: serial r_top8 measured 0.465 ms/layer, ~55% of the
+// layer CB; this replica ~93x faster with exactly matching output). EXACT-MATCH is the
+// contract: each lane owns ceil(E/32) contiguous experts (blocked) and keeps a taken
+// bitmask; per selection step: lane-local strict-'>' ascending max (lowest index wins
+// within a lane, matching the serial ascending scan), then a shuffle-down argmax
+// reduction where ties prefer the LOWER index — together exactly the serial kernel's
+// first-max-wins order. The topp/normk/rscale tail is the serial code verbatim on lane 0
+// (same ops, same order => bitwise-identical results; metal-test enforces this with
+// memcmp). Contract: E<=256 (ch[8]/taken mask sizing: ceil(E/32)<=8) — the defensive
+// return below makes an out-of-contract dispatch a visible no-op (idx/w/keff untouched),
+// never an OOB write; both call sites (coli_metal_layer_decode's dispatch and the
+// standalone coli_metal_rtop8 runner) additionally gate on E<=256 in host code before
+// selecting this pipeline at all, so the return here is defense-in-depth, not the only
+// guard. Sentinel-per-lane design (ch[j]=-1e30f for e>=E) makes non-multiple-of-32 E
+// and small E correct without special-casing — validated for E=24, E=168 (REAP
+// expert-pruned packages, see the upstream feature-request thread) and E=256 by metal-test.
+// ASSUMES SIMD width 32 (shuffle offsets 16..1, 32-thread threadgroup per row): enforced
+// at init — coli_metal_init clears g_rtop8_width_ok (and therefore both call sites' use
+// of this pipeline) if threadExecutionWidth != 32.
+kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float* bias [[buffer(1)]],
+                       device int* idx [[buffer(2)]], device float* w [[buffer(3)]],
+                       device int* keff [[buffer(4)]], constant int& E [[buffer(5)]],
+                       constant int& K [[buffer(6)]], constant int& Ksel [[buffer(7)]],
+                       constant float& topp [[buffer(8)]], constant int& normk [[buffer(9)]],
+                       constant float& rscale [[buffer(10)]],
+                       uint s [[threadgroup_position_in_grid]],
+                       uint slane [[thread_index_in_simdgroup]]) {
+  if(E>256) return;
+  device const float* sg=sig+(long)s*E;
+  device int* id_=idx+(long)s*K; device float* ww=w+(long)s*K;
+  int per=(E+31)/32, base=(int)slane*per;
+  float ch[8]; uint taken=0u;
+  for(int j=0;j<per;j++){ int e=base+j; ch[j]=(e<E)?sg[e]+bias[e]:-1e30f; }
+  for(int kk=0;kk<Ksel;kk++){
+    float bv=-1e30f; int bi=0x7FFFFFFF;
+    for(int j=0;j<per;j++) if(!(taken&(1u<<j)) && ch[j]>bv){ bv=ch[j]; bi=base+j; }
+    for(uint off=16;off>0;off>>=1){
+      float ov=simd_shuffle_down(bv,off); int oi=simd_shuffle_down(bi,off);
+      if(ov>bv || (ov==bv && oi<bi)){ bv=ov; bi=oi; }
+    }
+    bv=simd_broadcast(bv,0); bi=simd_broadcast(bi,0);
+    if(bi>=base && bi<base+per) taken|=1u<<(bi-base);
+    if(slane==0){ id_[kk]=bi; ww[kk]=sg[bi]; }
+  }
+  if(slane!=0) return;
+  int Ke=Ksel;
+  if(topp>0.0f && topp<1.0f){
+    for(int a=1;a<Ksel;a++){ int ii=id_[a]; float wv=ww[a]; int b=a-1;
+      while(b>=0 && ww[b]<wv){ ww[b+1]=ww[b]; id_[b+1]=id_[b]; b--; } ww[b+1]=wv; id_[b+1]=ii; }
+    float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=ww[kk];
+    float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=ww[kk]; if(cum>=topp*tot){ Ke=kk+1; break; } }
+  }
+  keff[s]=Ke;
+  if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
+  for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -231,7 +288,15 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
-static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8;
+static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
+static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
+                                  // serial kernel — see coli_metal_init.
+static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
+                                  // false if this device's threadExecutionWidth != 32.
+                                  // Consulted by BOTH the engine dispatch site and the
+                                  // standalone coli_metal_rtop8 runner, so no caller can
+                                  // reach r_top8_par's 32-lane reduction on an unsafe
+                                  // device even by explicitly requesting par=1.
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
@@ -258,6 +323,73 @@ extern "C" void coli_metal_attn_lat(double *ksched, double *gsched){
 struct Slab { void *base; size_t len; id<MTLBuffer> buf; };
 static std::vector<Slab> g_slabs;
 static std::mutex g_slab_mtx;   // expert_load registers slabs from parallel OpenMP threads
+
+// ---- E5 experiment: COLI_METAL_RESSET=1 -- one persistent MTLResidencySet attached to
+// g_queue (macOS 15+) replaces moe_submit's per-command-buffer useResource: loop over
+// resolved expert weight/scale slabs. Allocation is untouched (same newBufferWithBytesNoCopy
+// wrap as stock); only residency bookkeeping moves off the dispatch hot path -- see
+// SUMMARY.md for why skipping useResource: there is safe (read-only, indirectly-referenced
+// buffers only; residency sets don't do hazard tracking, but nothing here relied on it).
+// g_resset_obj is a bare `id` (holds id<MTLResidencySet>) so the global's declared type
+// carries no availability annotation -- the protocol name only appears inside
+// @available(macOS 15.0, *) guards below, keeping -Wunguarded-availability clean.
+static id g_resset_obj;
+static bool g_resset_enabled;   // COLI_METAL_RESSET=1, macOS 15+, and creation succeeded
+static bool g_resset_dirty;     // addAllocation: calls pending commit; g_resset_mtx-guarded
+// Set mutations + dirty flag get their OWN mutex, never held together with g_slab_mtx: no
+// live Metal call may run under the slab lock the parallel OMP loader threads contend on
+// (E4's audit round 2 found exactly that shape -- mutex over a live Metal call -- as the
+// leading suspect for its +12s expert-disk regression). g_slab_mtx keeps guarding g_slabs
+// bookkeeping only, exactly as on stock.
+static std::mutex g_resset_mtx;
+static double g_t_resset_flush;   // sec committing pending adds in moe_submit (gate on only)
+
+// Add a just-wrapped buffer to the set; commit deferred (an OMP loader burst batches into
+// one commit at the next moe_submit instead of one per slab). Called by coli_metal_register
+// after it drops g_slab_mtx but before it returns -- and the engine cannot dispatch an
+// expert before the load that registers its slab returns, so any slab a given moe_submit
+// can resolve() was added (and marked dirty) under g_resset_mtx strictly before that
+// moe_submit's resset_flush() acquired the same mutex: the flush covers it. The slab-table
+// ordering itself (register-before-resolve) is unchanged and stays under g_slab_mtx.
+// Cost lands in the caller's existing expert-load accounting (t_ewait window in colibri.c);
+// no separate counter for the add/remove side.
+static void resset_add(id<MTLBuffer> b) {
+  if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
+  if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj addAllocation:b]; g_resset_dirty = true; }
+}
+// Remove + commit immediately, NOT deferred: the caller frees the underlying host memory
+// right after coli_metal_unregister returns, so the removal must be applied before that --
+// an uncommitted-but-still-resident allocation pointing at freed memory is a use-after-free
+// risk the GPU could act on. Also runs outside g_slab_mtx (see g_resset_mtx above).
+static void resset_remove(id<MTLBuffer> b) {
+  if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
+  if (@available(macOS 15.0, *)) {
+    id<MTLResidencySet> rs = (id<MTLResidencySet>)g_resset_obj;
+    [rs removeAllocation:b]; [rs commit];
+  }
+  g_resset_dirty = false;   // commit above also flushes any pending adds
+}
+// Flush pending adds before moe_submit relies on the set alone for residency -- the only
+// caller that skips per-buffer useResource: (see moe_submit below). Takes g_resset_mtx
+// only, never g_slab_mtx; the happens-before argument lives at resset_add above.
+static void resset_flush() {
+  if (!g_resset_enabled) return;
+  std::lock_guard<std::mutex> lk(g_resset_mtx);
+  if (!g_resset_dirty) return;
+  if (@available(macOS 15.0, *)) { [(id<MTLResidencySet>)g_resset_obj commit]; }
+  g_resset_dirty = false;
+}
+// Harness visibility for the flush cost, which sits OUTSIDE the moe_times setup/gpu
+// breakdown (timed around resset_flush in moe_submit, before ts_start). Returns whether
+// the set is active so colibri.c prints the METAL-RESSET line only when the gate is on --
+// stock output stays byte-identical.
+extern "C" int coli_metal_resset_stats(double *flush_s) {
+  if (flush_s) *flush_s = g_t_resset_flush;
+  return g_resset_enabled ? 1 : 0;
+}
+
 // Persistent scratch buffers (grow-only) for the MoE pipeline.
 static id<MTLBuffer> g_gg, g_uu, g_hh, g_xg; static size_t g_gg_cap, g_uu_cap, g_hh_cap, g_xg_cap;
 static id<MTLBuffer> ensure(id<MTLBuffer> b, size_t *cap, size_t need) {
@@ -284,6 +416,8 @@ extern "C" int coli_metal_init(void) {
   if (g_dev) return 1;
   if (getenv("COLI_METAL_UNTRACKED") && atoi(getenv("COLI_METAL_UNTRACKED")))
     g_res_opts = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
+  { const char *e = getenv("COLI_RTOP8");           // default ON; COLI_RTOP8=0 opts out
+    if (e && atoi(e) == 0) g_rtop8_par = 0; }
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return 0;
@@ -299,11 +433,45 @@ extern "C" int coli_metal_init(void) {
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
-    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8");
-    if(!g_a_add||!g_r_router||!g_r_top8){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
+    // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
+    // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
+    // is a hard safety fact (g_rtop8_width_ok), not just a policy default: it gates BOTH
+    // the engine dispatch site and the standalone coli_metal_rtop8 runner (degrade-to-safe,
+    // same pattern as the pool/ring fallbacks elsewhere) — no caller can opt back into an
+    // unsafe reduction on such a device, even by explicitly requesting par=1.
+    if ([g_r_top8p threadExecutionWidth] != 32) {
+      g_rtop8_width_ok = 0;
+      if (g_rtop8_par)
+        fprintf(stderr, "[metal] COLI_RTOP8 parallel top-8 disabled: threadExecutionWidth=%lu "
+                        "!= 32 (r_top8_par's reduction assumes 32-lane simdgroups) — serial "
+                        "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
+      g_rtop8_par = 0;
+    }
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
+    // E5 experiment: COLI_METAL_RESSET=1 -- see g_resset_obj comment above.
+    if (getenv("COLI_METAL_RESSET") && atoi(getenv("COLI_METAL_RESSET"))) {
+      if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.initialCapacity = 4096;   // hint only (internal array presize), not a hard limit
+        NSError *rerr = nil;
+        id<MTLResidencySet> rs = [g_dev newResidencySetWithDescriptor:rd error:&rerr];
+        if (rs) {
+          [g_queue addResidencySet:rs];
+          g_resset_obj = rs; g_resset_enabled = true;
+          fprintf(stderr, "[METAL] residency-set: on (macOS 15+, moe_submit skips per-buffer useResource:)\n");
+        } else {
+          fprintf(stderr, "[METAL] residency-set create failed: %s -- stock per-CB residency path\n",
+                  rerr ? [[rerr localizedDescription] UTF8String] : "?");
+        }
+      } else {
+        fprintf(stderr, "[METAL] COLI_METAL_RESSET=1 requested but OS < macOS 15 -- stock per-CB residency path\n");
+      }
+    }
   }
   return 1;
 }
@@ -313,13 +481,29 @@ extern "C" void coli_metal_register(void *base, size_t len) {
   id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
                               options:g_res_opts deallocator:nil];
   if (!b) return;
-  std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
-  for (auto &s : g_slabs) if (s.base == base) { s.len = len; s.buf = b; return; }
-  g_slabs.push_back({base, len, b});
+  id<MTLBuffer> old = nil;   // E5: replaced wrapper on re-register of a live base (defensive)
+  {
+    std::lock_guard<std::mutex> lk(g_slab_mtx);   // called from parallel expert_load threads
+    bool found = false;
+    for (auto &s : g_slabs) if (s.base == base) { old = s.buf; s.len = len; s.buf = b; found = true; break; }
+    if (!found) g_slabs.push_back({base, len, b});
+  }
+  // E5, outside g_slab_mtx (no Metal call under the slab lock), before returning. Invariant
+  // defended: set membership mirrors g_slabs exactly -- a re-register of a live base must
+  // drop the replaced wrapper from the set (ARC releases our reference, but the set retains
+  // it and keeps its pages resident forever) before adding the new one. No in-tree caller
+  // re-registers a live base today; defensive.
+  if (old && old != b) resset_remove(old);
+  if (old != b) resset_add(b);
 }
 extern "C" void coli_metal_unregister(void *base) {
-  std::lock_guard<std::mutex> lk(g_slab_mtx);
-  for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) { g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); return; }
+  id<MTLBuffer> b = nil;
+  {
+    std::lock_guard<std::mutex> lk(g_slab_mtx);
+    for (size_t i=0;i<g_slabs.size();i++) if (g_slabs[i].base==base) {
+      b = g_slabs[i].buf; g_slabs[i].buf=nil; g_slabs.erase(g_slabs.begin()+i); break; }
+  }
+  if (b) resset_remove(b);   // E5: outside g_slab_mtx; commits before the caller frees base
 }
 // Resolve a host pointer inside a registered slab to (buffer, gpuAddress). Returns nil if unknown.
 static id<MTLBuffer> resolve(const void *p, uint64_t *addr) {
@@ -357,7 +541,14 @@ extern "C" void coli_metal_spin_start(void) {
 }
 extern "C" void coli_metal_spin_stop(void) { g_spin_run.store(false); }
 
-extern "C" void coli_metal_shutdown(void) { coli_metal_spin_stop(); g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0; }
+extern "C" void coli_metal_shutdown(void) {
+  coli_metal_spin_stop();
+  if (g_resset_enabled) {
+    if (@available(macOS 15.0, *)) { [g_queue removeResidencySet:(id<MTLResidencySet>)g_resset_obj]; }
+  }
+  g_resset_obj=nil; g_resset_enabled=false; g_resset_dirty=false;
+  g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0;
+}
 extern "C" int  coli_metal_available(void) { return g_dev != nil; }
 extern "C" void coli_metal_stats(size_t *c, size_t *b) { if(c)*c=g_tensor_count; if(b)*b=g_tensor_bytes; }
 extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
@@ -597,12 +788,22 @@ extern "C" int coli_metal_layer_decode(float *x,
     // 5) silu(gate)*up + exact top-K select
     [e setComputePipelineState:g_moe_silu]; [e setBuffer:ash1_ offset:0 atIndex:0]; [e setBuffer:ash2_ offset:0 atIndex:1];
     [e dispatchThreads:MTLSizeMake((size_t)S*SI,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-    { [e setComputePipelineState:g_r_top8];
+    { // COLI_RTOP8 (default ON) swaps the serial 1-thread-per-row select for the exact-
+      // match 1-simdgroup-per-row replica (same buffers/args; only pipeline+grid change).
+      // E<=256 is required by r_top8_par's ch[8]/32-lane blocking contract; this call
+      // site's E is always 256 today (layer_forward_rows' own architecture-shape gate in
+      // colibri.c requires c->n_experts==256 to reach coli_metal_layer_decode at all —
+      // see PR body "Scope statement") but the check is kept here too, defense-in-depth,
+      // so a future relaxation of that gate (e.g. to admit REAP-pruned E=168 models into
+      // the fused path) degrades safely to the serial kernel instead of mis-dispatching.
+      int use_par = g_rtop8_par && g_rtop8_width_ok && E<=256;
+      [e setComputePipelineState:use_par?g_r_top8p:g_r_top8];
       [e setBuffer:asig_ offset:0 atIndex:0]; [e setBuffer:rbB offset:rboff atIndex:1];
       [e setBuffer:aidx_ offset:0 atIndex:2]; [e setBuffer:aw_ offset:0 atIndex:3]; [e setBuffer:akeff_ offset:0 atIndex:4];
       [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
       [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
-      [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
+      if(use_par) [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+      else        [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
     BAR();
     // 6) shared down
     bind_gemv(e,shd_w,shd_s,shd_fmt,SI,AH,ash1_,ashout_,S);
@@ -651,6 +852,44 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
   return 1;
 }
 
+// Standalone single-kernel runner for the top-8 select (see backend_metal.h). Fresh
+// shared buffers per call (a test/probe path, not a hot path); grids exactly as the
+// engine dispatch site: serial = S threads of one S-wide threadgroup, parallel = S
+// threadgroups x 32 (one simdgroup per row). "par" is a REQUEST, not a guarantee: same
+// E<=256 and SIMD-width-32 host-side checks as the engine dispatch site gate the actual
+// pipeline choice, so a caller (including metal-test itself) can never reach the parallel
+// kernel out of contract by asking for it — par=1 with E>256, or on a non-32-wide device,
+// transparently runs the serial kernel instead and still returns 1 (success).
+extern "C" int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
+                                int Ksel, float topp, int normk, float rscale,
+                                int *idx, float *w, int *keff) {
+  if (!g_dev || S < 1 || E < 1 || K < 1 || Ksel < 1 || Ksel > K) return 0;
+  int use_par = par && g_r_top8p && g_rtop8_width_ok && E<=256;
+  @autoreleasepool {
+    id<MTLBuffer> bs=[g_dev newBufferWithBytes:sig  length:(size_t)S*E*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bb=[g_dev newBufferWithBytes:bias length:(size_t)E*4   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bi=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bk=[g_dev newBufferWithLength:(size_t)S*4   options:MTLResourceStorageModeShared];
+    if(!bs||!bb||!bi||!bw||!bk) return 0;
+    memset(bi.contents,0xFF,(size_t)S*K*4);           // poison: untouched slots stay visible
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:use_par?g_r_top8p:g_r_top8];
+    [e setBuffer:bs offset:0 atIndex:0]; [e setBuffer:bb offset:0 atIndex:1];
+    [e setBuffer:bi offset:0 atIndex:2]; [e setBuffer:bw offset:0 atIndex:3]; [e setBuffer:bk offset:0 atIndex:4];
+    [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
+    [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
+    if(use_par) [e dispatchThreadgroups:MTLSizeMake((NSUInteger)S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    else        [e dispatchThreads:MTLSizeMake((NSUInteger)S,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)S,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] rtop8 cmdbuf error\n"); return 0; }
+    memcpy(idx,bi.contents,(size_t)S*K*4);
+    memcpy(w,bw.contents,(size_t)S*K*4);
+    memcpy(keff,bk.contents,(size_t)S*4);
+  }
+  return 1;
+}
+
 extern "C" void coli_metal_tensor_free(ColiMetalTensor *t) {
   if (!t) return;
   g_tensor_count--; g_tensor_bytes -= t->wbytes;
@@ -668,6 +907,9 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
   if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
+  if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
+    double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
+  }
   double ts_start = mnow();
   std::vector<uint64_t> ag(nb),au(nb),ad(nb),sgv(nb),suv(nb),sdv(nb);
   std::vector<id<MTLBuffer>> use; use.reserve(nb*2);
@@ -689,7 +931,18 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
   memcpy([xg_buf contents], xg, (size_t)R*D*4);
 
   id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-  for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+  // E5 (COLI_METAL_RESSET=1): the queue-attached MTLResidencySet already guarantees these
+  // buffers are resident, so skip the per-buffer declaration whose count scales with LRU
+  // cache size (mechanism history v5). Residency sets don't do hazard tracking (Apple docs),
+  // but none was load-bearing here: every buffer in `use` is MTLResourceUsageRead-only and
+  // referenced only indirectly (moe_gemv dereferences waddr[]/saddr[] baked into bag/bsg's
+  // contents), so there's no GPU-side write to serialize against; the one real hazard -- a
+  // slab unregistered+freed+reused while an async in-flight CB still reads it -- is a
+  // CPU-write race outside Metal's hazard tracking either way, held by the engine's own slot
+  // lifecycle, not by useResource:. See SUMMARY.md UNCERTAINTIES.
+  if (!g_resset_enabled) {
+    for(auto&b:use) [e useResource:b usage:MTLResourceUsageRead];
+  }
   auto gemv=[&](id<MTLBuffer> wa,id<MTLBuffer> sa,id<MTLBuffer> xin,id<MTLBuffer> y,int O,int K,int Kin){
     int NT=R*O;
     [e setComputePipelineState:g_moe_gemv];

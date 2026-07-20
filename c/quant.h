@@ -268,6 +268,68 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* ---- int3-g64 (fmt=5): 3-bit weights with ONE f32 scale per 64-input group -
+ * Per group: 16B low plane (2 bits/val, int2 layout) + 8B high plane (1 bit/val),
+ * values in [-4,3] stored v+4. 3.5 bits/weight effective — the quality/size point
+ * the #132 OLMoE ablation measured BEATING per-row int4. */
+#define I3_GROUP 64
+#define I3_GBYTES 24                     /* 16B low plane + 8B high plane per group */
+static inline int64_t i3_groups(int I){ return ((int64_t)I + I3_GROUP - 1) / I3_GROUP; }
+static inline int64_t i3_rowbytes(int I){ return i3_groups(I) * I3_GBYTES; }
+
+/* Dequant-on-use with PER-GROUP scale. Exact f32 path only (no IDOT in v1: int8
+ * activations don't compose with per-group accumulation without a kernel
+ * restructure — follow-up). NEON: low plane = matmul_i2's unpack, high plane
+ * expanded via vtst on bit masks; x86 stays scalar for now (follow-up). */
+static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *scale, int S, int I, int O){
+    int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wrow=q3+(int64_t)o*rb;
+        const float *srow=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float acc=0;
+            for(int64_t g=0; g<ng; g++){
+                const uint8_t *lo=wrow+g*I3_GBYTES, *hi=lo+16;
+                int base=(int)(g*I3_GROUP), n = I-base < I3_GROUP ? I-base : I3_GROUP;
+                float a=0; int k=0;
+#if defined(__ARM_NEON)
+                if(n==I3_GROUP){
+                    const uint8x8_t m2v=vdup_n_u8(3); const int8x16_t b4q=vdupq_n_s8(4);
+                    const uint8x16_t bitm={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
+                    const uint8x16_t fourq=vdupq_n_u8(4);
+                    float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+                    for(;k+16<=I3_GROUP;k+=16){
+                        uint32_t wd; memcpy(&wd, lo+(k>>2), 4);            /* 4 bytes = 16 low-plane values */
+                        uint8x8_t by=vreinterpret_u8_u32(vdup_n_u32(wd));
+                        uint8x8x2_t z01=vzip_u8(vand_u8(by,m2v),              vand_u8(vshr_n_u8(by,2),m2v));
+                        uint8x8x2_t z23=vzip_u8(vand_u8(vshr_n_u8(by,4),m2v), vshr_n_u8(by,6));
+                        uint16x4x2_t zz=vzip_u16(vreinterpret_u16_u8(z01.val[0]), vreinterpret_u16_u8(z23.val[0]));
+                        uint8x16_t lov=vcombine_u8(vreinterpret_u8_u16(zz.val[0]), vreinterpret_u8_u16(zz.val[1]));
+                        uint8x16_t hv=vcombine_u8(vdup_n_u8(hi[k>>3]), vdup_n_u8(hi[(k>>3)+1]));
+                        uint8x16_t hb=vandq_u8(vtstq_u8(hv,bitm), fourq);   /* 4 where high bit set */
+                        int8x16_t wq=vsubq_s8(vreinterpretq_s8_u8(vaddq_u8(lov,hb)), b4q); /* [-4,3] in order */
+                        int16x8_t w0=vmovl_s8(vget_low_s8(wq)), w1=vmovl_s8(vget_high_s8(wq));
+                        ac0=vfmaq_f32(ac0, vld1q_f32(xs+base+k),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                        ac1=vfmaq_f32(ac1, vld1q_f32(xs+base+k+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                        ac0=vfmaq_f32(ac0, vld1q_f32(xs+base+k+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                        ac1=vfmaq_f32(ac1, vld1q_f32(xs+base+k+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1))));
+                    }
+                    a=vaddvq_f32(vaddq_f32(ac0,ac1));
+                }
+#endif
+                for(;k<n;k++){
+                    unsigned u=((lo[k>>2]>>((k&3)*2))&3) | (((hi[k>>3]>>(k&7))&1)<<2);
+                    a += xs[base+k]*(float)((int)u-4);
+                }
+                acc += a*srow[g];
+            }
+            y[(int64_t)s*O+o]=acc;
+        }
+    }
+}
+
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 #define IDOT_KERNEL "avx512-vnni"
@@ -314,12 +376,27 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    __m128i acc=_mm_setzero_si128();
+    /* 4 accumulatori indipendenti (64 byte/iter): un solo acc incatena i vpdpbusd
+     * (latenza-bound ~5c). Somme intere associative -> bit-identico. Stessa struttura
+     * dei 4 accumulatori del ramo NEON piu' sotto.
+     * EN: four independent accumulators break the serial vpdpbusd->acc chain; integer
+     * adds are associative, so the result is bit-identical (mirrors the NEON path). */
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i w0=_mm_loadu_si128((const __m128i*)(w+i)),    x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i w1=_mm_loadu_si128((const __m128i*)(w+i+16)), x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i w2=_mm_loadu_si128((const __m128i*)(w+i+32)), x2=_mm_loadu_si128((const __m128i*)(x+i+32));
+        __m128i w3=_mm_loadu_si128((const __m128i*)(w+i+48)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
     for(;i+16<=I;i+=16){
         __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
         __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i xs=_mm_sign_epi8(xv,wv);
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),_mm_sign_epi8(xv,wv));
     }
     sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
@@ -390,13 +467,32 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* 4 accumulatori indipendenti (64 elementi = 32 byte packed/iter): un solo acc
+     * incatena i vpdpbusd (latenza-bound ~5c). Somme intere associative -> bit-identico.
+     * Stessa struttura dei 4 accumulatori del ramo NEON piu' sotto.
+     * EN: four independent accumulators break the serial vpdpbusd->acc chain; integer
+     * adds are associative, so the result is bit-identical (mirrors the NEON path). */
     const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
-    __m128i acc=_mm_setzero_si128();
-    for(;i+32<=I;i+=32){
+    __m128i a0=_mm_setzero_si128(),a1=_mm_setzero_si128(),a2=_mm_setzero_si128(),a3=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        __m128i by0=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));       /* elem i..i+31  */
+        __m128i by1=_mm_loadu_si128((const __m128i*)(w4+(i>>1)+16));    /* elem i+32..i+63 */
+        __m128i lo0=_mm_and_si128(by0,m4), hi0=_mm_and_si128(_mm_srli_epi16(by0,4),m4);
+        __m128i lo1=_mm_and_si128(by1,m4), hi1=_mm_and_si128(_mm_srli_epi16(by1,4),m4);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo0,hi0),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo0,hi0),b8);
+        __m128i w2=_mm_sub_epi8(_mm_unpacklo_epi8(lo1,hi1),b8), w3=_mm_sub_epi8(_mm_unpackhi_epi8(lo1,hi1),b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i)),    x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        __m128i x2=_mm_loadu_si128((const __m128i*)(x+i+32)), x3=_mm_loadu_si128((const __m128i*)(x+i+48));
+        a0=_mm_dpbusd_epi32(a0,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        a1=_mm_dpbusd_epi32(a1,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        a2=_mm_dpbusd_epi32(a2,_mm_abs_epi8(w2),_mm_sign_epi8(x2,w2));
+        a3=_mm_dpbusd_epi32(a3,_mm_abs_epi8(w3),_mm_sign_epi8(x3,w3));
+    }
+    __m128i acc=_mm_add_epi32(_mm_add_epi32(a0,a1),_mm_add_epi32(a2,a3));
+    for(;i+32<=I;i+=32){   /* 32-nibble remainder: 2 dpbusd, same unpack */
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
-        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo,hi),b8);
         __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
         __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
         acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
@@ -655,6 +751,34 @@ static void pack_int4(const float *w, uint8_t *q4, float *scale, int O, int I, i
         }
     }
 }
+/* quantize w[O,I] f32 -> int3-g64 (fmt=5): per 64-input group, symmetric absmax
+ * (qmax=3, clamp [-4,3], stored v+4), 16B low plane + 8B high plane, ONE f32 scale
+ * per group. Same math as tools/quant_ablation.py `_quant_last_dim(bits=3, group=64)`
+ * (#132), here with real bit packing. */
+static void pack_int3_g64(const float *w, uint8_t *q3, float *scale, int O, int I){
+    int64_t ng=i3_groups(I), rb=i3_rowbytes(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const float *wr=w+(int64_t)o*I;
+        uint8_t *qr=q3+(int64_t)o*rb;
+        float   *sr=scale+(int64_t)o*ng;
+        for(int64_t g=0; g<ng; g++){
+            int base=(int)(g*I3_GROUP), n = I-base < I3_GROUP ? I-base : I3_GROUP;
+            float amax=0;
+            for(int k=0;k<n;k++){ float a=fabsf(wr[base+k]); if(a>amax)amax=a; }
+            float s=amax/3.f; if(s<1e-8f)s=1e-8f; sr[g]=s;
+            uint8_t *lo=qr+g*I3_GBYTES, *hi=lo+16;
+            memset(lo,0,I3_GBYTES);
+            for(int k=0;k<n;k++){
+                int v=(int)lrintf(wr[base+k]/s); if(v>3)v=3; if(v<-4)v=-4;
+                unsigned u=(unsigned)(v+4);                     /* 0..7 */
+                lo[k>>2] |= (uint8_t)((u&3)<<((k&3)*2));
+                hi[k>>3] |= (uint8_t)(((u>>2)&1)<<(k&7));
+            }
+        }
+    }
+}
+
 static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1, rb=(I+3)/4;
     #pragma omp parallel for schedule(static)

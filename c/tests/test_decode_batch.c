@@ -44,6 +44,12 @@ static void test_submit_header(void)
     assert(coli_submit_parse("SUBMIT 1 0 16777216 3 1 1", &sub));
     assert(!coli_submit_parse("SUBMIT 1 0 16777217 3 1 1", &sub));
     assert(!coli_submit_parse("SUBMIT 1 0 2 3 1 1 trailing", &sub));
+    /* optional 7th field: per-request grammar length (0 when absent) */
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95", &sub) && sub.gbytes == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512", &sub) && sub.gbytes == 512);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 1048576", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 1048577", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 extra", &sub));
 }
 
 int main(void)
