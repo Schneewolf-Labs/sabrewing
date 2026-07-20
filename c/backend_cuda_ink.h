@@ -25,6 +25,12 @@ int    ink_cuda_matmul_q4(float *y, const float *x, const void *packed,
  * scales [O]. Matches CPU matmul_q; the int8-residents VRAM-halving path. */
 int    ink_cuda_matmul_q8(float *y, const float *x, const void *q8,
                           const void *scale, int S, int I, int O);
+/* Fused routed expert (int4, S=1 decode): out[D] = W2 @ siluglu(W13 @ x), device
+ * weights (packed int4 + f32 row scales). One HtoD/DtoH/sync, no host silu bounce.
+ * Matches the CPU matmul_q4 + siluf expert path. */
+int    ink_cuda_expert_q4(float *out, const float *x,
+                          const void *p13, const void *s13,
+                          const void *p2, const void *s2, int I, int D);
 
 #ifdef __cplusplus
 }

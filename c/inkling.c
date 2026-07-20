@@ -520,12 +520,16 @@ static Wt load_w(Model *m, const char *name, int gpu_ok, int cols) {
         pread_all(t->fd, w.h, t->nbytes, t->off);
         lora_merge_resident(&m->lora, name, w.h, NULL, t->numel);
 #ifdef COLI_CUDA
-        /* Q8=1: quantize this resident to per-row int8 and keep it in VRAM at half
-         * the bf16 footprint (frees VRAM for the expert tier). `cols` = the input
-         * dim, so rows = numel/cols is always the TRUE tensor row count (correct
-         * even for lm_head, whose matmul O is the unpadded vocab < padded rows).
-         * cols=0 skips (fused/sliced shared experts + the embedding lookup). */
-        if (g_cuda && gpu_ok && cols > 0 && getenv("Q8") &&
+        /* int8 residents (DEFAULT under CUDA; Q8=0 opts out): quantize this
+         * resident to per-row int8 and keep it in VRAM at half the bf16 footprint,
+         * freeing VRAM for the expert tier (measured 402 → 780 experts, lossless:
+         * ppl 7.35 vs 8.01 bf16, the int8 path uses full-f32 activations). `cols` =
+         * the input dim, so rows = numel/cols is always the TRUE tensor row count
+         * (correct even for lm_head, whose matmul O is the unpadded vocab < padded
+         * rows). cols=0 skips (fused/sliced shared experts + the embedding lookup). */
+        const char *q8e = getenv("Q8");
+        int q8_on = !q8e || strcmp(q8e, "0") != 0;   /* on unless Q8=0 */
+        if (g_cuda && gpu_ok && cols > 0 && q8_on &&
             ink_cuda_free_bytes() > (size_t)t->numel + (size_t)(t->numel/cols)*4 + (3ULL<<30)) {
             int64_t rows = t->numel / cols;
             int8_t *q8 = malloc(t->numel); float *qs = malloc((size_t)rows*4);
@@ -1205,6 +1209,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         if (lact) { lora_moe_pre(lr, layer, xs, lt1, lt3); memset(acc2, 0, lr->r*sizeof(float)); }
         for (int kk = 0; kk < K; kk++) {
             Slot *e = use[(int64_t)s*K + kk];
+            int fused = 0;
+#ifdef COLI_CUDA
+            /* fused GPU expert: gate+up→silu→down in one launch/sync, no host
+             * bounce. Decode only (S=1) and no LoRA (needs the host g mid-expert). */
+            if (q4 && e->gpu && S == 1 && !lact &&
+                ink_cuda_expert_q4(hh, xs, e->d13, e->ds13, e->d2, e->ds2, I, D) == 0) fused = 1;
+#endif
+            if (!fused) {
             /* gate+up (fused rows: gate then up) */
             if (m->xq) {
 #ifdef COLI_CUDA
@@ -1225,6 +1237,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 else    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
             } else if (m->quant_bits) matmul_q(hh, g, e->q2, e->s2, I, D);
             else                      matmul(hh, g, e->f2, 1, I, D);
+            }
             if (lact) lora_moe_down_acc(lr, layer, e->eid, g, w[kk], acc2);
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
@@ -1941,7 +1954,33 @@ int main(int argc, char **argv) {
             printf("q8 GPU vs CPU (I=%d O=%d): max abs %.2e, mean|y| %.3f, scaled-rel %.2e  %s\n",
                    I, O, ma, my, r8, ok8 ? "[OK]" : "[FAIL]");
         } else fprintf(stderr, "[q8-test] GPU path failed\n");
-        return (ok && ok8) ? 0 : 1;
+
+        /* fused GPU expert vs CPU (matmul_q4 + siluf + matmul_q4). D=I=6144. */
+        int okf = 0;
+        {
+            int Dd = 6144, Ii = 6144;
+            uint8_t *p13 = malloc((size_t)(2*Ii)*(Dd/2)), *p2 = malloc((size_t)Dd*(Ii/2));
+            float *s13 = malloc((size_t)(2*Ii)*4), *s2 = malloc((size_t)Dd*4);
+            for (size_t j = 0; j < (size_t)(2*Ii)*(Dd/2); j++) p13[j] = (uint8_t)(rand()&0xFF);
+            for (size_t j = 0; j < (size_t)Dd*(Ii/2); j++) p2[j] = (uint8_t)(rand()&0xFF);
+            for (int o = 0; o < 2*Ii; o++) s13[o] = ((rand()%2000)-1000)/100000.f;
+            for (int o = 0; o < Dd; o++)   s2[o]  = ((rand()%2000)-1000)/100000.f;
+            float *gc = malloc((size_t)2*Ii*4), *hc = malloc((size_t)Dd*4), *hg = malloc((size_t)Dd*4);
+            matmul_q4(gc, x, p13, s13, Dd, 2*Ii);
+            for (int i = 0; i < Ii; i++) gc[i] = siluf(gc[i]) * gc[Ii+i];
+            matmul_q4(hc, gc, p2, s2, Ii, Dd);
+            void *dp13=ink_cuda_upload(p13,(size_t)(2*Ii)*(Dd/2)), *ds13=ink_cuda_upload(s13,(size_t)(2*Ii)*4);
+            void *dp2 =ink_cuda_upload(p2,(size_t)Dd*(Ii/2)),      *ds2 =ink_cuda_upload(s2,(size_t)Dd*4);
+            if (dp13 && ds13 && dp2 && ds2 &&
+                ink_cuda_expert_q4(hg, x, dp13, ds13, dp2, ds2, Ii, Dd) == 0) {
+                double ma=0,my=0; for (int o=0;o<Dd;o++){double d=fabs((double)hc[o]-hg[o]);if(d>ma)ma=d;my+=fabs((double)hc[o]);}
+                my/=Dd; double rf=ma/(my+1e-9); okf = rf < 1e-3;
+                printf("fused-expert GPU vs CPU (D=%d I=%d): max abs %.2e, mean|y| %.3f, scaled-rel %.2e  %s\n",
+                       Dd, Ii, ma, my, rf, okf ? "[OK]" : "[FAIL]");
+            } else fprintf(stderr, "[fused-expert-test] GPU path failed\n");
+            free(p13); free(p2); free(s13); free(s2); free(gc); free(hc); free(hg);
+        }
+        return (ok && ok8 && okf) ? 0 : 1;
     }
 #endif
 

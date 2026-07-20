@@ -166,6 +166,55 @@ extern "C" int ink_cuda_matmul_q8(float *y, const float *x, const void *q8,
     return 0;
 }
 
+/* SiLU-GLU gate: gg[i] = silu(g[i]) * g[I+i], reading the fused 2I gate+up row.
+ * expf (not __expf) to match the CPU siluf bit-for-bit. */
+__global__ void silu_glu_kernel(const float * __restrict__ g, float * __restrict__ gg, int I) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= I) return;
+    float a = g[i];
+    gg[i] = (a / (1.f + expf(-a))) * g[I + i];
+}
+
+/* device scratch for the fused single-expert path (S=1 decode): gate+up[2I],
+ * silu-glu[I], out[D]; x reuses g_dx. Grown on demand. */
+static float *e_dg = nullptr, *e_dgg = nullptr, *e_dout = nullptr, *e_hout = nullptr;
+static int e_I = 0, e_D = 0;
+
+/* Fused routed expert (int4, S=1): out[D] = W2 @ siluglu(W13 @ x), all on device
+ * — one HtoD (x), one DtoH (out), one sync, no host silu bounce. Numerically the
+ * mm_q4 (validated token-exact) + expf-silu, so it matches the CPU expert. */
+extern "C" int ink_cuda_expert_q4(float *out, const float *x,
+                                  const void *p13, const void *s13,
+                                  const void *p2, const void *s2, int I, int D) {
+    if (!g_ok || (D & 1) || (I & 1)) return -1;
+    size_t xn = (size_t)D * 4;
+    if (xn > g_xcap) {
+        cudaFree(g_dx); cudaFreeHost(g_hx);
+        if (cudaMalloc(&g_dx, xn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hx, xn * 2) != cudaSuccess) { g_dx = g_hx = nullptr; g_xcap = 0; return -1; }
+        g_xcap = xn * 2;
+    }
+    if (I > e_I) { cudaFree(e_dg); cudaFree(e_dgg);
+        if (cudaMalloc(&e_dg, (size_t)2*I*4) != cudaSuccess ||
+            cudaMalloc(&e_dgg, (size_t)I*4) != cudaSuccess) { e_dg = e_dgg = nullptr; e_I = 0; return -1; }
+        e_I = I; }
+    if (D > e_D) { cudaFree(e_dout); cudaFreeHost(e_hout);
+        if (cudaMalloc(&e_dout, (size_t)D*4) != cudaSuccess ||
+            cudaMallocHost(&e_hout, (size_t)D*4) != cudaSuccess) { e_dout = e_hout = nullptr; e_D = 0; return -1; }
+        e_D = D; }
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    mm_q4_kernel<<<dim3((unsigned)((2*I + 3) / 4), 1), 128, 0, g_st>>>(
+        (const unsigned char *)p13, (const float *)s13, g_dx, e_dg, D, 2*I);
+    silu_glu_kernel<<<(unsigned)((I + 255) / 256), 256, 0, g_st>>>(e_dg, e_dgg, I);
+    mm_q4_kernel<<<dim3((unsigned)((D + 3) / 4), 1), 128, 0, g_st>>>(
+        (const unsigned char *)p2, (const float *)s2, e_dgg, e_dout, I, D);
+    cudaMemcpyAsync(e_hout, e_dout, (size_t)D*4, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(out, e_hout, (size_t)D*4);
+    return 0;
+}
+
 extern "C" int ink_cuda_matmul_q4(float *y, const float *x, const void *packed,
                                   const void *scale, int S, int I, int O) {
     if (!g_ok || (I & 1)) return -1;
