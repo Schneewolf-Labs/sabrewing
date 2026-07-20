@@ -121,6 +121,51 @@ __global__ void mm_q4_kernel(const unsigned char * __restrict__ P,
     if (!lane) y[(size_t)s * O + o] = acc * scale[o];
 }
 
+/* Resident int8 GEMM: per-row signed int8 weights [O,I] + per-row f32 scale.
+ * Matches the CPU matmul_q scalar contract. Half the VRAM read of bf16 (and half
+ * the footprint) — the int8-residents path that frees VRAM for the expert tier. */
+__global__ void mm_q8_kernel(const signed char * __restrict__ W,
+                             const float * __restrict__ scale,
+                             const float * __restrict__ x,
+                             float * __restrict__ y, int I, int O) {
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y;
+    if (o >= O) return;
+    const signed char *w = W + (size_t)o * I;
+    const float *xs = x + (size_t)s * I;
+    float acc = 0.f;
+    for (int i = lane; i < I; i += 32) acc += xs[i] * (float)w[i];
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (!lane) y[(size_t)s * O + o] = acc * scale[o];
+}
+
+extern "C" int ink_cuda_matmul_q8(float *y, const float *x, const void *q8,
+                                  const void *scale, int S, int I, int O) {
+    if (!g_ok) return -1;
+    size_t xn = (size_t)S * I * 4, yn = (size_t)S * O * 4;
+    if (xn > g_xcap) {
+        cudaFree(g_dx); cudaFreeHost(g_hx);
+        if (cudaMalloc(&g_dx, xn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hx, xn * 2) != cudaSuccess) { g_dx = g_hx = nullptr; g_xcap = 0; return -1; }
+        g_xcap = xn * 2;
+    }
+    if (yn > g_ycap) {
+        cudaFree(g_dy); cudaFreeHost(g_hy);
+        if (cudaMalloc(&g_dy, yn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hy, yn * 2) != cudaSuccess) { g_dy = g_hy = nullptr; g_ycap = 0; return -1; }
+        g_ycap = yn * 2;
+    }
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
+    mm_q8_kernel<<<grid, 128, 0, g_st>>>((const signed char *)q8, (const float *)scale, g_dx, g_dy, I, O);
+    cudaMemcpyAsync(g_hy, g_dy, yn, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(y, g_hy, yn);
+    return 0;
+}
+
 extern "C" int ink_cuda_matmul_q4(float *y, const float *x, const void *packed,
                                   const void *scale, int S, int I, int O) {
     if (!g_ok || (I & 1)) return -1;
