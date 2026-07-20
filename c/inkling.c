@@ -118,8 +118,9 @@ typedef struct {
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
+    uint8_t **seen;                       /* per-layer: expert touched this generation (miss classification) */
     int npin;                             /* pinned experts per sparse layer */
-    uint64_t clock, hits, miss;
+    uint64_t clock, hits, miss, miss_cold, miss_churn;
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
     float **K, **V; int kv_len, max_t;    /* per-layer [kv][max_t][hd] */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
@@ -710,6 +711,11 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     /* usage counters; seeded from a previous run's history when present */
     m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
+    /* per-generation "touched" set: classifies a miss as cold-first-touch
+     * (never seen this generation → unpredictable) vs churn (seen then evicted
+     * → prefetchable). Decides whether prefetch is the right lever. */
+    m->seen = calloc(c->n_layers, sizeof(uint8_t*));
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->seen[i] = calloc(E, 1);
     /* opt-in: the 10.5 GB draft head only loads when speculation is requested
      * (MTP=1, or the --mtp-* / spec paths force-load it). Normal serve/decode
      * pays nothing until the spec serve loop is wired up. */
@@ -1132,6 +1138,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             if (e) m->hits++;
             else {
                 m->miss++;
+                if (m->seen[layer]) {   /* cold first-touch vs evicted-and-back */
+                    if (m->seen[layer][eid]) m->miss_churn++;
+                    else { m->miss_cold++; m->seen[layer][eid] = 1; }
+                }
                 e = slot_acquire(m, layer, eid);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
@@ -1517,6 +1527,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     /* phase timers accumulate globally (across prompts in -f mode); snapshot to
      * report THIS prompt's deltas, or 'other' goes negative on later prompts */
     double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
+    /* fresh miss-classification window for this prompt */
+    uint64_t mc0 = m->miss_cold, mh0 = m->miss_churn;
+    for (int i = 0; i < c->n_layers; i++) if (m->seen[i]) memset(m->seen[i], 0, c->n_experts);
     float *logit = step(m, ids, np, 0, NULL, NULL, NULL);
     int len = np;
     char buf[512];
@@ -1541,6 +1554,10 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     double pf = m->t_fill-f0, pe = m->t_expert-e0, ps = m->t_shared-s0, pa = m->t_attn-a0;
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
            pf, pe, ps, pa, wall - pf - pe - ps - pa);
+    uint64_t mc = m->miss_cold - mc0, mh = m->miss_churn - mh0, mt = mc + mh;
+    printf("[misses] %llu total | cold-first-touch %llu (%.0f%%) | churn/re-evict %llu (%.0f%%)\n",
+           (unsigned long long)mt, (unsigned long long)mc, mt?100.0*mc/mt:0.0,
+           (unsigned long long)mh, mt?100.0*mh/mt:0.0);
     free(ids);
 }
 
