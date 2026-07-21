@@ -177,6 +177,68 @@ static int run_attn(int S, int pos_base, const char* name){
   return pass?0:1;
 }
 
+// serial r_top8 vs parallel r_top8_par on the ENGINE build's own compiled shaders — the
+// exact-match contract (same indices, same order, same weights bitwise, same keff)
+// enforced with memcmp, per adversarial input family. `mode` selects the input
+// construction; see the inventory at the call sites in main(). E is a parameter (not
+// hardcoded 256) so the same helper drives both the original E=256 fuzz and the
+// expert-count-generality cases (E=24 <32-lane-width, E=168 REAP-pruned, E=200
+// lane-straddling boundary, E=257 out-of-contract auto-serial-fallback proof).
+static int run_rtop8(int mode, int S, int E, float topp, int normk, float rscale, const char *name) {
+  const int K=8, Ksel=8;
+  std::vector<float> sig((size_t)S*E), bias(E);
+  srand(4242+mode*17+S+E);
+  for (int e=0;e<E;e++) bias[e]=((rand()%2001)-1000)/1000.f;
+  for (int s=0;s<S;s++) for (int e=0;e<E;e++) {
+    float *v=&sig[(size_t)s*E+e];
+    switch (mode) {
+      case 0: *v=(float)(rand()%10000)/10000.f; break;                  // generic sigmoid-like
+      case 1: *v=0.5f; break;                                           // ALL EQUAL: pure tie-break test
+      case 2: *v=(float)((e/2)%8)/8.f; break;                           // massed duplicates (paired+cyclic ties)
+      case 3: *v=(e%2)?1e-40f:2e-40f; break;                            // denormal logits (flush behavior must match)
+      case 4: *v=(float)(rand()%3)/2.f; break;                          // 3-level ties across the whole row
+      // boundary-forcing: elevate the LAST 4 valid experts (E-4..E-1) to near-max choice
+      // so they are guaranteed in the top-8. For an E whose per-lane block size doesn't
+      // divide E evenly, E-1's lane straddles the E boundary (real indices below E,
+      // sentinel -1e30f at/above E in the SAME ch[] block) -- e.g. E=200: per=ceil(200/
+      // 32)=7, lane 28 owns indices 196..202, of which 196-199 are real and 200-202 are
+      // sentinel. Forcing selection onto 196-199 exercises exactly that lane's per-index
+      // e<E boundary check, rather than hoping random data happens to land there.
+      case 5: *v=(e>=E-4)?1.0f:(float)(rand()%10000)/10000.f; break;
+      default: *v=(float)(rand()%10000)/10000.f; break;
+    }
+  }
+  if (mode==1) for (int e=0;e<E;e++) bias[e]=0.25f;                     // choice fully tied too
+  if (mode==3) for (int e=0;e<E;e++) bias[e]=(e%3)?3e-40f:-3e-40f;      // denormal bias as well
+  if (mode==5) for (int e=E-4;e<E;e++) bias[e]=1.0f;                    // combined choice = 2.0, max possible
+  std::vector<int> is((size_t)S*K), ip((size_t)S*K); std::vector<float> ws((size_t)S*K), wp((size_t)S*K);
+  std::vector<int> ks(S), kp(S);
+  if (!coli_metal_rtop8(0,sig.data(),bias.data(),S,E,K,Ksel,topp,normk,rscale,is.data(),ws.data(),ks.data()) ||
+      !coli_metal_rtop8(1,sig.data(),bias.data(),S,E,K,Ksel,topp,normk,rscale,ip.data(),wp.data(),kp.data())) {
+    printf("  %-34s FAIL (rtop8 runner returned 0)\n", name); return 1; }
+  int ok = memcmp(is.data(),ip.data(),(size_t)S*K*4)==0 &&
+           memcmp(ws.data(),wp.data(),(size_t)S*K*4)==0 &&              // bitwise: same ops, same order
+           memcmp(ks.data(),kp.data(),(size_t)S*4)==0;
+  if (mode==5 && ok) {
+    // Don't just trust the input design -- confirm the straddling lane's valid segment
+    // (E-4..E-1) was actually selected, in EVERY row, so this case can't silently
+    // degrade into an unrelated pass if the input construction above ever changes.
+    for (int s=0;s<S;s++) { int seen=0;
+      for (int k=0;k<K;k++) if (ip[(size_t)s*K+k]>=E-4 && ip[(size_t)s*K+k]<E) seen++;
+      if (seen<4) { printf("  %-34s *** boundary segment not exercised (row %d saw %d/4) -- test setup bug\n", name, s, seen); return 1; }
+    }
+  }
+  if (!ok) {
+    printf("  %-34s *** MISMATCH\n", name);
+    for (int s=0;s<S;s++){ printf("    row %d keff %d/%d:",s,ks[s],kp[s]);
+      for(int k=0;k<K;k++) printf(" [%d]%d/%d %.6g/%.6g",k,is[s*K+k],ip[s*K+k],ws[s*K+k],wp[s*K+k]);
+      printf("\n"); }
+    return 1;
+  }
+  printf("  %-34s ok (serial==parallel bitwise, S=%d E=%d)\n", name, S, E);
+  return 0;
+}
+
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
   printf("Metal backend kernel tests:\n");
@@ -215,6 +277,32 @@ int main(void) {
   fail |= run_attn(1, 37,  "attn S=1 pos=37");
   fail |= run_attn(4, 12,  "attn S=4 pos=12 (MTP)");
   fail |= run_attn(3, 0,   "attn S=3 pos=0");
+  printf("Metal top-8 select serial-vs-parallel tests (exact-match contract, E=256):\n");
+  fail |= run_rtop8(0, 1, 256, 0.0f,  1, 1.0f,   "top8 generic S=1");
+  fail |= run_rtop8(0, 4, 256, 0.0f,  1, 1.0f,   "top8 generic S=4");
+  fail |= run_rtop8(1, 1, 256, 0.0f,  1, 1.0f,   "top8 ALL-EQUAL ties");
+  fail |= run_rtop8(2, 4, 256, 0.0f,  1, 1.0f,   "top8 massed dup ties S=4");
+  fail |= run_rtop8(4, 2, 256, 0.0f,  0, 2.5f,   "top8 3-level ties rscale");
+  fail |= run_rtop8(3, 1, 256, 0.0f,  1, 1.0f,   "top8 denormal logits");
+  fail |= run_rtop8(0, 1, 256, 0.01f, 1, 1.0f,   "top8 topp=0.01 (Ke=1 edge)");
+  fail |= run_rtop8(2, 1, 256, 0.6f,  1, 1.0f,   "top8 topp=0.6 tied weights");
+  fail |= run_rtop8(0, 4, 256, 0.999f,1, 1.75f,  "top8 topp=0.999 S=4");
+  fail |= run_rtop8(1, 2, 256, 0.5f,  0, 1.0f,   "top8 topp on ALL-EQUAL");
+  printf("Metal top-8 select expert-count-generality tests (E!=256, REAP/#428 motivated):\n");
+  fail |= run_rtop8(0, 1, 168, 0.0f,  1, 1.0f,   "top8 E=168 (REAP) generic S=1");
+  fail |= run_rtop8(2, 4, 168, 0.0f,  1, 1.0f,   "top8 E=168 (REAP) massed dup ties S=4");
+  fail |= run_rtop8(0, 1, 24,  0.0f,  1, 1.0f,   "top8 E=24 (<32 lane width) generic");
+  fail |= run_rtop8(1, 1, 24,  0.0f,  1, 1.0f,   "top8 E=24 (<32 lane width) ALL-EQUAL ties");
+  // E=200: per-lane block size ceil(200/32)=7, and 200 is NOT a multiple of 7, so lane 28
+  // (indices 196..202) straddles the boundary -- 196-199 real, 200-202 sentinel -1e30f in
+  // the SAME ch[] block. E=24 and E=168 above both happen to divide evenly by their own
+  // per (24/1, 168/6), so no case before this one exercised a lane whose ch[] mixes real
+  // and sentinel indices. mode 5 deterministically forces indices 196-199 into the top-8
+  // (see run_rtop8) and asserts they were actually selected, rather than hoping random
+  // data lands there -- proving by TEST what the per-index `e<E` check was proven by
+  // reading (both kernels agree bitwise on a selection that requires that check to fire).
+  fail |= run_rtop8(5, 4, 200, 0.0f,  1, 1.0f,   "top8 E=200 (lane straddles E boundary)");
+  fail |= run_rtop8(0, 1, 257, 0.0f,  1, 1.0f,   "top8 E=257 (>256, auto-serial-fallback)");
   printf(fail? "metal backend tests: FAILED\n" : "metal backend tests: ok\n");
   coli_metal_shutdown();
   return fail;

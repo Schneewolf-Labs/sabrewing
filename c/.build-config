@@ -1,1 +1,0 @@
-gcc|-O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_CUDA|-lm -fopenmp -pthread -L/usr/local/cuda-12.9/lib64 -Wl,-rpath,/usr/local/cuda-12.9/lib64 -lcudart -lstdc++|CUDA=1|CUDA_DLL=0|ARCH=native|CUDA_ARCH=native|METAL=0

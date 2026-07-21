@@ -83,3 +83,27 @@ this implementation adds: forced spans as a **draft source verified in the targe
 own forward** (lossless even under a wrong grammar, composes with MTP/n-gram in one
 union batch), deployed where the win is denominated in expert I/O rather than
 forward passes.
+
+## Server usage: `response_format` (OpenAI API)
+
+The gateway (`openai_server.py`) turns `response_format` into a **per-request**
+grammar carried to the engine over the `SUBMIT` protocol (optional 7th header
+field, `gbytes`; 6-field headers from older clients remain valid — the field is
+additive and back-compatible in both directions):
+
+```jsonc
+{"response_format": {"type": "json_object"}}                       // generic JSON grammar
+{"response_format": {"type": "json_schema",
+                     "json_schema": {"schema": { ... }}}}          // compiled by schema_gbnf.h
+{"response_format": {"type": "gbnf", "grammar": "root ::= ..."}}   // raw GBNF (extension)
+```
+
+Semantics are identical to `GRAMMAR=`/`SCHEMA=`: a **draft source, never a
+sampling constraint**. A schema outside the supported subset, or malformed GBNF,
+costs the speedup — never the request, never the output. Drafting engages for
+greedy requests (`temperature: 0`); sampled requests run undrafted. Compile
+overhead is negligible: ~8 µs/request for a typical schema, ~18 µs at the
+32-level nesting cap (measured, M3 Max). Grammar payloads are capped at 1 MiB.
+As with MTP (#100), a drafted greedy run may differ from an undrafted one in
+near-tie tokens (the verify forward has a different batch shape); each output
+is a valid greedy stream of its own forward shapes.

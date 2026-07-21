@@ -84,6 +84,23 @@ int coli_metal_layer_decode(float *x,
 
 int coli_metal_gemm(float *y, const float *x, const void *weights, const float *scales,
                     int fmt, int S, int I, int O);   /* large-batch sync GEMM; 0 -> CPU */
+/* Parallel top-8 expert selection (r_top8_par): run ONE top-8 selection kernel standalone
+ * on host arrays — par=0 the serial r_top8, par=1 the parallel exact-match replica gated
+ * in the engine by COLI_RTOP8 (default ON; COLI_RTOP8=0 opts out to the serial kernel).
+ * Exists so the metal-test suite (and any battery probe) can prove serial/parallel
+ * equivalence on the ENGINE build's own compiled shaders, not just in the bench tool.
+ * sig[S*E], bias[E], idx[S*K], w[S*K], keff[S].
+ * Expert-count generality: the parallel kernel's blocked-lane design (ch[8]/32-lane
+ * threadgroup) is validated correct for arbitrary E<=256, including non-multiples of the
+ * 32-lane width and small E (see metal-test's E=24/E=168/E=256 cases — 168 is the REAP
+ * expert-pruned package width from #428/#426). For E>256 (out of contract) this function
+ * transparently falls back to the serial kernel even when par=1 is requested, and the
+ * same automatic fallback is wired into the engine dispatch site — "par" is a request,
+ * never a guarantee, so no caller can reach the unguarded parallel path out of contract.
+ * Returns 1 on success, 0 if Metal is unavailable. */
+int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
+                     int Ksel, float topp, int normk, float rscale,
+                     int *idx, float *w, int *keff);
 void coli_metal_attn_counts(uint64_t *ok, double *wall, double *kernel);
 void coli_metal_attn_lat(double *ksched, double *gsched);
 int coli_metal_attn_decode(const float *x,
@@ -98,6 +115,10 @@ int coli_metal_attn_decode(const float *x,
 void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *experts);
 void coli_metal_moe_times(double *setup, double *gpu, double *scatter);
 double coli_metal_moe_kernel_time(void);
+/* E5 (COLI_METAL_RESSET=1): returns 1 when the queue-attached residency set is active and
+ * writes the cumulative seconds moe_submit spent committing pending set adds -- a cost that
+ * sits OUTSIDE the setup/gpu/scatter breakdown above. Returns 0 (and writes 0) when off. */
+int coli_metal_resset_stats(double *flush_s);
 
 /*
  * Batched routed-expert SwiGLU for one MoE block, in ONE command buffer.

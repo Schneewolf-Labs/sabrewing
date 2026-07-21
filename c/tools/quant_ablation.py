@@ -117,9 +117,77 @@ def quantize_param(w, bits, group, rot=False, e8=""):
 
 
 def _grid_or_e8(x, bits, group, e8):
+    if e8 == "-iq3":
+        return _quant_iq3(x.float())
     if e8:
-        return _quant_e8(x.float(), group, ball=(e8 == "-e8"))
+        return _quant_e8(x.float(), group, bits, ball=(e8 == "-e8"))
     return _quant_last_dim(x, bits, group)
+
+
+# --------------------------------------------------------------------------------------
+# IQ3_XXS-style codebook (#452 candidate (a)): llama.cpp's deployed 3.06-bpw scheme.
+# 4-dim magnitude blocks quantized to a 256-entry lattice-subset grid (magnitudes on the
+# odd ladder 4,12,..,62 in half-units), signs factored out per 8 weights with an odd-parity
+# constraint (7 stored + 1 derived: a block whose true signs violate parity gets its
+# smallest-magnitude sign flipped — modelled here so the ablation pays the real cost).
+# Scales: fp16 super-scale per 256 + 4-bit sub-scale per 32, db = d*(0.5+s)*0.5.
+# Grid extracted from ggml-common.h (MIT).
+# --------------------------------------------------------------------------------------
+_IQ3_GRID = None
+def _iq3_grid(device):
+    global _IQ3_GRID
+    if _IQ3_GRID is None or _IQ3_GRID.device != device:
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), "iq3xxs_grid.json")
+        _IQ3_GRID = torch.tensor(json.load(open(path)), dtype=torch.float32, device=device)
+    return _IQ3_GRID          # [256,4], half-unit magnitudes (value/2 = weight units)
+
+def _quant_iq3(x):
+    orig = x.shape
+    K = orig[-1]
+    assert K % 256 == 0, "iq3 needs multiples of 256 along the input dim"
+    xb = x.reshape(-1, 256)                                   # super-blocks
+    grid = _iq3_grid(x.device) * 0.5                          # weight units
+    out = torch.empty_like(xb)
+    signs = torch.sign(xb); signs[signs == 0] = 1.0
+    mags = xb.abs()
+    for sb in range(8):                                       # 8 sub-blocks of 32
+        m = mags[:, sb*32:(sb+1)*32]                          # [N,32]
+        s = signs[:, sb*32:(sb+1)*32]
+        # per-8 sign parity: flip the smallest-|w| sign where the product is negative
+        s8 = s.reshape(-1, 4, 8)
+        m8 = m.reshape(-1, 4, 8)
+        viol = (s8.prod(-1) < 0)                              # odd number of minus signs
+        idxmin = m8.argmin(-1)
+        flip = torch.zeros_like(s8)
+        flip.scatter_(-1, idxmin[..., None], 1.0)
+        s8 = torch.where(viol[..., None].expand_as(s8) & (flip > 0), -s8, s8)
+        s = s8.reshape(-1, 32)
+        # sub-scale search: db candidates from the 4-bit code, super d from block RMS
+        d = m.pow(2).mean(-1, keepdim=True).sqrt() / 20.0 + 1e-12   # rough anchor
+        best = None
+        for code in range(16):
+            db = d * (0.5 + code) * 0.5
+            q = m / db                                       # [N,32] target magnitudes
+            q4 = q.reshape(-1, 4)                            # 4-dim grid blocks
+            # chunked argmin ||q-g||^2 = argmin(|g|^2 - 2 q.g): a full cdist on a
+            # 100M-param tensor materializes tens of GB — this stays at ~256 MB.
+            g2 = grid.pow(2).sum(-1)
+            idx = torch.empty(q4.shape[0], dtype=torch.long, device=q4.device)
+            CH = 1 << 18
+            for i0 in range(0, q4.shape[0], CH):
+                cc = q4[i0:i0+CH]
+                idx[i0:i0+CH] = (g2 - 2.0 * (cc @ grid.T)).argmin(-1)
+            hit = grid[idx].reshape(-1, 8, 4)
+            rec = (hit.reshape(-1, 32) * db)
+            err = (rec - m).pow(2).sum(-1, keepdim=True)
+            if best is None:
+                best = (err, rec)
+            else:
+                take = err < best[0]
+                best = (torch.where(take, err, best[0]), torch.where(take, rec, best[1]))
+        out[:, sb*32:(sb+1)*32] = best[1] * s
+    return out.reshape(orig)
 
 
 def _rot_quant(x, bits, group, e8=""):
@@ -169,8 +237,15 @@ def _e8_ball(y, r2=10.0):
     return p
 
 
-def _quant_e8(x, group, ball):
-    """Blocks of 8 along the input dim; per-group scale by MSE search over RMS multiples."""
+_E8_R2_REPORTED = set()
+def _e8_radius(bits):
+    # E8 lattice: points within |p|^2<=r2 grow ~r2^4, so +1 bit (x256 codebook) needs r2 x4.
+    # Anchor: r2=10 is the ~2^16 E8P ball (2 bits over 8 dims). Scale from there.
+    return 10.0 * (4.0 ** (bits - 2))
+
+def _quant_e8(x, group, bits, ball):
+    """Blocks of 8 along the input dim; per-group scale by MSE search over RMS multiples.
+    ball=True clamps to the rate-scaled E8 ball for `bits`; ball=False is the unbounded ideal."""
     if x.shape[-1] % 8:
         raise SystemExit(f"-e8 needs input dim divisible by 8 (got {x.shape[-1]})")
     g = group or x.shape[-1]
@@ -183,7 +258,11 @@ def _quant_e8(x, group, ball):
     for k in (0.5, 0.7, 0.9, 1.1, 1.4, 1.8, 2.4):
         s = rms * k
         yb = (xg / s).reshape(-1, g // 8, 8)
-        p = _e8_ball(yb) if ball else _e8_nearest(yb)
+        p = _e8_ball(yb, _e8_radius(bits)) if ball else _e8_nearest(yb)
+        if ball and bits not in _E8_R2_REPORTED:
+            _E8_R2_REPORTED.add(bits)
+            import sys as _sys
+            _sys.stderr.write(f"[e8] bits={bits}: ball r2={_e8_radius(bits):.1f}\n")
         out = (p.reshape(-1, g) * s)
         err = (out - xg).pow(2).sum(-1, keepdim=True)
         if best_err is None:
@@ -195,7 +274,7 @@ def _quant_e8(x, group, ball):
     return best_out.reshape(shp)
 
 
-SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?)?(-rot)?(-nohead)?$")
+SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?|-iq3)?(-rot)?(-nohead)?$")
 
 
 def parse_scheme(name):

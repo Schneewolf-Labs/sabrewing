@@ -58,8 +58,13 @@ CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indent
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
+# For older X86_64 Macs (for example, Mac Pro 2019) we need to use -march
 ifneq ($(ARCH),)
+ifneq (,$(X86_64))
+CFLAGS += -march=$(ARCH)
+else
 CFLAGS += -mcpu=$(ARCH)
+endif
 endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
@@ -166,7 +171,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -283,8 +288,9 @@ inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h $(INK_CUDA_OBJ)
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
+# Intel Macs need -march for vector instructions
 ifneq (,$(DARWIN))
-PORTABLE_ARCH =
+PORTABLE_ARCH = $(if $(X86_64),x86-64-v3,)
 else ifneq (,$(AARCH64))
 PORTABLE_ARCH = armv8-a
 else ifneq (,$(PPC64))
@@ -304,10 +310,15 @@ iobench$(EXE): iobench.c compat.h
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
 
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
@@ -345,6 +356,12 @@ tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -362,7 +379,15 @@ tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json
 tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
+# Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
@@ -372,6 +397,29 @@ test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python
+
+# --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
+# The tiny-model assertions live in test_inefficiency.py and run as part of
+# test-python (they're discovered by the test_*.py glob). These targets are
+# convenience entry points; the opt-in full-model report is NEVER in `make test`.
+#
+#   make efficiency        tiny-model asserted regression tests (CPU; part of test-python)
+#   make efficiency-cuda   the CUDA-path tests (requires a CUDA build — see below)
+#   make efficiency-report opt-in full-model 🟢/🔴 diagnostic, never fails CI
+#
+# CUDA build (Windows): the CUDA tests need a host built with -DCOLI_CUDA plus
+# the runtime DLL. Do this FIRST — note CUDA_DLL=1 on BOTH the host and the
+# rule below, or `make glm.exe` will rebuild a CPU-only host and overwrite it:
+#   make clean && make glm.exe CUDA_DLL=1 && make cuda-dll
+# The tests auto-skip with a clear message if the host is CPU-only.
+efficiency: test-python
+	$(PYTHON) -m unittest tests.test_inefficiency -v
+
+efficiency-cuda:
+	$(PYTHON) -m unittest tests.test_inefficiency.TinyCudaEfficiencyTest -v
+
+efficiency-report:
+	$(PYTHON) tests/test_efficiency_report.py
 
 # Local validation: one portable CPU build and dependency-free tests.
 check:

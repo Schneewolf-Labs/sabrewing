@@ -50,10 +50,56 @@ int main(int argc, char **argv) {
     if (coli_cuda_tensor_upload(&t8, q8, s8, 1, 5, 2, d0)) return 1;
     if (ndev > 1 && coli_cuda_tensor_upload(&t8, q8, s8, 1, 4, 2, d1)) return 1;
     if (!coli_cuda_matmul(&t8, got, x, q8, s8, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
+    /* Cached tensor must stay callable without live host pointers
+     * (CUDA_RELEASE_HOST slots null theirs after upload) — including
+     * SUSTAINED reuse, not just the first call. */
+    for (int rep = 0; rep < 64; rep++)
+        if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+    /* A tensor uploaded from a TEMPORARY host buffer must survive the buffer
+     * being scribbled and freed (the release-host lifecycle). */
+    {
+        int8_t *tmpw = static_cast<int8_t *>(std::malloc(8));
+        float  *tmps = static_cast<float *>(std::malloc(2 * sizeof(float)));
+        if (!tmpw || !tmps) return 2;
+        for (int i = 0; i < 8; i++) tmpw[i] = q8[i];
+        tmps[0] = s8[0]; tmps[1] = s8[1];
+        ColiCudaTensor *tt = nullptr;
+        if (!coli_cuda_tensor_upload(&tt, tmpw, tmps, 1, 4, 2, d0)) return 1;
+        for (int i = 0; i < 8; i++) tmpw[i] = 99;
+        std::free(tmpw); std::free(tmps);
+        if (!coli_cuda_matmul(&tt, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+        coli_cuda_tensor_free(tt);
+    }
+    /* Upload failures must be graceful and must not corrupt accounting —
+     * and must not poison LATER healthy launches (sticky-error regression). */
+    {
+        size_t c0 = 0, b0 = 0, c1 = 0, b1 = 0;
+        coli_cuda_stats(-1, &c0, &b0);
+        ColiCudaTensor *bad = nullptr;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 4, 2, 9999)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 7, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, nullptr, 1, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, nullptr, s8, 1, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 1 << 20, 1 << 24, d0)) return 1; /* ~16 TB */
+        if (bad) return 1;
+        coli_cuda_stats(-1, &c1, &b1);
+        if (c0 != c1 || b0 != b1) return 1;
+        /* healthy launch immediately after the failed allocation */
+        if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+    }
+    /* Fault injection hook: on/off, restores cleanly. */
+    if (setenv("COLI_GPU_FAIL_AFTER", "0", 1)) return 2;
+    if (coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0)) return 1;
+    if (unsetenv("COLI_GPU_FAIL_AFTER")) return 2;
+    if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+        !close_enough(got, want8, 4)) return 1;
     const int8_t q8b[8]={-1,-2,-3,-4, 1,-2,3,-4};
     const float s8b[2]={1.f,.5f},want8b[4]={10.f,15.f,-3.f,-2.5f};
     if(!coli_cuda_tensor_update(t8,q8b,s8b)||
-       !coli_cuda_matmul(&t8,got,x,q8b,s8b,1,2,4,2,d0)||
+       !coli_cuda_matmul(&t8,got,x,q8b,s8b,1,2,4,2,d0,0)||
        !close_enough(got,want8b,4))return 1;
 
     /* Rows [-8,-1,0,7] and [1,2,3,4], packed low nibble first. */
@@ -61,26 +107,26 @@ int main(int argc, char **argv) {
     const float s4[2] = {1.0f, 0.25f};
     const float want4[2] = {-34.0f, -2.5f};
     ColiCudaTensor *t4 = nullptr;
-    if (!coli_cuda_matmul(&t4, got, x, q4, s4, 2, 1, 4, 2, d1) || !close_enough(got, want4, 2)) return 1;
+    if (!coli_cuda_matmul(&t4, got, x, q4, s4, 2, 1, 4, 2, d1, 0) || !close_enough(got, want4, 2)) return 1;
 
     const uint8_t q2[2] = {0xe4, 0x1b};
     const float s2[2] = {0.5f, 2.0f};
     const float want2[2] = {-2.0f, 12.0f};
     ColiCudaTensor *t2 = nullptr;
-    if (!coli_cuda_matmul(&t2, got, x, q2, s2, 3, 1, 4, 2, d1) || !close_enough(got, want2, 2)) return 1;
+    if (!coli_cuda_matmul(&t2, got, x, q2, s2, 3, 1, 4, 2, d1, 0) || !close_enough(got, want2, 2)) return 1;
 
     const float wf[8] = {1, 0, -1, 2, 0.5f, 0.5f, 0.5f, 0.5f};
     const float wantf[2] = {-10.0f, -1.0f};
     ColiCudaTensor *tf = nullptr;
-    if (!coli_cuda_matmul(&tf, got, x, wf, nullptr, 0, 1, 4, 2, d0) || !close_enough(got, wantf, 2)) return 1;
+    if (!coli_cuda_matmul(&tf, got, x, wf, nullptr, 0, 1, 4, 2, d0, 0) || !close_enough(got, wantf, 2)) return 1;
 
     const float eg[8] = {1,0,0,0, 0,1,0,0};
     const float eu[8] = {1,0,0,0, 0,1,0,0};
     const float ed[8] = {1,0, 0,1, 1,1, 1,-1};
     ColiCudaTensor *tg=nullptr,*tu=nullptr,*td=nullptr;
-    if (!coli_cuda_tensor_upload(&tg,eg,nullptr,0,4,2,d0) ||
-        !coli_cuda_tensor_upload(&tu,eu,nullptr,0,4,2,d0) ||
-        !coli_cuda_tensor_upload(&td,ed,nullptr,0,2,4,d0)) return 1;
+    if (!coli_cuda_tensor_upload(&tg,eg,nullptr,0,4,2,d0,0) ||
+        !coli_cuda_tensor_upload(&tu,eu,nullptr,0,4,2,d0,0) ||
+        !coli_cuda_tensor_upload(&td,ed,nullptr,0,2,4,d0,0)) return 1;
     float expert[8], want_expert[8];
     for(int s=0;s<2;s++){
         float a=x[s*4], b=x[s*4+1];
@@ -98,7 +144,7 @@ int main(int argc, char **argv) {
     const float aw[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     const float aq[4]={1,2,.5f,-.5f},al[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
     const float ar[6]={1,0, 0,1, 1,1};float actx[2],aref[2];
-    ColiCudaTensor *at=nullptr;if(!coli_cuda_tensor_upload(&at,aw,nullptr,0,4,4,d0))return 1;
+    ColiCudaTensor *at=nullptr;if(!coli_cuda_tensor_upload(&at,aw,nullptr,0,4,4,d0,0))return 1;
     float score[3];for(int t=0;t<3;t++)score[t]=aq[0]*al[t*4]+aq[1]*al[t*4+1]+aq[2]*ar[t*2]+aq[3]*ar[t*2+1];
     float mx=score[0],z=0;for(int t=1;t<3;t++)mx=score[t]>mx?score[t]:mx;
     for(int t=0;t<3;t++){score[t]=std::exp(score[t]-mx);z+=score[t];}for(int t=0;t<3;t++)score[t]/=z;
@@ -117,9 +163,9 @@ int main(int argc, char **argv) {
     for(int i=0;i<32;i++)ws4[i]=0.01f+(i%5)*0.002f;
     for(int i=0;i<64;i++)gx4[i]=std::sin((float)(i+1)*0.17f)*2.f;
     ColiCudaTensor *g4=nullptr,*u4=nullptr,*d4=nullptr;
-    if(!coli_cuda_tensor_upload(&g4,w4,ws4,2,32,32,d0)||
-       !coli_cuda_tensor_upload(&u4,w4,ws4,2,32,32,d0)||
-       !coli_cuda_tensor_upload(&d4,w4,ws4,2,32,32,d0))return 1;
+    if(!coli_cuda_tensor_upload(&g4,w4,ws4,2,32,32,d0,0)||
+       !coli_cuda_tensor_upload(&u4,w4,ws4,2,32,32,d0,0)||
+       !coli_cuda_tensor_upload(&d4,w4,ws4,2,32,32,d0,0))return 1;
     ColiCudaTensor *gg4[2]={g4,g4},*ug4[2]={u4,u4},*dg4[2]={d4,d4};
     if(!coli_cuda_expert_group(gg4,ug4,dg4,group_rows,2,scalar4,gx4))return 1;
     setenv("COLI_CUDA_TC_INT4","1",1);
