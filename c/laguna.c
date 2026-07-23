@@ -66,7 +66,7 @@ typedef struct {
 typedef struct {
     Cfg c; shards S;
     int xq;                            /* 1 = int4 packed-expert container */
-    int res_bf16;                      /* 1 = residents stored bf16 (real container) */
+    int res_dt;                        /* resident dtype: 0=f32, 1=bf16, 2=int8 */
     void *embed, *lm_head;             /* bf16 (real) / f32 (tiny) */
     float *final_norm;
     Layer *L;
@@ -108,7 +108,7 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) {
  * result equals matmul() on the f32-expanded weights but reads half the bytes —
  * the real container stores residents bf16, so this halves resident bandwidth. */
 static float bf16_f32(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
-static int g_res_bf16 = 0;   /* residents are bf16 (real container) vs f32 (tiny oracle) */
+static int g_res_dt = 0;   /* resident dtype: 0=f32 (tiny), 1=bf16 (real), 2=int8 (RES8) */
 static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int O) {
     #pragma omp parallel for schedule(static) if(O >= 512)
     for (int o = 0; o < O; o++) {
@@ -131,9 +131,35 @@ static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int 
         y[o] = (float)s;
     }
 }
-/* resident GEMM: dispatch bf16 (real) or f32 (tiny/oracle) by the loaded dtype */
+/* int8 residents: W = [int8 O*I][f32 scale O] in one buffer (per-row scale).
+ * ~lossless on residents (proven by inkling's Q8), 4 GB vs 8 GB bf16. */
+static void matmul_q8(float *y, const float *x, const void *W, int I, int O) {
+    const int8_t *q = (const int8_t*)W;
+    const float *scale = (const float*)(q + (int64_t)I * O);
+    #pragma omp parallel for schedule(static) if(O >= 512)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+#if defined(__AVX512F__)
+        if (!g_exact) {
+            __m512 acc = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 16 <= I; i += 16)
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i),
+                        _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)(w + i)))), acc);
+            float s = _mm512_reduce_add_ps(acc);
+            for (; i < I; i++) s += x[i] * w[i];
+            y[o] = s * scale[o];
+            continue;
+        }
+#endif
+        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
+        y[o] = (float)(s * scale[o]);
+    }
+}
+/* resident GEMM: dispatch f32 (tiny/oracle) / bf16 (real) / int8 (RES8) */
 static void resmm(float *y, const float *x, const void *W, int I, int O) {
-    if (g_res_bf16) matmul_bf16(y, x, (const uint16_t*)W, I, O);
+    if (g_res_dt == 2) matmul_q8(y, x, W, I, O);
+    else if (g_res_dt == 1) matmul_bf16(y, x, (const uint16_t*)W, I, O);
     else matmul(y, x, (const float*)W, I, O);
 }
 /* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
@@ -284,12 +310,31 @@ static uint8_t *load_u8(Model *m, const char *name) {
     uint8_t *p = malloc(n); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); }
     st_read_raw(&m->S, name, p, 0); return p;
 }
-/* resident matmul weight: keep bf16 raw (half the RAM/bandwidth) if the tensor is
- * bf16, else load f32. bf16->f32 happens inside matmul_bf16, exactly. */
-static void *load_res(Model *m, const char *name) {
+/* resident matmul weight in the model's resident dtype (g_res_dt):
+ *  0 f32   — read/convert to f32 (tiny oracle).
+ *  1 bf16  — keep bf16 raw (half the bytes; bf16->f32 exact in matmul_bf16).
+ *  2 int8  — read f32, per-row symmetric int8 (row length = indim), store
+ *            [int8 O*I][f32 scale O] in one buffer (~lossless, quarter of f32).
+ */
+static void *load_res(Model *m, const char *name, int indim) {
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
-    if (t->dtype == 0) {   /* bf16 */
+    if (g_res_dt == 2) {
+        int64_t O = t->numel / indim, I = indim;
+        float *f = falloc(t->numel); st_read_f32(&m->S, name, f, 0);
+        int8_t *buf = malloc((size_t)t->numel + (size_t)O * 4);
+        if (!buf) { fprintf(stderr, "OOM int8 %s\n", name); exit(1); }
+        float *sc = (float*)(buf + O * I);
+        for (int64_t o = 0; o < O; o++) {
+            const float *w = f + o * I; float mx = 0;
+            for (int64_t i = 0; i < I; i++) { float a = fabsf(w[i]); if (a > mx) mx = a; }
+            float s = mx / 127.f; if (s < 1e-12f) s = 1e-12f; sc[o] = s;
+            int8_t *q = buf + o * I;
+            for (int64_t i = 0; i < I; i++) { int v = (int)lrintf(w[i] / s); q[i] = v < -127 ? -127 : v > 127 ? 127 : v; }
+        }
+        free(f); return buf;
+    }
+    if (g_res_dt == 1 && t->dtype == 0) {   /* bf16 raw */
         uint16_t *p = malloc((size_t)t->numel * 2);
         if (!p) { fprintf(stderr, "OOM %lld\n", (long long)t->numel); exit(1); }
         st_read_raw(&m->S, name, p, 0); return p;
@@ -306,25 +351,27 @@ static void model_load(Model *m, const char *snap) {
         char nm[256]; snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);
         m->xq = st_has(&m->S, nm);
     }
-    m->res_bf16 = (st_find(&m->S, "model.embed_tokens.weight")->dtype == 0);
-    g_res_bf16 = m->res_bf16;
-    m->embed = load_res(m, "model.embed_tokens.weight");
-    m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight") : m->embed;
+    int file_bf16 = (st_find(&m->S, "model.embed_tokens.weight")->dtype == 0);
+    m->res_dt = file_bf16 ? (getenv("RES8") ? 2 : 1) : 0;   /* bf16 file -> bf16/int8; f32 -> f32 */
+    g_res_dt = m->res_dt;
+    m->embed = load_res(m, "model.embed_tokens.weight", c->hidden);
+    m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight", c->hidden) : m->embed;
     m->final_norm = load_t(m, "model.norm.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *L = &m->L[i];
+        int D = c->hidden, hix = c->heads[i] * c->head_dim;   /* o_proj in-dim = H*hd */
 #define LD(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_t(m, nm); } while (0)
-#define LDR(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm); } while (0)
+#define LDR(field, suffix, indim) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm, indim); } while (0)
         LD(ln1, "input_layernorm.weight");
         LD(ln2, "post_attention_layernorm.weight");
-        LDR(wq, "self_attn.q_proj.weight"); LDR(wk, "self_attn.k_proj.weight");
-        LDR(wv, "self_attn.v_proj.weight"); LDR(wo, "self_attn.o_proj.weight");
-        LDR(wg, "self_attn.g_proj.weight");
+        LDR(wq, "self_attn.q_proj.weight", D); LDR(wk, "self_attn.k_proj.weight", D);
+        LDR(wv, "self_attn.v_proj.weight", D); LDR(wo, "self_attn.o_proj.weight", hix);
+        LDR(wg, "self_attn.g_proj.weight", D);
         LD(qn, "self_attn.q_norm.weight"); LD(kn, "self_attn.k_norm.weight");
         if (!c->is_moe[i]) {
-            LDR(gate, "mlp.gate_proj.weight"); LDR(up, "mlp.up_proj.weight"); LDR(down, "mlp.down_proj.weight");
+            LDR(gate, "mlp.gate_proj.weight", D); LDR(up, "mlp.up_proj.weight", D); LDR(down, "mlp.down_proj.weight", c->dense_inter);
         } else {
             LD(router, "mlp.gate.weight");
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.e_score_correction_bias", i);
@@ -342,7 +389,7 @@ static void model_load(Model *m, const char *snap) {
                     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", i, e); L->ed[e] = load_t(m, nm);
                 }
             }
-            LDR(sg, "mlp.shared_expert.gate_proj.weight"); LDR(su, "mlp.shared_expert.up_proj.weight"); LDR(sd, "mlp.shared_expert.down_proj.weight");
+            LDR(sg, "mlp.shared_expert.gate_proj.weight", D); LDR(su, "mlp.shared_expert.up_proj.weight", D); LDR(sd, "mlp.shared_expert.down_proj.weight", c->shared_inter);
         }
 #undef LD
 #undef LDR
@@ -383,8 +430,14 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
     float *h = falloc((int64_t)S * D);
     for (int t = 0; t < S; t++) {
-        if (m->res_bf16) { const uint16_t *e = (const uint16_t*)m->embed + (int64_t)ids[t] * D; for (int i = 0; i < D; i++) h[t * D + i] = bf16_f32(e[i]); }
-        else memcpy(h + t * D, (const float*)m->embed + (int64_t)ids[t] * D, D * sizeof(float));
+        if (m->res_dt == 2) {   /* int8 embed: [int8 V*D][f32 scale V] */
+            const int8_t *q = (const int8_t*)m->embed + (int64_t)ids[t] * D;
+            float s = ((const float*)((const int8_t*)m->embed + (int64_t)c->vocab * D))[ids[t]];
+            for (int i = 0; i < D; i++) h[t * D + i] = q[i] * s;
+        } else if (m->res_dt == 1) {
+            const uint16_t *e = (const uint16_t*)m->embed + (int64_t)ids[t] * D;
+            for (int i = 0; i < D; i++) h[t * D + i] = bf16_f32(e[i]);
+        } else memcpy(h + t * D, (const float*)m->embed + (int64_t)ids[t] * D, D * sizeof(float));
     }
 
     float *xn = falloc((int64_t)S * D);
