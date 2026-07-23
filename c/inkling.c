@@ -27,6 +27,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -34,6 +35,7 @@
 #include "st.h"
 #include "lora.h"
 #include "tok.h"
+#include "tier.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -98,6 +100,12 @@ typedef struct {
     int eid; uint64_t used;
     int pinned;                           /* never evicted (usage-history pin) */
     int filled;                           /* 0 while queued for a parallel fill */
+    int pending;                          /* async engine: read chunks still in flight */
+    int busy;                             /* referenced by the moe() call in progress:
+                                           * a mid-call slot_acquire must not evict what
+                                           * pass 3 is about to compute from */
+    int transient;                        /* overflow slot outside the cache, freed at the
+                                           * end of the moe() call that spilled into it */
     uint8_t *p13, *p2; float *s13, *s2;   /* container: packed rows + row scales */
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
@@ -616,6 +624,7 @@ static void unpack_rows(const uint8_t *raw, int8_t *q, int64_t rows, int64_t col
 static double mem_avail_bytes(void);
 
 static void mtp_load(Model *m);
+static void fe_init(Model *m);
 
 static void model_init(Model *m, const char *snap, int cap, int bits, const char *lora_dir) {
     memset(m, 0, sizeof(*m));
@@ -715,6 +724,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    fe_init(m);   /* async chunked expert-fill engine (FILL_ASYNC=0 disables) */
     /* usage counters; seeded from a previous run's history when present */
     m->eusage = calloc(c->n_layers, sizeof(uint32_t*));
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) m->eusage[i] = calloc(E, 4);
@@ -811,6 +821,8 @@ static double mem_avail_bytes(void) {
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
+static void fill_wait(Slot *s);
+
 static Slot *slot_find(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
     for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
@@ -820,28 +832,77 @@ static Slot *slot_find(Model *m, int layer, int eid) {
     return NULL;
 }
 
-/* allocate a slot (or evict the LRU non-pinned one); serial callers only */
-static Slot *slot_acquire(Model *m, int layer, int eid) {
-    LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+/* residency check without touching the LRU clock (speculative overfetch) */
+static Slot *slot_peek(Model *m, int layer, int eid) {
+    LCache *lc = &m->cache[layer];
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) return &lc->slots[i];
+    return NULL;
+}
+
+/* per-container-mode slot buffer allocation, shared by cache and transient slots */
+static void slot_alloc_bufs(Model *m, Slot *s) {
+    Cfg *c = &m->c;
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
-    Slot *s;
+    if (m->xq)              { s->p13 = malloc((size_t)(m->rb13*2*I)); s->p2 = malloc((size_t)(m->rb2*D));
+                              s->s13 = falloc(2*I); s->s2 = falloc(D);
+                              if (!s->p13 || !s->p2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
+    else if (m->quant_bits) { s->q13 = malloc(n13); s->q2 = malloc(n2);
+                              s->s13 = falloc(2*I); s->s2 = falloc(D);
+                              if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
+    else                    { s->f13 = falloc(n13); s->f2 = falloc(n2); }
+}
+
+/* allocate a slot (or evict the LRU non-pinned one); serial callers only.
+ * Never evicts a slot the current moe() call still references (busy) or one
+ * with async fill chunks in flight (workers are writing into its buffers) —
+ * the pre-existing behavior of evicting a busy slot silently computed earlier
+ * positions of an S>1 batch with the WRONG expert's weights whenever a layer
+ * call's working set exceeded cap. When no victim exists: spill=1 falls back
+ * to a transient slot (freed at the end of the call), spill=0 returns NULL
+ * (speculative callers just skip). LFRU=1 switches the victim policy to
+ * tier.h's frequency-first score over the accumulated usage counts. */
+static Slot *slot_acquire(Model *m, int layer, int eid, int spill) {
+    LCache *lc = &m->cache[layer];
+    Slot *s = NULL;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        if (m->xq)              { s->p13 = malloc((size_t)(m->rb13*2*I)); s->p2 = malloc((size_t)(m->rb2*D));
-                                  s->s13 = falloc(2*I); s->s2 = falloc(D);
-                                  if (!s->p13 || !s->p2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
-        else if (m->quant_bits) { s->q13 = malloc(n13); s->q2 = malloc(n2);
-                                  s->s13 = falloc(2*I); s->s2 = falloc(D);
-                                  if (!s->q13 || !s->q2) { fprintf(stderr,"OOM expert slot\n"); exit(1); } }
-        else                    { s->f13 = falloc(n13); s->f2 = falloc(n2); }
+        slot_alloc_bufs(m, s);
     } else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++)
-            if (!lc->slots[i].pinned && (lru < 0 || lc->slots[i].used < lc->slots[lru].used)) lru = i;
-        if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
-        s = &lc->slots[lru];
+        static int lfru = -1;
+        if (lfru < 0) { const char *ev = getenv("LFRU"); lfru = ev && atoi(ev) ? 1 : 0; }
+        const uint32_t *heat = m->eusage[layer];
+        for (;;) {
+            int lru = -1;
+            for (int i = 0; i < lc->n; i++) {
+                Slot *si = &lc->slots[i];
+                if (si->pinned || si->busy || __atomic_load_n(&si->pending, __ATOMIC_ACQUIRE)) continue;
+                if (lru < 0) { lru = i; continue; }
+                Slot *sl = &lc->slots[lru];
+                if (lfru && heat) {
+                    if (tier_lfru_score(heat[si->eid], (uint32_t)si->used, (uint32_t)m->clock) <
+                        tier_lfru_score(heat[sl->eid], (uint32_t)sl->used, (uint32_t)m->clock)) lru = i;
+                } else if (si->used < sl->used) lru = i;
+            }
+            if (lru >= 0) { s = &lc->slots[lru]; break; }
+            /* no victim yet: an idle in-flight fill becomes evictable once it
+             * lands — wait for one and rescan before giving up */
+            Slot *w = NULL;
+            for (int i = 0; i < lc->n; i++) {
+                Slot *si = &lc->slots[i];
+                if (!si->pinned && !si->busy && __atomic_load_n(&si->pending, __ATOMIC_ACQUIRE)) { w = si; break; }
+            }
+            if (!w) break;
+            fill_wait(w);
+        }
+        if (!s) {
+            if (!spill) return NULL;
+            s = calloc(1, sizeof(Slot));
+            if (!s) { fprintf(stderr, "OOM transient slot\n"); exit(1); }
+            slot_alloc_bufs(m, s);
+            s->transient = 1;
+        }
     }
-    s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pinned = 0;
+    s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pending = 0; s->pinned = 0; s->busy = 0;
     return s;
 }
 
@@ -877,12 +938,176 @@ static int qsim_cold(Model *m, int layer, int eid) {
     return m->eusage[layer] && m->qsim_thr && m->eusage[layer][eid] < m->qsim_thr[layer];
 }
 
+/* ---------- async chunked expert fills ----------
+ * The legacy miss path ran one synchronous 4-pread slot_fill per OMP task:
+ * during decode that is 1-2 misses in flight, i.e. queue depth ~1-2 to the
+ * NVMe, ~35 ms per ~28 MB expert on a drive that does several GB/s when fed.
+ * Here every miss becomes ~FILL_CHUNK_KB-sized positioned reads spread over a
+ * pool of I/O worker threads, so even a SINGLE miss keeps the drive at depth,
+ * and moe() overlaps the wait with the cached experts' matmuls.
+ * FILL_ASYNC=0 restores the legacy path (A/B baseline); the engine only
+ * serves the U8 container + f32 .qs layout (everything else falls back). */
+typedef struct {
+    int fd; int64_t off, len; void *dst;
+    Model *m; Slot *s; int layer;
+} FillChunk;
+
+static struct {
+    int on, nth; int64_t chunk;
+    pthread_t *th;
+    pthread_mutex_t mu;
+    pthread_cond_t more, space, done;     /* work available / queue space / a slot completed */
+    FillChunk *q; int qcap, qhead, qtail, qn;
+} g_fe;
+static int g_overfetch = 0;               /* OVERFETCH=n speculative fills per layer per token */
+
+static int fe_on(Model *m) { return g_fe.on && m->xq; }
+
+/* block until a slot's fill has fully landed (no-op when already filled) */
+static void fill_wait(Slot *s) {
+    if (!g_fe.on || __atomic_load_n(&s->filled, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&g_fe.mu);
+    while (!__atomic_load_n(&s->filled, __ATOMIC_ACQUIRE))
+        pthread_cond_wait(&g_fe.done, &g_fe.mu);
+    pthread_mutex_unlock(&g_fe.mu);
+}
+
+static void *fe_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_fe.mu);
+        while (!g_fe.qn) pthread_cond_wait(&g_fe.more, &g_fe.mu);
+        FillChunk c = g_fe.q[g_fe.qhead];
+        g_fe.qhead = (g_fe.qhead + 1) % g_fe.qcap; g_fe.qn--;
+        pthread_cond_signal(&g_fe.space);
+        pthread_mutex_unlock(&g_fe.mu);
+        char *p = c.dst; int64_t got = 0;
+        while (got < c.len) {           /* POSIX allows short reads on regular files */
+            ssize_t r = pread(c.fd, p + got, (size_t)(c.len - got), c.off + got);
+            if (r <= 0) { perror("pread expert chunk"); exit(1); }
+            got += r;
+        }
+        posix_fadvise(c.fd, c.off, c.len, POSIX_FADV_DONTNEED);
+        if (__atomic_sub_fetch(&c.s->pending, 1, __ATOMIC_ACQ_REL) == 0) {
+            /* last chunk of this expert: run the qsim requant (needs the whole
+             * weight in place), publish, and wake any waiter */
+            Model *m = c.m; Slot *s = c.s;
+            if (qsim_cold(m, c.layer, s->eid)) {
+                qsim_row(s->p13, 2*(int64_t)m->c.moe_inter, m->rb13, m->qsim_bits);
+                qsim_row(s->p2,  m->c.hidden,               m->rb2,  m->qsim_bits);
+            }
+            __atomic_store_n(&s->filled, 1, __ATOMIC_RELEASE);
+            pthread_mutex_lock(&g_fe.mu);
+            pthread_cond_broadcast(&g_fe.done);
+            pthread_mutex_unlock(&g_fe.mu);
+        }
+    }
+    return NULL;
+}
+
+/* push one read split into <=ch-sized chunks; caller holds g_fe.mu */
+static void fe_push_locked(Model *m, int layer, Slot *s, int fd,
+                           int64_t off, int64_t len, void *dst, int64_t ch) {
+    for (int64_t o = 0; o < len; o += ch) {
+        while (g_fe.qn == g_fe.qcap) pthread_cond_wait(&g_fe.space, &g_fe.mu);
+        FillChunk *q = &g_fe.q[g_fe.qtail];
+        g_fe.qtail = (g_fe.qtail + 1) % g_fe.qcap; g_fe.qn++;
+        q->fd = fd; q->off = off + o; q->len = len - o < ch ? len - o : ch;
+        q->dst = (char*)dst + o; q->m = m; q->s = s; q->layer = layer;
+        pthread_cond_signal(&g_fe.more);
+    }
+}
+
+/* queue one expert's four reads; pending counts chunks, the last worker to
+ * finish publishes filled=1. Returns 0 when the engine is unavailable. */
+static int fill_submit(Model *m, int layer, Slot *s) {
+    if (!fe_on(m)) return 0;
+    Cfg *c = &m->c; int64_t I = c->moe_inter, D = c->hidden, eid = s->eid;
+    char nm[320], qs[340];
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj", layer);
+    snprintf(qs, sizeof(qs), "%s.qs", nm);
+    st_tensor *t13 = st_find(&m->S, nm), *tq13 = st_find(&m->S, qs);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj", layer);
+    snprintf(qs, sizeof(qs), "%s.qs", nm);
+    st_tensor *t2 = st_find(&m->S, nm), *tq2 = st_find(&m->S, qs);
+    if (!t13 || !tq13 || !t2 || !tq2) { fprintf(stderr, "missing expert tensors, layer %d\n", layer); exit(1); }
+    int64_t nb13 = 2*I*m->rb13, nb2 = D*m->rb2, CH = g_fe.chunk;
+    int nch = (int)((nb13 + CH-1)/CH + (nb2 + CH-1)/CH) + 2;
+    __atomic_store_n(&s->filled, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s->pending, nch, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_fe.mu);
+    fe_push_locked(m, layer, s, t13->fd,  t13->off  + eid*nb13,  nb13,  s->p13, CH);
+    fe_push_locked(m, layer, s, t2->fd,   t2->off   + eid*nb2,   nb2,   s->p2,  CH);
+    fe_push_locked(m, layer, s, tq13->fd, tq13->off + eid*2*I*4, 2*I*4, s->s13, INT64_MAX);
+    fe_push_locked(m, layer, s, tq2->fd,  tq2->off  + eid*D*4,   D*4,   s->s2,  INT64_MAX);
+    pthread_mutex_unlock(&g_fe.mu);
+    return 1;
+}
+
+/* speculative runner-up fills: this decode token's router ranking [0..topm)
+ * at this layer was just recorded in prev_topm; ranks beyond top-K are the
+ * "recent near-miss" class the overfetch probe reports as catchable. The cap
+ * headroom guard keeps speculation from evicting this token's working set. */
+static void overfetch_submit(Model *m, int layer) {
+    LCache *lc = &m->cache[layer];
+    int K = m->c.topk;
+    if (!m->prev_topm[layer]) return;
+    if (lc->cap - m->npin < K + g_overfetch + 4) return;
+    int nnew = 0;
+    for (int r = 0; r < m->topm && nnew < g_overfetch; r++) {
+        int eid = m->prev_topm[layer][r];
+        if (eid < 0) break;
+        if (slot_peek(m, layer, eid)) continue;   /* resident or already in flight */
+        Slot *s = slot_acquire(m, layer, eid, 0);  /* never spill for speculation */
+        if (!s) break;
+        fill_submit(m, layer, s);
+        nnew++;
+    }
+}
+
+static void fe_init(Model *m) {
+    if (!m->xq) return;
+    const char *e = getenv("FILL_ASYNC");
+    if (e && !atoi(e)) { fprintf(stderr, "[fill] async I/O disabled (FILL_ASYNC=0)\n"); return; }
+    /* the workers read the .qs scales raw, so they must be f32 on disk (they
+     * are in convert_inkling_int4.py containers; anything else falls back) */
+    Cfg *c = &m->c; char nm[336];
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+        snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);
+        st_tensor *t = st_find(&m->S, nm);
+        if (!t || t->dtype != 2) { fprintf(stderr, "[fill] non-f32 .qs scales, async I/O off\n"); return; }
+        break;
+    }
+    g_fe.nth = getenv("FILL_THREADS") ? atoi(getenv("FILL_THREADS")) : 16;
+    if (g_fe.nth < 1) g_fe.nth = 1;
+    if (g_fe.nth > 128) g_fe.nth = 128;
+    int64_t kb = getenv("FILL_CHUNK_KB") ? atoll(getenv("FILL_CHUNK_KB")) : 2048;
+    if (kb < 1) kb = 1;
+    g_fe.chunk = kb * 1024;
+    g_overfetch = getenv("OVERFETCH") ? atoi(getenv("OVERFETCH")) : 0;
+    if (g_overfetch < 0) g_overfetch = 0;
+    g_fe.qcap = 8192;
+    g_fe.q = malloc((size_t)g_fe.qcap * sizeof(FillChunk));
+    g_fe.th = malloc((size_t)g_fe.nth * sizeof(pthread_t));
+    if (!g_fe.q || !g_fe.th) { fprintf(stderr, "OOM fill queue\n"); exit(1); }
+    pthread_mutex_init(&g_fe.mu, NULL);
+    pthread_cond_init(&g_fe.more, NULL);
+    pthread_cond_init(&g_fe.space, NULL);
+    pthread_cond_init(&g_fe.done, NULL);
+    for (int i = 0; i < g_fe.nth; i++)
+        if (pthread_create(&g_fe.th[i], NULL, fe_worker, NULL)) { perror("pthread_create"); exit(1); }
+    g_fe.on = 1;
+    fprintf(stderr, "[fill] async chunked expert I/O: %d workers x %lld KB chunks%s\n",
+            g_fe.nth, (long long)kb, g_overfetch ? " + overfetch" : "");
+}
+
 /* pure I/O (+ optional requant): safe to run in parallel across slots */
 static void slot_fill(Model *m, int layer, Slot *s) {
     Cfg *c = &m->c;
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     int64_t eid = s->eid;
     char nm[320], qs[340];
+    if (fill_submit(m, layer, s)) { fill_wait(s); return; }
     if (m->xq) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
         read_u8_slice(&m->S, nm, s->p13, eid*2*I*m->rb13, 2*I*m->rb13);
@@ -986,7 +1211,7 @@ static void pins_load(Model *m, const char *snap) {
                 if (!taken && tmp[e] >= bv && tmp[e] > 0) { bv = tmp[e]; best = e; }
             }
             if (best < 0) break;
-            Slot *s = slot_acquire(m, i, best);
+            Slot *s = slot_acquire(m, i, best, 0);
             s->pinned = 1;
             ps[np] = s; pl[np] = i; np++;
         }
@@ -1158,6 +1383,44 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     dense_mlp_i(m, l, x, S, out, m->c.dense_inter);
 }
 
+/* one routed expert's forward (gate+up -> silu -> down) into dst[D]. g is the
+ * caller's 2I scratch (u = g+I); after return g holds the post-silu gate — the
+ * LoRA down_acc in the caller reads it. Factored out so the reordered decode
+ * path and the in-order path run the IDENTICAL FP op sequence per expert. */
+static void expert_compute(Model *m, Slot *e, int layer, const float *xs,
+                           float *g, float *dst, int q4, int fuse_ok,
+                           int lact, const float *lt1, const float *lt3) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->moe_inter;
+    float *u = g + I;
+    (void)fuse_ok;   /* only read by the CUDA fused path */
+#ifdef COLI_CUDA
+    /* fused GPU expert: gate+up→silu→down in one launch/sync, no host bounce.
+     * Decode only and no LoRA (LoRA needs the host g mid-expert). */
+    if (fuse_ok && q4 && e->gpu &&
+        ink_cuda_expert_q4(dst, xs, e->d13, e->ds13, e->d2, e->ds2, I, D) == 0) return;
+#endif
+    /* gate+up (fused rows: gate then up) */
+    if (m->xq) {
+#ifdef COLI_CUDA
+        if (q4 && e->gpu) ink_cuda_matmul_q4(g, xs, e->d13, e->ds13, 1, D, 2*I); else
+#endif
+        if (q4) matmul_q4(g, xs, e->p13, e->s13, D, 2*I);
+        else    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
+    } else if (m->quant_bits) matmul_q(g, xs, e->q13, e->s13, D, 2*I);
+    else                      matmul(g, xs, e->f13, 1, D, 2*I);
+    if (lact) lora_moe_gu(&m->lora, layer, e->eid, lt1, lt3, g);
+    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+    /* down */
+    if (m->xq) {
+#ifdef COLI_CUDA
+        if (q4 && e->gpu) ink_cuda_matmul_q4(dst, g, e->d2, e->ds2, 1, I, D); else
+#endif
+        if (q4) matmul_q4(dst, g, e->p2, e->s2, I, D);
+        else    matmul_q(dst, g, (int8_t*)e->p2, e->s2, I, D);
+    } else if (m->quant_bits) matmul_q(dst, g, e->q2, e->s2, I, D);
+    else                      matmul(dst, g, e->f2, 1, I, D);
+}
+
 /* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ----------
  * Three passes per layer call: (1) route every position and acquire slots,
  * (2) fill ALL missing experts in one parallel burst (the NVMe wants queue
@@ -1220,9 +1483,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                         }
                     }
                 }
-                e = slot_acquire(m, layer, eid);
+                e = slot_acquire(m, layer, eid, 1);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
+            e->busy = 1;
             use[(int64_t)s*K + kk] = e;
         }
         /* record this decode token's top-M router ranking for next token's probe */
@@ -1239,15 +1503,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
-    /* pass 2: one parallel burst for every miss in this layer call */
+    /* pass 2: kick every miss in this layer call. Engine on: chunked async
+     * reads — the NVMe sees a FILL_THREADS-deep queue even for a single decode
+     * miss, and the waits move into pass 3 behind the cached experts' compute.
+     * Engine off (FILL_ASYNC=0): the original synchronous parallel burst. */
+    int async = fe_on(m);
     if (nfill) {
         double tf = now_s();
-        #pragma omp parallel for schedule(dynamic,1)
-        for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+        if (async) for (int j = 0; j < nfill; j++) fill_submit(m, fl[j], fill[j]);
+        else {
+            #pragma omp parallel for schedule(dynamic,1)
+            for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+        }
         m->t_fill += now_s() - tf;
     }
-    /* pass 3: compute. gate+up run as ONE matmul over the fused 2I rows —
-     * halves the number of (expensive to open) parallel regions per expert */
+    /* OVERFETCH=n: also start fills for the router's runners-up (this token's
+     * ranking beyond top-K) — the "recent near-miss" class the overfetch probe
+     * measures. They stream in behind later layers' compute and turn the next
+     * token's cold misses into hits or partial waits. Decode only. */
+    if (async && S == 1 && g_overfetch > 0) overfetch_submit(m, layer);
+    /* pass 3: compute (per-expert math lives in expert_compute). */
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
     /* LoRA runtime path: shared-A projections t1/t3 computed once per token;
@@ -1257,43 +1532,48 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int lact = lr->experts_on && lr->b1[layer];
     float *lt = lact ? falloc(3*lr->r) : NULL;
     float *lt1 = lt, *lt3 = lact ? lt + lr->r : NULL, *acc2 = lact ? lt + 2*lr->r : NULL;
+    /* async decode (no LoRA): compute each expert into its own hb row in the
+     * order the fills LAND — cached experts first, so their matmuls hide the
+     * misses' remaining I/O — then accumulate into os in kk order. Per-expert
+     * math and the accumulation sequence are identical to the in-order path,
+     * so the reorder cannot change the emitted tokens. */
+    int reorder = async && S == 1 && !lact && K <= 64;
+    float *hb = reorder ? falloc((int64_t)K*D) : NULL;
+    if (async && !reorder) {
+        /* prefill / LoRA / MTP batches: settle every slot up front (a fill_wait
+         * on a filled slot is a load and a branch), then compute as before */
+        double tw = now_s();
+        for (int64_t t = 0; t < (int64_t)S*K; t++) fill_wait(use[t]);
+        m->t_fill += now_s() - tw;
+    }
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s*D;
         float *os = out + (int64_t)s*D;
         float *w = wgt + (int64_t)s*(K+ns);
         double te = now_s();
         if (lact) { lora_moe_pre(lr, layer, xs, lt1, lt3); memset(acc2, 0, lr->r*sizeof(float)); }
-        for (int kk = 0; kk < K; kk++) {
-            Slot *e = use[(int64_t)s*K + kk];
-            int fused = 0;
-#ifdef COLI_CUDA
-            /* fused GPU expert: gate+up→silu→down in one launch/sync, no host
-             * bounce. Decode only (S=1) and no LoRA (needs the host g mid-expert). */
-            if (q4 && e->gpu && S == 1 && !lact &&
-                ink_cuda_expert_q4(hh, xs, e->d13, e->ds13, e->d2, e->ds2, I, D) == 0) fused = 1;
-#endif
-            if (!fused) {
-            /* gate+up (fused rows: gate then up) */
-            if (m->xq) {
-#ifdef COLI_CUDA
-                if (q4 && e->gpu) ink_cuda_matmul_q4(g, xs, e->d13, e->ds13, 1, D, 2*I); else
-#endif
-                if (q4) matmul_q4(g, xs, e->p13, e->s13, D, 2*I);
-                else    matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
-            } else if (m->quant_bits) matmul_q(g, xs, e->q13, e->s13, D, 2*I);
-            else                      matmul(g, xs, e->f13, 1, D, 2*I);
-            if (lact) lora_moe_gu(lr, layer, e->eid, lt1, lt3, g);
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            /* down */
-            if (m->xq) {
-#ifdef COLI_CUDA
-                if (q4 && e->gpu) ink_cuda_matmul_q4(hh, g, e->d2, e->ds2, 1, I, D); else
-#endif
-                if (q4) matmul_q4(hh, g, e->p2, e->s2, I, D);
-                else    matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
-            } else if (m->quant_bits) matmul_q(hh, g, e->q2, e->s2, I, D);
-            else                      matmul(hh, g, e->f2, 1, I, D);
+        if (reorder) {
+            unsigned char dn[64] = {0};
+            int left = K;
+            for (int pass = 0; pass < 2 && left; pass++)
+                for (int kk = 0; kk < K && left; kk++) {
+                    Slot *e = use[kk];
+                    if (dn[kk]) continue;
+                    if (!pass && !__atomic_load_n(&e->filled, __ATOMIC_ACQUIRE)) continue;
+                    if (pass) {   /* exposed stall: I/O the hits' compute couldn't hide */
+                        double tw = now_s(); fill_wait(e);
+                        double t1 = now_s(); m->t_fill += t1 - tw; te += t1 - tw;
+                    }
+                    expert_compute(m, e, layer, xs, g, hb + (int64_t)kk*D, q4, 1, 0, NULL, NULL);
+                    dn[kk] = 1; left--;
+                }
+            for (int kk = 0; kk < K; kk++) {
+                const float *hk = hb + (int64_t)kk*D;
+                for (int d = 0; d < D; d++) os[d] += w[kk] * hk[d];
             }
+        } else for (int kk = 0; kk < K; kk++) {
+            Slot *e = use[(int64_t)s*K + kk];
+            expert_compute(m, e, layer, xs, g, hh, q4, S == 1 && !lact, lact, lt1, lt3);
             if (lact) lora_moe_down_acc(lr, layer, e->eid, g, w[kk], acc2);
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
         }
@@ -1309,8 +1589,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_shared += now_s() - ts;
     }
+    for (int64_t t = 0; t < (int64_t)S*K; t++) {
+        Slot *e = use[t];
+        e->busy = 0;
+        if (e->transient) {   /* cap-overflow spill: lives for this call only */
+            free(e->p13); free(e->p2); free(e->q13); free(e->q2);
+            free(e->s13); free(e->s2); free(e->f13); free(e->f2); free(e);
+        }
+    }
     free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
-    free(g); free(hh); free(lt);    /* u aliases g+I */
+    free(g); free(hh); free(lt); free(hb);    /* u aliases g+I */
 }
 
 /* ---------- one forward pass over S new tokens ----------

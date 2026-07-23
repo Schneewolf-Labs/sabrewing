@@ -65,6 +65,37 @@ SNAP=~/Models/inkling_i4 ./c/inkling -f warmup_prompts.txt -n 32
 | `IDOT=0` | byte-exact scalar int kernels (debugging) |
 | First positional arg | expert-cache cap per layer (`0` = auto-size from free RAM) |
 
+## Expert-fill I/O (async chunked reads)
+
+Cache misses are filled by a pool of I/O worker threads that read each expert
+as `FILL_CHUNK_KB`-sized positioned chunks, so the NVMe sees a deep queue even
+for a **single** decode miss (the legacy path was one serial 4-`pread` fill per
+miss: queue depth ~1, ~35 ms per ~28 MB expert on a drive that does several
+GB/s when fed). During decode, `moe()` computes the cached experts *while* the
+missing ones stream in and only stalls on I/O the compute could not hide —
+`[phases] fill` therefore now reports the **exposed** stall, not total I/O
+time. Output is token-identical: per-expert math and the accumulation order
+into the residual are unchanged, only the compute order between independent
+experts moves.
+
+| Env | Effect |
+|---|---|
+| `FILL_ASYNC=0` | legacy synchronous fills (A/B baseline) |
+| `FILL_THREADS=<n>` | I/O worker pool size (default 16) |
+| `FILL_CHUNK_KB=<n>` | read chunk size (default 2048) |
+| `OVERFETCH=<n>` | speculative fills per layer per decode token of the router's runners-up — the "recent near-miss" class the overfetch probe prints. Default 0 (off); shares the worker pool with demand misses, so let the probe's *catchable* % justify it |
+| `OVERFETCH_M=<n>` | router-ranking depth for the probe and the `OVERFETCH` pool (default 16) |
+| `LFRU=1` | frequency-first eviction (`tier.h` LFRU score over the accumulated usage counts) instead of plain LRU |
+
+Size `FILL_THREADS` / `FILL_CHUNK_KB` for your drive with the microbench —
+compare chunk-sized reads at pool depth against the legacy access pattern:
+
+```sh
+make -C c iobench
+./c/iobench <big-shard> 2 256 16 0     # 2 MB x 16 threads (new pattern)
+./c/iobench <big-shard> 19 64 1 0      # 19 MB serial (old decode pattern)
+```
+
 ## Performance (975B, Ryzen 9 7900 / 24t, 187 GB DDR5, RTX A6000, NVMe)
 
 24-token greedy decode, 5-token prompt, commit-tagged runs, single run each.
