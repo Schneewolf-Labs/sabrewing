@@ -36,6 +36,7 @@ typedef struct {
     int hidden, n_layers, n_kv, head_dim, vocab;
     int n_experts, topk, moe_inter, shared_inter, dense_inter;
     int sliding_window, norm_topk;
+    int eos[4], n_eos;
     float rms_eps, route_scale;
     int heads[MAXL];          /* per-layer query-head count */
     int is_sliding[MAXL];     /* 1 = sliding, 0 = global */
@@ -68,8 +69,11 @@ typedef struct {
 
 /* ---------- math ---------- */
 static float *falloc(int64_t n) { float *p = malloc(n * sizeof(float)); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); } return p; }
-/* y[O] = x[I] @ W[O,I]^T  (W row-major [out,in], HF Linear convention) */
+/* y[O] = x[I] @ W[O,I]^T  (W row-major [out,in], HF Linear convention).
+ * The O loop is embarrassingly parallel and each y[o] is an independent
+ * double-accumulate, so OpenMP keeps the result bit-identical to serial. */
 static void matmul(float *y, const float *x, const float *W, int I, int O) {
+    #pragma omp parallel for schedule(static) if(O >= 512)
     for (int o = 0; o < O; o++) {
         const float *w = W + (int64_t)o * I;
         double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
@@ -78,6 +82,7 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) {
 }
 /* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
 static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
+    #pragma omp parallel for schedule(static) if(O >= 512)
     for (int o = 0; o < O; o++) {
         const uint8_t *p = packed + (int64_t)o * (I / 2);
         double s = 0;
@@ -153,6 +158,11 @@ static void cfg_load(Cfg *c, const char *snap) {
     c->route_scale  = (float)jnum(o, "moe_routed_scaling_factor", 1.0);
     jval *nt = json_get(o, "norm_topk_prob"); c->norm_topk = nt && nt->t == J_BOOL ? nt->boolean : 1;
     if (c->n_layers > MAXL) { fprintf(stderr, "n_layers %d > MAXL\n", c->n_layers); exit(1); }
+
+    c->n_eos = 0;
+    jval *es = json_get(o, "eos_token_id");
+    if (es && es->t == J_NUM) c->eos[c->n_eos++] = (int)es->num;
+    else if (es && es->t == J_ARR) for (int i = 0; i < es->len && c->n_eos < 4; i++) if (es->kids[i]->t == J_NUM) c->eos[c->n_eos++] = (int)es->kids[i]->num;
 
     int def_heads = (int)jnum(o, "num_attention_heads", 0);
     jval *hpl = json_get(o, "num_attention_heads_per_layer");
@@ -415,13 +425,49 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
-    const char *refpath = argc > 1 ? argv[1] : "ref_laguna.json";
+    const char *prompt = NULL, *refpath = "ref_laguna.json";
+    int n_new = 128;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_new = atoi(argv[++i]);
+        else refpath = argv[i];
+    }
 
     Model m; model_load(&m, snap);
-    printf("== Laguna C engine (Stage A, f32) ==\n");
+    printf("== Laguna C engine (Stage A, %s) ==\n", m.xq ? "int4 container" : "f32");
     printf("cfg: D=%d L=%d kv=%d hd=%d V=%d E=%d+1 topk=%d moe_I=%d win=%d g_rdim=%d(scale %.4f) s_rdim=%d\n",
            m.c.hidden, m.c.n_layers, m.c.n_kv, m.c.head_dim, m.c.vocab, m.c.n_experts, m.c.topk,
            m.c.moe_inter, m.c.sliding_window, m.c.g_rdim, m.c.g_scale, m.c.s_rdim);
+    printf("resident weights loaded | RSS %.2f GB\n", (double)0);
+
+    /* ---- prompt / generate mode (greedy, streaming; full-recompute Stage A) ---- */
+    if (prompt) {
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        int plen = (int)strlen(prompt), cap = plen + 16;
+        int *seq = malloc((cap + n_new) * sizeof(int));
+        int np = tok_encode(&T, prompt, plen, seq, cap);
+        if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return 1; }
+        printf("[%d prompt tokens]\n%s", np, prompt); fflush(stdout);
+        int D = m.c.hidden, len = np;
+        double t0 = now_s(), t1 = 0; char buf[512];
+        for (int s = 0; s < n_new; s++) {
+            float *H = falloc((int64_t)len * D);
+            hidden_states(&m, seq, len, H);
+            int nxt = argmax_logits(&m, H + (int64_t)(len - 1) * D, NULL);
+            free(H);
+            if (s == 0) t1 = now_s();
+            int is_eos = 0; for (int e = 0; e < m.c.n_eos; e++) if (nxt == m.c.eos[e]) is_eos = 1;
+            if (is_eos) { printf("\n[eos]"); break; }
+            int nb = tok_decode(&T, &nxt, 1, buf, sizeof(buf) - 1); buf[nb] = 0;
+            fputs(buf, stdout); fflush(stdout);
+            seq[len++] = nxt;
+        }
+        int gen = len - np;
+        printf("\n[prefill %.1fs | %d tok in %.1fs = %.2f tok/s]\n",
+               t1 - t0, gen, now_s() - t1, gen > 1 ? (gen - 1) / (now_s() - t1) : 0.0);
+        return 0;
+    }
 
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
