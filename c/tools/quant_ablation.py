@@ -277,10 +277,27 @@ def _quant_e8(x, group, bits, ball):
 SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-e8u?|-iq3)?(-rot)?(-nohead)?$")
 
 
+def _quant_iq3_pack(x):
+    """Bytes-true fmt=6 (#452 step 2): the tensor goes through tools/iq3_pack —
+    real 98-byte blocks, the parity sign cost, fp16 super-scales, regenerated
+    rotation signs — and comes back to model space via the inverse rotation.
+    This is the number a SHIPPED container gets, where `int3-iq3-rot` above is
+    the float simulation that chose the scheme. The rotation sign diagonal
+    differs from the simulation's torch PRNG (xorshift spec, quant.h e8_signs);
+    statistically equivalent, and it is what the engine regenerates."""
+    import iq3_pack as IP
+    w = x.detach().cpu().float().numpy()
+    packed = IP.encode(IP.rotate_rows(w.reshape(-1, w.shape[-1])))
+    deq = IP.decode(packed, w.shape[-1])
+    return torch.from_numpy(IP.unrotate_rows(deq).reshape(w.shape)).to(x.device)
+
+
 def parse_scheme(name):
     """'int4-g128-nohead' -> (bits, group, e8, skip_head...). 'fp16' -> None."""
     if name == "fp16":
         return None
+    if name == "iq3-pack":
+        return "PACK"
     m = SCHEME_RE.match(name)
     if not m:
         raise SystemExit(f"bad scheme '{name}' (expected fp16 | int{{2,3,4,8}}[-g<N>][-e8|-e8u][-rot][-nohead])")
@@ -304,8 +321,19 @@ def apply_scheme(model, scheme):
     spec = parse_scheme(scheme)
     if spec is None:
         return 0, 0, total
-    bits, group, e8, rot, skip_head = spec
     n = qp = 0
+    if spec == "PACK":
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.ndim < 2 or is_router(name):
+                    continue
+                if p.shape[-1] % 256:      # fmt=6 needs I % 256 == 0 — same rule the converter enforces
+                    continue
+                p.data.copy_(_quant_iq3_pack(p.data).to(p.dtype))
+                n += 1
+                qp += p.numel()
+        return n, qp, total
+    bits, group, e8, rot, skip_head = spec
     with torch.no_grad():
         for name, p in model.named_parameters():
             if p.ndim < 2 or is_router(name):

@@ -31,7 +31,7 @@ Fewer forwards also means less LRU churn, which compounds with cache hit rate.
 ## Usage
 
 ```bash
-GRAMMAR=fit.gbnf TEMP=0 PROMPT="..." ./glm 64 4 8
+GRAMMAR=fit.gbnf COLI_TEMP=0 PROMPT="..." ./colibri 64 4 8
 ```
 
 - `GRAMMAR=<file.gbnf>` — arm the draft source with a grammar. Byte-level GBNF

@@ -1,3 +1,3 @@
-"""Single source of truth for the colibrì version number."""
+"""Single source of truth for the colibri version number."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.1"

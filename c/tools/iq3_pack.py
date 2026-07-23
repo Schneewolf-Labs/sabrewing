@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""fmt=5 (E8/IQ3 grouped container) index codec — #452 ladder step 2.
+"""fmt=6 (E8/IQ3 lattice container) index codec — #452 ladder step 2.
+
+Note: fmt=5 is taken by the int3 dual-plane container (#132); this lattice
+container is fmt=6.
 
 The ablation (#453) proved the SCHEME: an IQ3_XXS-style codebook plus rotation
 matches our simulated E8 ball (51.5% vs 51.5% on OLMoE). That code quantizes to
@@ -7,7 +10,7 @@ lattice points and keeps floats. This module produces the DEPLOYABLE bytes and
 reads them back, so the container, the converter and the decode kernels all
 agree on one layout.
 
-Layout — one 256-weight super-block, 98 bytes, 3.0625 bpw:
+Layout - one 256-weight super-block, 98 bytes, 3.0625 bpw:
 
     [0  .. 63]  uint8  grid index per 4-dim magnitude block   (64 blocks)
     [64 .. 95]  uint32 x8, one per 32-weight sub-block:
@@ -168,3 +171,79 @@ def decode(packed, K):
 
 def bpw():
     return BLOCK_BYTES * 8 / QK
+
+
+# ---- rotation (converter side of quant.h e8_signs / e8_rot_rows) -------------
+#
+# Q = D @ H / sqrt(n) per power-of-two block; W@Q on weight rows here equals
+# Q^T x on activations in the engine (sign-flip then FWHT — one routine both
+# sides). The sign diagonal D is REGENERATED from the block size, never stored:
+# both sides draw the same xorshift64* stream seeded 417+n, and the kernel
+# fixture (make_e8_fixture.py) pins the agreement.
+
+def signs(n):
+    """[n] float32 in {+1,-1} — bit-exact mirror of quant.h e8_signs()."""
+    s = np.uint64(417 + n)
+    out = np.empty((n + 7) // 8, dtype=np.uint8)
+    with np.errstate(over="ignore"):
+        for i in range(len(out)):
+            s ^= s >> np.uint64(12)
+            s ^= (s << np.uint64(25)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+            s ^= s >> np.uint64(27)
+            out[i] = np.uint8(((s * np.uint64(2685821657736338717)) &
+                               np.uint64(0xFFFFFFFFFFFFFFFF)) >> np.uint64(56))
+    bits = np.unpackbits(out, bitorder="little")[:n]
+    return np.where(bits == 1, -1.0, 1.0).astype(np.float32)
+
+
+def rot_blocks(dim):
+    """Block tiling: each block is the largest power of two dividing the
+    remainder (its lowest set bit) — 6144 -> [2048, 4096], 1536 -> [512, 1024].
+    Blocks over 32768 halve, mirroring the engine's sign-buffer cap."""
+    out, rem = [], dim
+    while rem:
+        b = rem & (-rem)
+        while b > 32768:
+            b >>= 1
+        out.append(b)
+        rem -= b
+    return out
+
+
+def _fwht_rows(blk, b):
+    """In-place-style FWHT over rows of [..., b] (b a power of two)."""
+    h = 1
+    while h < b:
+        blk = blk.reshape(-1, b // (2 * h), 2, h)
+        u, v = blk[:, :, 0, :].copy(), blk[:, :, 1, :].copy()
+        blk[:, :, 0, :] = u + v
+        blk[:, :, 1, :] = u - v
+        blk = blk.reshape(-1, b)
+        h <<= 1
+    return blk / np.sqrt(b, dtype=np.float32)
+
+
+def rotate_rows(x):
+    """Apply the rotation to rows of float32 [..., dim] (weights W@Q or
+    activations Q^T x — the transform is the same). Returns a new array."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    dim = x.shape[-1]
+    rows = x.reshape(-1, dim).copy()
+    off = 0
+    for b in rot_blocks(dim):
+        rows[:, off:off + b] = _fwht_rows(rows[:, off:off + b] * signs(b)[None, :], b)
+        off += b
+    return rows.reshape(x.shape)
+
+
+def unrotate_rows(x):
+    """Inverse of rotate_rows (Q v back to v): FWHT first, then the sign flip.
+    Eval-side only — the engine always works in the rotated space."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    dim = x.shape[-1]
+    rows = x.reshape(-1, dim).copy()
+    off = 0
+    for b in rot_blocks(dim):
+        rows[:, off:off + b] = _fwht_rows(rows[:, off:off + b].copy(), b) * signs(b)[None, :]
+        off += b
+    return rows.reshape(x.shape)

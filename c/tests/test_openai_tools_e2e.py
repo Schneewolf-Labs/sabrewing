@@ -51,6 +51,10 @@ while True:
     elif "weather in Rome" in prompt:
         reply(rid, "<tool_call>get_weather<arg_key>city</arg_key>"
                    "<arg_value>Rome</arg_value></tool_call>")
+    elif "weather in Naples" in prompt:
+        # #401: a well-formed call whose closing tag never arrives (budget ran out, or
+        # quantization mangled it). Strict parsing loses the whole call.
+        reply(rid, "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Naples</arg_value>")
     elif "weather in Milan" in prompt:
         # split across many tiny DATA chunks: streamed marker suppression must
         # hold even when a marker straddles a chunk boundary
@@ -169,6 +173,36 @@ class ToolCallingE2E(unittest.TestCase):
                       rendered)
         self.assertIn("# Tools", rendered)
         self.assertIn('"get_weather"', rendered)
+
+    def test_unclosed_tool_call_still_reaches_the_client(self):
+        """#401: the closing </tool_call> never arrives. Before the recovery the client got
+        finish_reason=stop with the raw markers dumped into content -- a total failure from
+        an otherwise perfectly well-formed call."""
+        r = self.post({"model": MODEL_ID, "tools": TOOLS,
+                       "messages": [{"role": "user",
+                                     "content": "What is the weather in Naples?"}]})
+        choice = r["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Naples"})
+        self.assertNotIn("<tool_call>", choice["message"].get("content") or "")
+
+    def test_unclosed_tool_call_streamed(self):
+        """Same recovery on the streaming path -- this is the shape coding clients use."""
+        events = self.post({"model": MODEL_ID, "tools": TOOLS, "stream": True,
+                            "messages": [{"role": "user",
+                                          "content": "What is the weather in Naples?"}]},
+                           stream=True)
+        deltas = [e["choices"][0]["delta"] for e in events if e["choices"]]
+        self.assertNotIn("<tool_call>", "".join(d.get("content") or "" for d in deltas))
+        calls = [d["tool_calls"] for d in deltas if d.get("tool_calls")]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0][0]["function"]["arguments"]), {"city": "Naples"})
+        finish = [e["choices"][0]["finish_reason"] for e in events
+                  if e["choices"] and e["choices"][0].get("finish_reason")]
+        self.assertEqual(finish, ["tool_calls"])
 
     def test_no_tools_plain_text(self):
         r = self.post({"model": MODEL_ID,

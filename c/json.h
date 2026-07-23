@@ -55,10 +55,12 @@ static jval *j_parse_val(jparser *p);
 static char *j_parse_str_raw(jparser *p) {
     /* assume *p->s == '"' */
     p->s++;
-    const char *start = p->s;
-    /* trova la fine gestendo gli escape, poi copia decodificando i casi base */
-    char tmp[1 << 16]; int n = 0;
-    #define J_PUT(ch) do{ if (n < (int)sizeof(tmp)-1) tmp[n++] = (char)(ch); }while(0)
+    /* buffer su heap che CRESCE: niente troncamento silenzioso a 64KB (le stringhe
+     * lunghe di tokenizer.json/config venivano tagliate) e niente 64KB di stack. */
+    size_t cap = 64, n = 0; char *tmp = (char *)malloc(cap);
+    if (!tmp) { fprintf(stderr, "OOM parsing JSON string\n"); exit(1); }
+    #define J_PUT(ch) do{ if (n + 1 >= cap) { cap *= 2; tmp = (char *)realloc(tmp, cap); \
+        if (!tmp) { fprintf(stderr, "OOM parsing JSON string\n"); exit(1); } } tmp[n++] = (char)(ch); }while(0)
     while (*p->s && *p->s != '"') {
         char c = *p->s++;
         if (c == '\\' && *p->s) {
@@ -69,9 +71,11 @@ static char *j_parse_str_raw(jparser *p) {
                 case 'f': c = '\f'; break; case '/': c = '/'; break;
                 case '\\': c = '\\'; break; case '"': c = '"'; break;
                 case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate) */
+                    if (!p->s[0]||!p->s[1]||!p->s[2]||!p->s[3]) { c='?'; break; }   /* \u troncato: non leggere oltre il NUL */
                     unsigned cp = (unsigned)strtoul((char[]){p->s[0],p->s[1],p->s[2],p->s[3],0}, NULL, 16);
                     p->s += 4;
-                    if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u') {
+                    if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u'
+                        && p->s[2] && p->s[3] && p->s[4] && p->s[5]) {
                         unsigned lo = (unsigned)strtoul((char[]){p->s[2],p->s[3],p->s[4],p->s[5],0}, NULL, 16);
                         if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp-0xD800)<<10) + (lo-0xDC00); p->s += 6; }
                     }
@@ -88,8 +92,8 @@ static char *j_parse_str_raw(jparser *p) {
     }
     #undef J_PUT
     if (*p->s == '"') p->s++;
-    (void)start;
-    return j_dup(p, tmp, n);
+    char *out = j_dup(p, tmp, (int)n); free(tmp);
+    return out;
 }
 
 static jval *j_parse_val(jparser *p) {
@@ -135,9 +139,9 @@ static jval *j_parse_val(jparser *p) {
         p->depth--;
         return v;
     }
-    if (c == 't') { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
-    if (c == 'f') { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
-    if (c == 'n') { p->s += 4; return j_new(J_NULL); }
+    if (c == 't' && !strncmp(p->s, "true", 4))  { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
+    if (c == 'f' && !strncmp(p->s, "false", 5)) { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
+    if (c == 'n' && !strncmp(p->s, "null", 4))  { p->s += 4; return j_new(J_NULL); }
     /* numero */
     { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
 }

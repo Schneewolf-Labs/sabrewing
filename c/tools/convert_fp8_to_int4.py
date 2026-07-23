@@ -106,6 +106,22 @@ def quant_int3_g64(w, bits=3, group=64):        # -> (qbytes U8 [O*ceil(I/64)*24
     out = np.concatenate([lo, hi], axis=2)                                      # [O, ng, 24]
     return out.reshape(-1), s[:, :, 0].astype(np.float32).reshape(-1)
 
+E8 = "e8"                                       # CLI/bits-plumbing marker for fmt=6 (not a bit width)
+
+def quant_e8(w):                                # -> (qbytes U8 [O*ceil(I/256)*98], tag f32 [1])
+    """E8/IQ3 lattice (fmt=6 in colibri.c, #452): rotate the rows first (W@Q,
+    block-diagonal FWHT with regenerated signs — iq3_pack.rotate_rows mirrors
+    quant.h e8_rot_rows), then pack with the iq3 codec: 98B per 256 weights,
+    3.0625 bpw, every scale in-block. The .qs companion is a single float,
+    the engine's fmt=6 discriminator — not a scale."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import iq3_pack
+    O, I = w.shape
+    if I % 256:
+        raise SystemExit(f"e8: input dim {I} is not a multiple of 256")
+    packed = iq3_pack.encode(iq3_pack.rotate_rows(np.asarray(w, dtype=np.float32)))
+    return packed.reshape(-1), np.array([6.0], dtype=np.float32)
+
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
     qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
@@ -272,7 +288,10 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                         if f".{proj}.weight" in name: bits = pb; break
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
                     out_dict[name] = w.astype(np.float32); continue
-                if bits == 3:
+                if bits == E8:
+                    # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
+                    q, s = quant_e8(w)
+                elif bits == 3:
                     # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
                     q, s = quant_int3_g64(w)
                 elif group_size > 0 and bits <= 4:
@@ -311,6 +330,9 @@ def check_or_record_params(outdir, prefix, params):
     os.replace(tmp, path)
     return True
 
+def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
+    return E8 if v == E8 else int(v)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
@@ -318,7 +340,7 @@ def main():
     ap.add_argument("--outdir", required=False)
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
-    ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    ap.add_argument("--xbits", type=_bits, default=None) # bit degli expert ROUTED (streaming), o "e8" (fmt=6); default=ebits
     # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
     # Set these higher to protect sensitive tensors from quantization error.
     ap.add_argument("--shared-bits", type=int, default=None,
@@ -334,11 +356,11 @@ def main():
     ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
         help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
     # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
-    ap.add_argument("--up-bits", type=int, default=None,
+    ap.add_argument("--up-bits", type=_bits, default=None,
         help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
-    ap.add_argument("--gate-bits", type=int, default=None,
+    ap.add_argument("--gate-bits", type=_bits, default=None,
         help="bits for gate_proj in routed experts. Default=xbits")
-    ap.add_argument("--down-bits", type=int, default=None,
+    ap.add_argument("--down-bits", type=_bits, default=None,
         help="bits for down_proj in routed experts. Default=xbits")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
@@ -373,6 +395,13 @@ def main():
         if val is not None: PROJ_BITS[proj] = val
     if PROJ_BITS:
         print(f"[per-projection expert bits] {PROJ_BITS} (others -> xbits={a.xbits})")
+    # fmt=6 is all-or-nothing across the three expert projections: gate and up
+    # share one rotated input row in the engine (the placement rule in quant.h),
+    # so a mixed layout would need two gather buffers for zero measured benefit.
+    eff = [PROJ_BITS.get(p, a.xbits) for p in ("gate_proj", "up_proj", "down_proj")]
+    if any(b == E8 for b in eff) and not all(b == E8 for b in eff):
+        raise SystemExit(f"e8 covers all three expert projections or none (got {eff}); "
+                         "use --xbits e8, or none of the e8 flags")
 
     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
     # converter falls back to ebits for that type.
@@ -663,8 +692,9 @@ def main():
             s0, s1 = segs[t]
             while done[t] < s1 - s0 and not stopfail:
                 pos = s0 + done[t]
-                req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
-                                                           "Range": f"bytes={pos}-{s1-1}"})
+                _hdrs = {"User-Agent": "colibri-convert", "Range": f"bytes={pos}-{s1-1}"}
+                if os.environ.get("HF_TOKEN"): _hdrs["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+                req = urllib.request.Request(url, headers=_hdrs)
                 try:
                     with urllib.request.urlopen(req, timeout=8) as r:
                         if r.status != 206:               # Range ignorato: multi-stream impossibile
@@ -727,6 +757,7 @@ def main():
             have0 = have
             req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
             if have: req.add_header("Range", f"bytes={have}-")
+            if os.environ.get("HF_TOKEN"): req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
                     if have and r.status == 200:          # server ha ignorato il Range: riparti pulito

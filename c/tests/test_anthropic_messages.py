@@ -16,7 +16,8 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError)
+from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
+                           render_chat)
 
 
 class FakeEngine:
@@ -72,6 +73,19 @@ class TranslationTest(unittest.TestCase):
                 {"type": "tool_result", "tool_use_id": "t1", "content": "done"}]},
         ]})
         self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
+
+    def test_prior_assistant_thinking_block_is_preserved(self):
+        messages = anthropic_to_openai({"messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reasoning",
+                 "signature": "opaque-upstream-signature"},
+                {"type": "text", "text": "answer"}]},
+            {"role": "user", "content": "follow-up"},
+        ]})
+        self.assertEqual(messages[1]["reasoning_content"], "reasoning")
+        self.assertIn("<|assistant|><think>reasoning</think>answer",
+                      render_chat(messages))
 
     def test_tools_and_choice_translate(self):
         tools, choice = anthropic_tools({
@@ -207,6 +221,77 @@ class MessagesHTTPTest(unittest.TestCase):
         self.post(self.base_body(thinking={"type": "enabled"})).close()
         self.assertIn("Reasoning Effort", self.engine.prompts[-1])
         self.assertTrue(self.engine.prompts[-1].endswith("<|assistant|><think>"))
+
+    def test_thinking_enabled_returns_separate_blocks(self):
+        self.engine.script = ("reasoning</think>answer",)
+        with self.post(self.base_body(thinking={"type": "enabled"})) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["content"], [
+            {"type": "thinking", "thinking": "reasoning", "signature": "colibri-local"},
+            {"type": "text", "text": "answer"},
+        ])
+
+    def test_streamed_thinking_marker_can_split_at_every_boundary(self):
+        marker = "</think>"
+        for boundary in range(1, len(marker)):
+            with self.subTest(boundary=boundary):
+                self.engine.script = ("reasoning" + marker[:boundary],
+                                      marker[boundary:] + "answer")
+                with self.post(self.base_body(stream=True,
+                                              thinking={"type": "enabled"})) as response:
+                    raw = response.read().decode()
+                payloads = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+                            if line.startswith("data: ")]
+                starts = [p for p in payloads if p["type"] == "content_block_start"]
+                self.assertEqual([(p["index"], p["content_block"]["type"]) for p in starts],
+                                 [(0, "thinking"), (1, "text")])
+                deltas = [p for p in payloads if p["type"] == "content_block_delta"]
+                self.assertEqual("".join(p["delta"].get("thinking", "") for p in deltas),
+                                 "reasoning")
+                self.assertEqual("".join(p["delta"].get("text", "") for p in deltas),
+                                 "answer")
+                self.assertEqual([p["delta"]["type"] for p in deltas
+                                  if p["delta"]["type"] == "signature_delta"],
+                                 ["signature_delta"])
+                signature = next(i for i, p in enumerate(payloads)
+                                 if p.get("delta", {}).get("type") == "signature_delta")
+                self.assertEqual(payloads[signature]["delta"]["signature"], "colibri-local")
+                thinking_stop = next(i for i, p in enumerate(payloads)
+                                     if p["type"] == "content_block_stop" and p["index"] == 0)
+                text_start = next(i for i, p in enumerate(payloads)
+                                  if p["type"] == "content_block_start" and p["index"] == 1)
+                self.assertLess(signature, thinking_stop)
+                self.assertLess(thinking_stop, text_start)
+                self.assertNotIn(marker, raw)
+
+    def test_thinking_budget_exhaustion_returns_thinking_only(self):
+        self.engine.script = ("unfinished reasoning",)
+        self.engine.length_limited = True
+        with self.post(self.base_body(thinking={"type": "enabled"})) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["content"], [
+            {"type": "thinking", "thinking": "unfinished reasoning",
+             "signature": "colibri-local"},
+        ])
+        self.assertEqual(payload["stop_reason"], "max_tokens")
+
+    def test_streamed_thinking_then_tool_uses_next_block(self):
+        self.engine.script = ("reasoning</thi",
+                              "nk><tool_call>f<arg_key>x</arg_key>"
+                              "<arg_value>1</arg_value></tool_call>")
+        body = self.base_body(stream=True, thinking={"type": "enabled"},
+                              tools=[{"name": "f", "input_schema": {
+                                  "type": "object",
+                                  "properties": {"x": {"type": "string"}}}}])
+        with self.post(body) as response:
+            raw = response.read().decode()
+        payloads = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+                    if line.startswith("data: ")]
+        starts = [p for p in payloads if p["type"] == "content_block_start"]
+        self.assertEqual([(p["index"], p["content_block"]["type"]) for p in starts],
+                         [(0, "thinking"), (1, "tool_use")])
+        self.assertNotIn("</think>", raw)
+        self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
 
     def test_unsupported_fields_refuse_loudly(self):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):

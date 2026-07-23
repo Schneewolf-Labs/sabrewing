@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-colibrì — tiny engine, immense model.
+colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
   coli chat                 interactive chat (loads the model once)
@@ -90,7 +90,7 @@ class C:
 TTY = sys.stdout.isatty() or os.environ.get("COLI_COLOR")=="1"
 if not TTY: C.off()
 
-# ---------- colibrì 8-bit (pixel art, 2 pixel verticali per carattere) ----------
+# ---------- colibri 8-bit (pixel art, 2 pixel verticali per carattere) ----------
 SPRITE = [
     "....MMM.........",
     "...MMMMM..w.....",
@@ -124,7 +124,7 @@ def sprite_lines():
 def banner(sub=""):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v{_version}{C.r}",
+        f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -215,7 +215,8 @@ def env_for(a):
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
-    if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+                                                        # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
     if a.repin: e["REPIN"]=str(a.repin)
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
@@ -248,7 +249,14 @@ def env_for(a):
         # has working detection + the explicit-flag UX, and changing bare-chat
         # semantics there is out of scope. Falls back to CPU with a warning if
         # nvidia-smi is missing (discover_gpus can't size VRAM without it).
-        if (sys.platform == "win32" and a.gpu is None and not a.vram):
+        # An explicit COLI_CUDA=0 in the environment must win over the implicit
+        # auto-enable: before this check, a Windows user setting COLI_CUDA=0 for
+        # a CPU baseline silently got a ~12.6 GB VRAM expert tier anyway (the
+        # engine's "CPU" rows were GPU-assisted). --gpu none remains the
+        # canonical hard off-switch (works on every platform, also clears the
+        # CUDA_* sizing vars).
+        if (sys.platform == "win32" and a.gpu is None and not a.vram
+                and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
                 from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
                 gpus = discover_gpus()
@@ -277,6 +285,11 @@ def env_for(a):
                           f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
                           f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
             # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
+        elif e.get("COLI_CUDA") == "0":
+            # honoured off-switch: also drop stale device/sizing vars so the
+            # engine can't be re-enabled by leftovers (same as --gpu none).
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
@@ -595,7 +608,7 @@ def chat_attached(a, base, model_id):
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
-        print(f"\n  {C.teal}◆ colibrì{C.r}")
+        print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
         try:
@@ -759,7 +772,7 @@ def cmd_chat(a):
                 p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
             else:
                 p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
-            print(f"\n  {C.teal}◆ colibrì{C.r}")
+            print(f"\n  {C.teal}◆ colibri{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
             def prefill_tick(path=errlog.name):
@@ -950,8 +963,8 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
-    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
-    ap.add_argument("--version", action="version", version=f"colibrì {_version}")
+    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
+    ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])

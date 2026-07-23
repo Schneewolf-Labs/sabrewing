@@ -210,21 +210,66 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
-static void st_init(shards *S, const char *snap_dir) {
+/* Scan one directory for *.safetensors shards, appending to files[] (dedup by
+ * basename, so a list of directories acts as a SEARCH PATH: the same shard
+ * present on two drives is taken from the first-listed one only). *added
+ * returns how many shards this dir contributed. */
+static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
+    DIR *d = opendir(dir); struct dirent *e;
+    if (!d) { perror(dir); exit(1); }
+    int base_n = *nf;
+    while ((e = readdir(d))) {
+        const char *dot = strrchr(e->d_name, '.');
+        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+            int dup = 0;
+            for (int i = 0; i < *nf; i++) {
+                const char *b = strrchr(files[i], '/');
+#ifdef _WIN32
+                const char *b2 = strrchr(files[i], '\\'); if (b2 && (!b || b2 > b)) b = b2;
+#endif
+                b = b ? b + 1 : files[i];
+                if (!strcmp(b, e->d_name)) { dup = 1; break; }  /* already taken from a higher-priority drive */
+            }
+            if (dup) continue;
+            if (*nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
+            snprintf(files[(*nf)++], 1024, "%s/%s", dir, e->d_name);
+        }
+    }
+    closedir(d);
+    if (added) *added = *nf - base_n;
+}
+
+/* Index shards from snap_dir, optionally SPLIT across extra drives listed in
+ * extra_dirs (';' or ',' separated). Each shard lives on exactly ONE drive
+ * (no duplication — unlike the dual-SSD mirror); a demand pread hits whichever
+ * drive holds that shard, so concurrent expert loads parallelise across drives
+ * and combined capacity is used. Scales to N drives. Metadata (config /
+ * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* raccoglie ordinatamente i nomi dei file shard */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
-    DIR *d = opendir(snap_dir); struct dirent *e;
-    if (!d) { perror(snap_dir); exit(1); }
-    while ((e = readdir(d))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
-            if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
-            snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
+    int c0 = 0; st_scan_dir(snap_dir, files, &nf, &c0);
+    int ndir = 1;
+    if (extra_dirs && *extra_dirs) {
+        char buf[4096]; snprintf(buf, sizeof(buf), "%s", extra_dirs);
+        char *p = buf;
+        while (p && *p) {
+            char *sep = p; while (*sep && *sep != ';' && *sep != ',') sep++;
+            int last = (*sep == 0); *sep = 0;
+            while (*p == ' ') p++;
+            size_t plen = strlen(p); while (plen > 0 && p[plen-1] == ' ') p[--plen] = 0;
+            if (*p) {
+                int cN = 0; st_scan_dir(p, files, &nf, &cN);
+                fprintf(stderr, "[SPLIT] +%s -> %d shard(s)\n", p, cN);
+                ndir++;
+            }
+            p = last ? NULL : sep + 1;
         }
+        fprintf(stderr, "[SPLIT] model across %d dir(s): %d shard(s) total (primary %s -> %d shard(s)), no duplication\n",
+                ndir, nf, snap_dir, c0);
     }
-    closedir(d);
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
 
@@ -290,6 +335,15 @@ static void st_init(shards *S, const char *snap_dir) {
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            /* cross-check the declared element count against the byte span for FLOAT
+             * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
+             * into a caller-sized buffer, so a header with numel != nbytes/esz is an
+             * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
+             * their numel is unused by the read path and legitimately may differ. */
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+                  fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
+                          files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
@@ -304,6 +358,9 @@ static void st_init(shards *S, const char *snap_dir) {
         S->hidx[h] = i;
     }
 }
+
+/* backward-compatible single-directory entry point */
+static void st_init(shards *S, const char *snap_dir) { st_init_multi(S, snap_dir, NULL); }
 
 static st_tensor *st_find(shards *S, const char *name) {
     if (S->hidx) {
@@ -368,6 +425,20 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     return t->numel;
 }
 
+/* like st_read_f32 but refuses to write more than `cap` floats into `out`.
+ * Callers that size `out` from CONFIG dims (qt_alloc's O*I, per-row scales) must
+ * use this: a crafted header whose tensor holds more elements than the config
+ * shape would otherwise overrun `out`. Callers that size `out` from st_numel are
+ * self-consistent and may keep using st_read_f32. */
+static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->numel > cap) {
+        fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
+                name, (long long)t->numel, (long long)cap); exit(1); }
+    return st_read_f32(S, name, out, drop);
+}
+
 static int64_t st_numel(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->numel : -1;
 }
@@ -391,9 +462,13 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
+    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
+                name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");
+    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }

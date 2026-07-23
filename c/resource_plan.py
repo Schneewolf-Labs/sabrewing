@@ -157,9 +157,22 @@ def discover_gpus():
         if len(fields) != 4:
             continue
         try:
-            index, total, free = int(fields[0]), int(fields[2]), int(fields[3])
+            index = int(fields[0])
         except ValueError:
             continue
+        # Unified-memory chips (e.g. NVIDIA GB10 Grace Blackwell) have no
+        # discrete VRAM pool, so nvidia-smi reports memory.total/memory.free
+        # as "[N/A]" rather than a number. Fall back to system RAM figures
+        # in that case instead of silently dropping the GPU from discovery.
+        try:
+            total, free = int(fields[2]), int(fields[3])
+        except ValueError:
+            try:
+                meminfo = Path("/proc/meminfo").read_text()
+                total = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
+                free = memory_available() // (1024 * 1024)
+            except (OSError, AttributeError):
+                total = free = 0
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
@@ -296,7 +309,16 @@ def _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets, plan_has_meta
     n_gpu = len(gpus)
 
     # MTP: costs more than it saves when compute-bound (#389 measured 42% loss)
-    if bottleneck_class == "compute":
+    # or streaming-bound (#467 measured 32% loss under CUDA at 85% hit).
+    # EXCEPTION: an explicit COLI_CUDA_MTP=1 in the environment is a documented
+    # opt-in to test speculation under CUDA (glm.c resolves DRAFT=-1 -> 3 only
+    # when it sees the var). Exporting DRAFT=0 here preempted that auto path,
+    # so the opt-in was silently inert on the Windows bare-run/auto-tier flows
+    # (#467): respect it and let the engine's auto path take over. Unset still
+    # gets DRAFT=0 -> MTP off, which is the measured-correct default.
+    if os.environ.get("COLI_CUDA_MTP") == "1":
+        pass  # explicit opt-in: leave DRAFT to the engine's auto resolution
+    elif bottleneck_class == "compute":
         tune["DRAFT"] = {"value": "0",
                          "reason": "compute-bound: MTP batch overhead exceeds yield"}
     elif bottleneck_class == "disk" and projected_hit < 0.90:

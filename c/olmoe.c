@@ -216,20 +216,35 @@ static void softmax_row(float *x, int n) {
 }
 
 /* ---------- caricamento ---------- */
+/* config.json arrives from an untrusted mirror: a missing key was a NULL-deref
+ * (json_get(...)->num), so require each dimension present + numeric. */
+static double req_num(jval *r, const char *k){
+    jval *v=json_get(r,k);
+    if(!v||v->t!=J_NUM){ fprintf(stderr,"config.json: missing or non-numeric \"%s\"\n",k); exit(1); }
+    return v->num;
+}
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    if(n<0 || n>(256L<<20)){ fprintf(stderr,"%s: config.json missing or larger than 256 MB\n",path); exit(1); }  /* SEC-9 */
+    char *buf = malloc((size_t)n+1); if(!buf){ fprintf(stderr,"OOM reading %s\n",path); exit(1); }
+    if(fread(buf,1,(size_t)n,f)!=(size_t)n){ fprintf(stderr,"%s: short read\n",path); exit(1); } buf[n]=0; fclose(f);
     char *arena=NULL; jval *r = json_parse(buf, &arena);
-    c->hidden    = (int)json_get(r,"hidden_size")->num;
-    c->n_layers  = (int)json_get(r,"num_hidden_layers")->num;
-    c->n_heads   = (int)json_get(r,"num_attention_heads")->num;
-    c->n_kv_heads= (int)json_get(r,"num_key_value_heads")->num;
-    c->n_experts = (int)json_get(r,"num_experts")->num;
-    c->topk      = (int)json_get(r,"num_experts_per_tok")->num;
-    c->inter     = (int)json_get(r,"intermediate_size")->num;
-    c->vocab     = (int)json_get(r,"vocab_size")->num;
+    c->hidden    = (int)req_num(r,"hidden_size");
+    c->n_layers  = (int)req_num(r,"num_hidden_layers");
+    c->n_heads   = (int)req_num(r,"num_attention_heads");
+    c->n_kv_heads= (int)req_num(r,"num_key_value_heads");
+    c->n_experts = (int)req_num(r,"num_experts");
+    c->topk      = (int)req_num(r,"num_experts_per_tok");
+    c->inter     = (int)req_num(r,"intermediate_size");
+    c->vocab     = (int)req_num(r,"vocab_size");
+    /* range-check so bad dims can't drive a later malloc(inter*hidden) / div-by-zero */
+    if(c->hidden<1||c->hidden>(1<<20) || c->n_heads<1||c->n_heads>(1<<16) ||
+       c->inter<1||c->inter>(1<<24) || c->vocab<1||c->vocab>(1<<24) ||
+       c->n_layers<1||c->n_layers>4096 || c->n_experts<1||c->n_experts>(1<<20) ||
+       c->n_kv_heads<1 || c->topk<1||c->topk>c->n_experts){
+        fprintf(stderr,"config.json: dimension out of range\n"); exit(1); }
     c->head_dim  = c->hidden / c->n_heads;
     jval *th = json_get(r,"rope_theta");  c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-5f;
@@ -358,6 +373,25 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
+    /* SEC: st_init skips its numel*esz==nbytes cross-check for dtype-3 (U8/I8)
+     * tensors, so a crafted header from an untrusted mirror can declare nbytes
+     * far larger than the config-sized destination and st_read_raw would write
+     * past w_block (heap overflow); an oversized .qs likewise overruns s->gs.
+     * slot_ensure_allocated sizes those buffers exactly ng+ng+nd bytes and
+     * inter+inter+hidden floats, so require an exact match. Reject, never
+     * repair — same contract as qt_resolve_fmt in the GLM engine. */
+    Cfg *cc = &m->c;
+    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
+    int64_t want_w = ng + ng + nd;
+    int64_t want_s = (int64_t)cc->inter + cc->inter + cc->hidden;
+    st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
+    if (!tw || tw->nbytes != want_w) {
+        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld for [inter=%d,hidden=%d], "
+                "refusing (untrusted container)\n", nm, (long long)(tw ? tw->nbytes : -1),
+                (long long)want_w, cc->inter, cc->hidden); exit(1); }
+    if (!ts || ts->numel != want_s) {
+        fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
+                qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
     st_read_raw(&m->S, nm, s->g, 1);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }

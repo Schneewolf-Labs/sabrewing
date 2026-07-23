@@ -59,6 +59,24 @@ static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
+/* acc[0..I) += coef * dequant(int4 row) — the axpy twin of dot_i4f_avx512, for the
+ * MLA absorption path (qt_addrow). Each acc[i] receives exactly ONE fma per call
+ * (no cross-element accumulation), so this is bit-identical to the scalar loop
+ * (gcc -O3 -ffp-contract already emits scalar fma there). Tail handled scalar. */
+static inline void axpy_i4f_avx512(const uint8_t *w,float coef,float *acc,int I){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    const __m512 cv=_mm512_set1_ps(coef); int i=0;
+    for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+        _mm512_storeu_ps(acc+i,   _mm512_fmadd_ps(cv,w0,_mm512_loadu_ps(acc+i)));
+        _mm512_storeu_ps(acc+i+16,_mm512_fmadd_ps(cv,w1,_mm512_loadu_ps(acc+i+16)));
+    }
+    for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=coef*(float)((int)(b&0xF)-8); acc[i+1]+=coef*(float)((int)(b>>4)-8); }
+    if(i<I){ uint8_t b=w[i>>1]; acc[i]+=coef*(float)((int)(b&0xF)-8); }
+}
 static int i4_acc512_selftest(void){
     enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
     for(int i=0;i<N;i++){
@@ -351,9 +369,27 @@ static int g_idot=1;
 static int g_i4s=1;
 #elif defined(__VSX__)
 static int g_i4s=1;
+#elif defined(__AVX512VNNI__) && defined(__AVX512BW__)
+static int g_i4s=1;   /* AVX-512 VNNI: come SDOT, l'IDOT int4 conviene anche a S=1. Misurato su
+                       * 2x Xeon 8370C (48 core, GLM-5.2 int4 tutto residente, TEMP=0 DRAFT=0,
+                       * 256 token): 3.65 -> 3.85 tok/s (+5.5%), expert-matmul 67.8 -> 89.5 GB/s.
+                       * EN: with AVX-512 VNNI, like SDOT, int4 IDOT pays at S=1 too. Measured on
+                       * a 2-socket Ice Lake (config above): +5.5% end-to-end greedy decode. */
 #else
 static int g_i4s=2;
 #endif
+static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -> ONE OpenMP
+                       * region across all experts of the batch-union block instead of ~2
+                       * fork/joins per expert. Engages only with the int4-IDOT S=1 family
+                       * (g_i4s<=1) and off the speculation window (spec_pinned): output is
+                       * byte-identical to that family (same dot_i4i8 per row, same silu,
+                       * same requant, same accumulation order into out). Measured on a
+                       * 2-socket Ice Lake 48C (GLM-5.2 int4 fully resident, TEMP=0 DRAFT=0,
+                       * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
+                       * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
+                       * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
+                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * opt-in; measure on your host. */
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
@@ -789,6 +825,393 @@ static void pack_int2(const float *w, uint8_t *q2, float *scale, int O, int I, i
         for(int i=0;i<I;i+=4){ uint8_t byte=0;
             for(int k=0;k<4 && i+k<I;k++){ int v=(int)lrintf(wr[i+k]/s); if(v>qmax)v=qmax; if(v<-2)v=-2; byte|=(uint8_t)((v+2)<<(k*2)); }
             qr[i>>2]=byte;
+        }
+    }
+}
+
+/* ---- fmt=6: E8/IQ3 lattice container (#452) --------------------------------
+ * 98 bytes per 256 weights = 3.0625 bits/weight. Per super-block:
+ *   [ 0..63]  uint8  grid index per 4-dim magnitude block
+ *   [64..95]  uint32 x8 - four 7-bit sign words + 4-bit sub-scale, per 32 weights
+ *   [96..97]  fp16   super-scale
+ * value = d * (0.5 + code) * 0.5 * grid[idx][j] * sign, with the 8th sign of every
+ * eight derived from odd parity (that is what buys the 8th bit back).
+ * Byte layout and arithmetic mirror tools/iq3_pack.py exactly - that codec is the
+ * oracle this kernel is tested against.
+ *
+ * Decode strategy: expand one 32-weight sub-block into a stack buffer, then FMA it
+ * against the activations. Per-weight table lookups would dominate; per-sub-block
+ * expansion keeps the grid rows (16 bytes each) hot in L1 and lets the compiler
+ * vectorize the multiply-accumulate. */
+#define E8_QK      256                  /* weights per super-block */
+#define E8_SUB     32                   /* weights per sign/scale word */
+#define E8_BBYTES  98                   /* bytes per super-block */
+static inline int64_t e8_blocks(int I){ return ((int64_t)I + E8_QK - 1) / E8_QK; }
+static inline int64_t e8_rowbytes(int I){ return e8_blocks(I) * E8_BBYTES; }
+
+/* The published 256x4 magnitude grid, stored doubled (4,12,..,62 mean 2,6,..,31).
+ * From ggml-common.h (MIT); tools/iq3xxs_grid.json is the same table for the
+ * Python codec, and tests/test_e8_kernel.c checks the two agree through the
+ * fixture. Header-local like the rest of quant.h - the engine is a single
+ * translation unit and the tests include this header directly. */
+static const uint8_t e8_grid[256][4] = {
+    {  4,  4,  4,  4},
+    { 20,  4,  4,  4},
+    { 36,  4,  4,  4},
+    { 12, 12,  4,  4},
+    { 28, 12,  4,  4},
+    { 62, 12,  4,  4},
+    {  4, 20,  4,  4},
+    { 20, 20,  4,  4},
+    { 12, 28,  4,  4},
+    { 20, 36,  4,  4},
+    { 28, 62,  4,  4},
+    { 44, 62,  4,  4},
+    { 12,  4, 12,  4},
+    { 28,  4, 12,  4},
+    {  4, 12, 12,  4},
+    { 20, 12, 12,  4},
+    { 12, 20, 12,  4},
+    { 44, 20, 12,  4},
+    {  4, 28, 12,  4},
+    { 20, 28, 12,  4},
+    { 12, 36, 12,  4},
+    { 36, 44, 12,  4},
+    {  4, 62, 12,  4},
+    {  4,  4, 20,  4},
+    { 20,  4, 20,  4},
+    { 36,  4, 20,  4},
+    { 12, 12, 20,  4},
+    {  4, 20, 20,  4},
+    { 20, 20, 20,  4},
+    { 12, 28, 20,  4},
+    { 28, 28, 20,  4},
+    { 62, 28, 20,  4},
+    { 12, 44, 20,  4},
+    { 62, 44, 20,  4},
+    { 44, 62, 20,  4},
+    { 12,  4, 28,  4},
+    { 62,  4, 28,  4},
+    {  4, 12, 28,  4},
+    { 20, 12, 28,  4},
+    { 44, 20, 28,  4},
+    {  4, 62, 28,  4},
+    { 28, 12, 36,  4},
+    { 62, 28, 36,  4},
+    { 36, 36, 36,  4},
+    { 62, 44, 36,  4},
+    { 28, 62, 36,  4},
+    { 44, 62, 36,  4},
+    { 12,  4, 44,  4},
+    { 62,  4, 44,  4},
+    { 20, 28, 44,  4},
+    { 20, 44, 44,  4},
+    { 44, 28, 52,  4},
+    { 36, 52, 52,  4},
+    {  4, 12, 62,  4},
+    { 36, 12, 62,  4},
+    { 52, 12, 62,  4},
+    { 28, 36, 62,  4},
+    { 12, 52, 62,  4},
+    { 12,  4,  4, 12},
+    { 28,  4,  4, 12},
+    {  4, 12,  4, 12},
+    { 20, 12,  4, 12},
+    { 12, 20,  4, 12},
+    { 28, 20,  4, 12},
+    {  4, 28,  4, 12},
+    { 20, 28,  4, 12},
+    { 36, 28,  4, 12},
+    { 62, 36,  4, 12},
+    {  4, 44,  4, 12},
+    {  4,  4, 12, 12},
+    { 20,  4, 12, 12},
+    { 12, 12, 12, 12},
+    {  4, 20, 12, 12},
+    { 20, 20, 12, 12},
+    { 12,  4, 20, 12},
+    { 28,  4, 20, 12},
+    {  4, 12, 20, 12},
+    { 20, 12, 20, 12},
+    { 12, 20, 20, 12},
+    {  4, 28, 20, 12},
+    { 20, 62, 20, 12},
+    {  4,  4, 28, 12},
+    { 20,  4, 28, 12},
+    {  4, 20, 28, 12},
+    { 12, 28, 28, 12},
+    { 52, 36, 28, 12},
+    { 52, 52, 28, 12},
+    { 12,  4, 36, 12},
+    { 44,  4, 36, 12},
+    {  4, 44, 36, 12},
+    {  4, 20, 44, 12},
+    { 36, 20, 44, 12},
+    { 52, 36, 44, 12},
+    { 12, 62, 44, 12},
+    { 44,  4, 52, 12},
+    { 20, 20, 62, 12},
+    {  4, 36, 62, 12},
+    {  4,  4,  4, 20},
+    { 20,  4,  4, 20},
+    { 12, 12,  4, 20},
+    { 28, 12,  4, 20},
+    {  4, 20,  4, 20},
+    { 20, 20,  4, 20},
+    { 52, 20,  4, 20},
+    { 12, 28,  4, 20},
+    { 20, 36,  4, 20},
+    { 12,  4, 12, 20},
+    { 28,  4, 12, 20},
+    { 44,  4, 12, 20},
+    {  4, 12, 12, 20},
+    { 20, 12, 12, 20},
+    { 12, 20, 12, 20},
+    {  4, 28, 12, 20},
+    { 28, 52, 12, 20},
+    { 62, 52, 12, 20},
+    {  4, 62, 12, 20},
+    {  4,  4, 20, 20},
+    { 20,  4, 20, 20},
+    { 12, 12, 20, 20},
+    { 62, 12, 20, 20},
+    {  4, 20, 20, 20},
+    { 20, 20, 20, 20},
+    { 62, 28, 20, 20},
+    {  4, 36, 20, 20},
+    { 44, 44, 20, 20},
+    { 12,  4, 28, 20},
+    {  4, 12, 28, 20},
+    { 36, 12, 28, 20},
+    {  4, 62, 28, 20},
+    { 36, 62, 28, 20},
+    { 44, 28, 36, 20},
+    { 28, 44, 36, 20},
+    { 28,  4, 44, 20},
+    { 62, 20, 44, 20},
+    { 12, 36, 44, 20},
+    { 36, 62, 44, 20},
+    { 12,  4, 62, 20},
+    { 28,  4, 62, 20},
+    { 52, 12, 62, 20},
+    { 44, 36, 62, 20},
+    { 12,  4,  4, 28},
+    {  4, 12,  4, 28},
+    { 20, 12,  4, 28},
+    { 12, 20,  4, 28},
+    { 28, 20,  4, 28},
+    {  4, 44,  4, 28},
+    { 44, 52,  4, 28},
+    { 20, 62,  4, 28},
+    {  4,  4, 12, 28},
+    { 20,  4, 12, 28},
+    {  4, 20, 12, 28},
+    { 12, 28, 12, 28},
+    { 36, 36, 12, 28},
+    { 52, 36, 12, 28},
+    { 12,  4, 20, 28},
+    { 28,  4, 20, 28},
+    {  4, 12, 20, 28},
+    { 44, 20, 20, 28},
+    { 20, 44, 20, 28},
+    { 20, 62, 20, 28},
+    { 12, 12, 28, 28},
+    { 28, 28, 28, 28},
+    {  4, 28, 36, 28},
+    { 62, 36, 36, 28},
+    { 20, 62, 36, 28},
+    {  4,  4, 44, 28},
+    { 52,  4, 44, 28},
+    { 20, 20, 44, 28},
+    { 44, 44, 44, 28},
+    { 36, 12, 52, 28},
+    { 52, 28, 52, 28},
+    { 28, 52, 52, 28},
+    { 28, 28, 62, 28},
+    {  4, 52, 62, 28},
+    { 36,  4,  4, 36},
+    { 62, 12,  4, 36},
+    { 44, 28,  4, 36},
+    { 62, 28,  4, 36},
+    { 28, 44,  4, 36},
+    { 62, 44,  4, 36},
+    { 36, 62, 12, 36},
+    {  4, 20, 20, 36},
+    { 62, 28, 20, 36},
+    {  4, 36, 20, 36},
+    {  4, 52, 20, 36},
+    { 52, 52, 20, 36},
+    { 62,  4, 28, 36},
+    { 44, 36, 28, 36},
+    { 36,  4, 36, 36},
+    { 12, 44, 36, 36},
+    { 36, 52, 36, 36},
+    { 44, 20, 44, 36},
+    { 28, 36, 44, 36},
+    {  4, 62, 44, 36},
+    { 44,  4, 62, 36},
+    {  4, 12, 62, 36},
+    { 20, 12, 62, 36},
+    {  4, 28, 62, 36},
+    { 20, 12,  4, 44},
+    { 12, 36,  4, 44},
+    {  4, 62,  4, 44},
+    {  4,  4, 12, 44},
+    { 52,  4, 12, 44},
+    { 52, 20, 12, 44},
+    { 44, 44, 12, 44},
+    { 36, 12, 20, 44},
+    { 20, 28, 20, 44},
+    { 20, 62, 20, 44},
+    { 20,  4, 28, 44},
+    { 28, 44, 28, 44},
+    {  4, 12, 36, 44},
+    { 28, 20, 36, 44},
+    { 62, 20, 36, 44},
+    { 20, 62, 36, 44},
+    { 20,  4, 44, 44},
+    { 12, 28, 44, 44},
+    {  4, 44, 52, 44},
+    { 36, 20, 62, 44},
+    { 20, 36, 62, 44},
+    { 36, 20,  4, 52},
+    { 36, 36,  4, 52},
+    { 52, 36,  4, 52},
+    { 36, 52,  4, 52},
+    { 12, 20, 12, 52},
+    { 12, 52, 12, 52},
+    { 62, 12, 20, 52},
+    { 36, 52, 20, 52},
+    {  4, 28, 28, 52},
+    { 52, 28, 28, 52},
+    { 36, 36, 36, 52},
+    { 44,  4, 44, 52},
+    { 20, 44, 44, 52},
+    { 28, 28, 52, 52},
+    { 28,  4, 62, 52},
+    { 12, 20, 62, 52},
+    { 28,  4,  4, 62},
+    { 44,  4,  4, 62},
+    { 62,  4,  4, 62},
+    {  4, 12,  4, 62},
+    { 20, 28,  4, 62},
+    { 20, 44,  4, 62},
+    { 52, 20, 12, 62},
+    {  4, 36, 12, 62},
+    { 20, 12, 20, 62},
+    { 44, 36, 20, 62},
+    { 20, 44, 20, 62},
+    {  4,  4, 28, 62},
+    { 44, 12, 28, 62},
+    { 28, 28, 28, 62},
+    {  4, 52, 28, 62},
+    { 12, 20, 36, 62},
+    { 12, 36, 36, 62},
+    {  4,  4, 44, 62},
+    { 20,  4, 44, 62},
+    { 36, 20, 44, 62},
+    {  4, 28, 52, 62}
+};
+
+static inline float e8_fp16_to_f32(uint16_t h){
+    uint32_t sign=(uint32_t)(h>>15)<<31, exp=(h>>10)&0x1F, man=h&0x3FF, bits;
+    if(!exp)      bits = man ? (sign | ((127-15+1)<<23) | (man<<13)) : sign;  /* subnormal->approx */
+    else if(exp==0x1F) bits = sign | 0x7F800000u | (man<<13);
+    else          bits = sign | ((exp+112)<<23) | (man<<13);
+    float f; memcpy(&f,&bits,4); return f;
+}
+
+/* Expand one 32-weight sub-block. `out` must hold 32 floats. */
+static inline void e8_expand_sub(const uint8_t *blk, int ib, float d, float *out){
+    uint32_t word; memcpy(&word, blk + E8_QK/4 + ib*4, 4);
+    float db = d * (0.5f + (float)((word>>28)&0xF)) * 0.5f;
+    const uint8_t *idx = blk + ib*8;
+    for(int l=0;l<4;l++){
+        uint32_t seven=(word>>(7*l))&0x7F;
+        const uint8_t *g0=e8_grid[idx[l*2+0]], *g1=e8_grid[idx[l*2+1]];
+        int par=0;
+        for(int j=0;j<8;j++){
+            int neg = j<7 ? (int)((seven>>j)&1) : 0;
+            if(j<7) par^=neg; else neg=par;            /* odd parity closes the block */
+            float mag = (j<4 ? (float)g0[j] : (float)g1[j-4]) * 0.5f;
+            out[l*8+j] = neg ? -mag*db : mag*db;
+        }
+    }
+}
+
+/* Fast Walsh-Hadamard transform with the per-tensor sign flip: y = Q^T x for
+ * Q = D*H/sqrt(n). fmt=6 stores W@Q, so activations must be transformed before
+ * the matmul (#452). Placement is the engine's job and it matters: all routed
+ * experts of a layer share one input row, so ONE transform per (layer,
+ * projection group) costs ~1.4 ms/token on GLM dims, while doing it per expert
+ * costs ~11 ms. n must be a power of two >= the real dim; the tail is zero-pad.
+ * Self-inverse up to the sign flip, so the same routine serves both directions. */
+static inline void e8_fwht(float *a, int n, const uint8_t *signbits){
+    if(signbits) for(int i=0;i<n;i++) if(signbits[i>>3]>>(i&7)&1) a[i]=-a[i];
+    for(int len=1;len<n;len<<=1)
+        for(int i=0;i<n;i+=len<<1)
+            for(int j=i;j<i+len;j++){ float u=a[j],v=a[j+len]; a[j]=u+v; a[j+len]=u-v; }
+    float s=1.0f/sqrtf((float)n);
+    for(int i=0;i<n;i++) a[i]*=s;
+}
+static inline int e8_pow2_ceil(int n){ int p=1; while(p<n) p<<=1; return p; }
+
+/* Rotation sign bits, regenerated — not stored. xorshift64* seeded 417+n, one
+ * bit per element; tools/iq3_pack.py signs() draws the identical stream, so the
+ * container carries no rotation data and the two sides cannot drift apart
+ * without the oracle fixture catching it (#452). */
+static inline void e8_signs(uint8_t *bits, int n){
+    uint64_t s=417u+(uint64_t)n;
+    for(int i=0;i<(n+7)/8;i++){
+        s^=s>>12; s^=s<<25; s^=s>>27;
+        bits[i]=(uint8_t)((s*2685821657736338717ULL)>>56);
+    }
+}
+/* Apply the fmt=6 activation rotation Q^T in place, row-major [nr,dim].
+ * Non-power-of-two dims tile block-diagonally; each block is the largest power
+ * of two dividing the remainder (= its lowest set bit): 6144 -> 2048+4096,
+ * 1536 -> 512+1024. Blocks over 32768 halve until they fit the sign buffer.
+ * The converter rotates weight rows with this exact routine (W@Q and Q^T x are
+ * the same transform: Q is symmetric-orthogonal up to the sign flip). */
+static inline void e8_rot_rows(float *rows, int nr, int dim){
+    int off=0;
+    while(off<dim){
+        int rem=dim-off, b=rem&(-rem);
+        while(b>32768) b>>=1;
+        uint8_t bits[32768/8];
+        e8_signs(bits,b);
+        for(int r=0;r<nr;r++) e8_fwht(rows+(int64_t)r*dim+off,b,bits);
+        off+=b;
+    }
+}
+
+static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
+                      int S, int I, int O){
+    (void)unused;                                  /* scales live inside the blocks */
+    int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wrow=q+(int64_t)o*rb;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float acc=0;
+            for(int64_t b=0;b<nb;b++){
+                const uint8_t *blk=wrow+b*E8_BBYTES;
+                uint16_t dh; memcpy(&dh, blk+96, 2);
+                float d=e8_fp16_to_f32(dh);
+                int base=(int)(b*E8_QK);
+                for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                    int off=base+ib*E8_SUB;
+                    if(off>=I) break;
+                    float w[E8_SUB];
+                    e8_expand_sub(blk, ib, d, w);
+                    int n = I-off < E8_SUB ? I-off : E8_SUB;
+                    float a=0;
+                    for(int k=0;k<n;k++) a += xs[off+k]*w[k];
+                    acc+=a;
+                }
+            }
+            y[(int64_t)s*O+o]=acc;
         }
     }
 }

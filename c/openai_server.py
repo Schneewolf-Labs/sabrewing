@@ -567,7 +567,13 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
             # content may be null when the message is purely tool_calls
             raw = message.get("content")
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-            prompt.append(f"<|assistant|><think></think>{text.strip()}")
+            reasoning = message.get("reasoning_content")
+            if reasoning is None:
+                reasoning = ""
+            elif not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            prompt.append(f"<|assistant|><think>{reasoning}</think>{text.strip()}")
             for tc in (message.get("tool_calls") or []):
                 fn = tc.get("function", tc) if isinstance(tc, dict) else {}
                 args = fn.get("arguments", "{}")
@@ -600,6 +606,63 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
 # request into the exact OpenAI-shaped body the existing path already validates, so prompt
 # rendering, scheduling, generation and tool parsing stay single-sourced. Only the request
 # translation and the response/SSE shapes are new. Claude Code is the reference client.
+
+ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
+
+
+class ThinkingStreamSplit:
+    """Split GLM's reasoning marker without leaking markers across stream chunks."""
+    MARKERS = (THINK_OPEN, THINK_CLOSE)
+
+    def __init__(self, on_thinking, on_text, on_thinking_end=None):
+        self.on_thinking = on_thinking
+        self.on_text = on_text
+        self.on_thinking_end = on_thinking_end
+        self.thinking = True
+        self.buf = ""
+
+    def _emit(self, text):
+        if text:
+            (self.on_thinking if self.thinking else self.on_text)(text)
+
+    def feed(self, chunk):
+        self.buf += chunk
+        while True:
+            hits = [(offset, marker) for marker in self.MARKERS
+                    if (offset := self.buf.find(marker)) >= 0]
+            if hits:
+                offset, marker = min(hits, key=lambda hit: hit[0])
+                self._emit(self.buf[:offset])
+                self.buf = self.buf[offset + len(marker):]
+                if marker == THINK_CLOSE and self.thinking:
+                    self.thinking = False
+                    if self.on_thinking_end:
+                        self.on_thinking_end()
+                continue
+
+            hold = 0
+            for size in range(1, min(len(self.buf), max(map(len, self.MARKERS)) - 1) + 1):
+                if any(marker.startswith(self.buf[-size:]) for marker in self.MARKERS):
+                    hold = size
+            flush = len(self.buf) - hold
+            if flush:
+                self._emit(self.buf[:flush])
+                self.buf = self.buf[flush:]
+            return
+
+    def finish(self):
+        self._emit(self.buf)
+        self.buf = ""
+
+
+def split_thinking_reply(text):
+    """Return the marker-free (thinking, answer) portions of one GLM reply."""
+    thinking, answer = [], []
+    split = ThinkingStreamSplit(thinking.append, answer.append)
+    split.feed(text)
+    split.finish()
+    return "".join(thinking), "".join(answer)
+
 
 def _anthropic_block_text(blocks, param):
     """Text out of an Anthropic content array (tool_result content is the same shape)."""
@@ -650,7 +713,7 @@ def anthropic_to_openai(body):
         if not isinstance(content, list):
             raise APIError(400, "Message content must be a string or an array of blocks.",
                            f"messages.{index}.content")
-        texts, calls, results = [], [], []
+        texts, reasoning, calls, results = [], [], [], []
         for j, block in enumerate(content):
             where = f"messages.{index}.content.{j}"
             if not isinstance(block, dict):
@@ -660,6 +723,17 @@ def anthropic_to_openai(body):
                 if not isinstance(block.get("text"), str):
                     raise APIError(400, "Text blocks require a string `text` field.", f"{where}.text")
                 texts.append(block["text"])
+            elif kind == "thinking":
+                if role != "assistant":
+                    raise APIError(400, "`thinking` blocks are valid only in assistant messages.",
+                                   f"{where}.type", "unsupported_content_type")
+                if not isinstance(block.get("thinking"), str):
+                    raise APIError(400, "Thinking blocks require a string `thinking` field.",
+                                   f"{where}.thinking")
+                if not isinstance(block.get("signature"), str):
+                    raise APIError(400, "Thinking blocks require a string `signature` field.",
+                                   f"{where}.signature")
+                reasoning.append(block["thinking"])
             elif kind == "tool_use":
                 name = block.get("name")
                 if not isinstance(name, str) or not name:
@@ -685,8 +759,10 @@ def anthropic_to_openai(body):
         messages.extend(results)
         text = "".join(texts)
         if role == "assistant":
-            if text or calls:
+            if text or reasoning or calls:
                 entry = {"role": "assistant", "content": text or None}
+                if reasoning:
+                    entry["reasoning_content"] = "".join(reasoning)
                 if calls:
                     entry["tool_calls"] = calls
                 messages.append(entry)
@@ -1631,9 +1707,9 @@ class APIHandler(BaseHTTPRequestHandler):
             tools = None
         prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
                              tools, tool_choice)
-        self.anthropic_generation(translated, prompt, request_id, tools)
+        self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
-    def anthropic_generation(self, body, prompt, request_id, tools):
+    def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
         maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -1648,10 +1724,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
+            content = []
+            if enable_thinking:
+                reasoning, text = split_thinking_reply(text)
+                content.append({"type": "thinking", "thinking": reasoning,
+                                "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
                 text, calls = parse_tool_calls(text, tools)
-            content = []
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -1722,8 +1802,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 "id": message_id, "type": "message", "role": "assistant",
                 "model": self.server.model_id, "content": [], "stop_reason": None,
                 "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
-            send_event("content_block_start", {"type": "content_block_start", "index": 0,
-                                               "content_block": {"type": "text", "text": ""}})
+            text_index = 1 if enable_thinking else 0
+            stream_state = {"thinking_closed": not enable_thinking,
+                            "text_started": not enable_thinking}
+            if enable_thinking:
+                send_event("content_block_start", {"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+            else:
+                send_event("content_block_start", {"type": "content_block_start", "index": 0,
+                                                   "content_block": {"type": "text", "text": ""}})
             ka_thread = threading.Thread(target=keepalive, daemon=True)
             ka_thread.start()
 
@@ -1731,11 +1818,19 @@ class APIHandler(BaseHTTPRequestHandler):
             state = {"buf": "", "in_tool": False}
             hold = len(BOX_START) - 1
 
-            def on_text(chunk):
-                raw.append(chunk)
+            def emit_text(chunk):
+                if not chunk:
+                    return
+                if not stream_state["text_started"]:
+                    stream_state["text_started"] = True
+                    send_event("content_block_start", {"type": "content_block_start",
+                        "index": text_index, "content_block": {"type": "text", "text": ""}})
+                send_event("content_block_delta", {"type": "content_block_delta",
+                    "index": text_index, "delta": {"type": "text_delta", "text": chunk}})
+
+            def emit_answer(chunk):
                 if not tools:
-                    send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta", "text": chunk}})
+                    emit_text(chunk)
                     return
                 if state["in_tool"]:
                     return                       # tool markers never reach the client as text
@@ -1743,32 +1838,54 @@ class APIHandler(BaseHTTPRequestHandler):
                 cut = state["buf"].find(BOX_START)
                 if cut >= 0:
                     if cut:
-                        send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                            "delta": {"type": "text_delta", "text": state["buf"][:cut]}})
+                        emit_text(state["buf"][:cut])
                     state["buf"] = ""
                     state["in_tool"] = True
                     return
                 flush = max(0, len(state["buf"]) - hold)
                 if flush:
-                    send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta", "text": state["buf"][:flush]}})
+                    emit_text(state["buf"][:flush])
                     state["buf"] = state["buf"][flush:]
+
+            def emit_thinking(chunk):
+                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": chunk}})
+
+            def close_thinking():
+                if stream_state["thinking_closed"]:
+                    return
+                stream_state["thinking_closed"] = True
+                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "signature_delta",
+                              "signature": ANTHROPIC_LOCAL_SIGNATURE}})
+                send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
+                     if enable_thinking else None)
+
+            def on_text(chunk):
+                raw.append(chunk)
+                (split.feed if split else emit_answer)(chunk)
 
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, on_text, cache_slot,
                 lambda: not connected[0], grammar=grammar)
+            if split:
+                split.finish()
+                close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
-                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                    "delta": {"type": "text_delta", "text": state["buf"]}})
+                emit_text(state["buf"])
             ka_stop.set()
             ka_thread.join(timeout=2)
-            send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            if stream_state["text_started"]:
+                send_event("content_block_stop", {"type": "content_block_stop",
+                                                  "index": text_index})
 
             content, stop_reason = blocks_and_stop("".join(raw), stats)
-            index = 1
+            index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":
-                    continue                     # text already streamed as block 0
+                    continue                     # thinking/text blocks were streamed above
                 send_event("content_block_start", {"type": "content_block_start", "index": index,
                     "content_block": {"type": "tool_use", "id": block["id"],
                                       "name": block["name"], "input": {}}})
