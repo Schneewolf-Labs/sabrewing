@@ -268,13 +268,28 @@ static void rope_apply(float *h, int pos, const float *inv, int rdim, float scal
 }
 
 /* fills h_out[n*hidden] with post-final-norm hidden states */
-static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
+/* persistent K/V cache: k[layer]/v[layer] indexed by absolute position, holding
+ * post-qk-norm, post-rope K and raw V — so decode processes one token instead of
+ * re-running the whole sequence (O(n) generation instead of O(n^2)). */
+typedef struct { float **k, **v; int max_pos, len; } KVCache;
+static void kv_init(KVCache *kv, Model *m, int max_pos) {
+    int nkv = m->c.n_kv, hd = m->c.head_dim, L = m->c.n_layers;
+    kv->k = malloc(L * sizeof(float*)); kv->v = malloc(L * sizeof(float*));
+    for (int l = 0; l < L; l++) { kv->k[l] = falloc((int64_t)max_pos * nkv * hd); kv->v[l] = falloc((int64_t)max_pos * nkv * hd); }
+    kv->max_pos = max_pos; kv->len = 0;
+}
+static void kv_free(KVCache *kv, int L) { for (int l = 0; l < L; l++) { free(kv->k[l]); free(kv->v[l]); } free(kv->k); free(kv->v); }
+
+/* process S tokens at absolute positions pos0..pos0+S-1, appending K/V to the
+ * cache; writes each token's post-final-norm hidden state to h_out[S*D].
+ * Prefill: S=np, pos0=0. Decode: S=1, pos0=current length. */
+static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, float *h_out) {
     Cfg *c = &m->c;
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
-    float *h = falloc((int64_t)n * D);
-    for (int t = 0; t < n; t++) memcpy(h + t * D, m->embed + (int64_t)ids[t] * D, D * sizeof(float));
+    float *h = falloc((int64_t)S * D);
+    for (int t = 0; t < S; t++) memcpy(h + t * D, m->embed + (int64_t)ids[t] * D, D * sizeof(float));
 
-    float *xn = falloc((int64_t)n * D);
+    float *xn = falloc((int64_t)S * D);
     float *scr = falloc(D);
     for (int li = 0; li < c->n_layers; li++) {
         Layer *L = &m->L[li];
@@ -284,54 +299,57 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
         float rscale = c->is_sliding[li] ? c->s_scale : c->g_scale;
         int win = c->is_sliding[li] ? c->sliding_window : 0;   /* 0 = global (unbounded) */
         int group = H / nkv;
+        float *Kc = kv->k[li], *Vc = kv->v[li];
 
-        /* --- attention --- */
-        float *Q = falloc((int64_t)n * H * hd);
-        float *K = falloc((int64_t)n * nkv * hd);
-        float *V = falloc((int64_t)n * nkv * hd);
-        float *AO = falloc((int64_t)n * H * hd);
-        for (int t = 0; t < n; t++) {
+        /* --- project + qk-norm + rope; store K/V into the cache at abs position --- */
+        float *Q = falloc((int64_t)S * H * hd);
+        float *AO = falloc((int64_t)S * H * hd);
+        for (int t = 0; t < S; t++) {
+            int pos = pos0 + t;
             rmsnorm(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
             matmul(Q + (int64_t)t * H * hd, xn + t * D, L->wq, D, H * hd);
-            matmul(K + (int64_t)t * nkv * hd, xn + t * D, L->wk, D, nkv * hd);
-            matmul(V + (int64_t)t * nkv * hd, xn + t * D, L->wv, D, nkv * hd);
+            float *kt = Kc + (int64_t)pos * nkv * hd, *vt = Vc + (int64_t)pos * nkv * hd;
+            matmul(kt, xn + t * D, L->wk, D, nkv * hd);
+            matmul(vt, xn + t * D, L->wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
                 float *q = Q + ((int64_t)t * H + hh) * hd;
                 rmsnorm(q, q, L->qn, hd, c->rms_eps);
-                rope_apply(q, t, inv, rdim, rscale);
+                rope_apply(q, pos, inv, rdim, rscale);
             }
-            for (int hh = 0; hh < nkv; hh++) {
-                float *k = K + ((int64_t)t * nkv + hh) * hd;
+            for (int hh = 0; hh < nkv; hh++) {  /* k_norm + rope, in place in the cache */
+                float *k = kt + hh * hd;
                 rmsnorm(k, k, L->kn, hd, c->rms_eps);
-                rope_apply(k, t, inv, rdim, rscale);
+                rope_apply(k, pos, inv, rdim, rscale);
             }
         }
         float scaling = 1.f / sqrtf((float)hd);
-        float *att = falloc(n);
-        for (int t = 0; t < n; t++) {
-            int j0 = (win > 0 && t - win + 1 > 0) ? t - win + 1 : 0;
+        #pragma omp parallel for schedule(dynamic) if(S > 1)
+        for (int t = 0; t < S; t++) {
+            int pos = pos0 + t;
+            int j0 = (win > 0 && pos - win + 1 > 0) ? pos - win + 1 : 0;   /* sliding window */
+            float *att = falloc(pos - j0 + 1);
             for (int hh = 0; hh < H; hh++) {
                 int kh = hh / group;
                 const float *q = Q + ((int64_t)t * H + hh) * hd;
                 int m0 = 0;
-                for (int j = j0; j <= t; j++) {
-                    const float *k = K + ((int64_t)j * nkv + kh) * hd;
+                for (int j = j0; j <= pos; j++) {                 /* attend cached K [j0..pos] */
+                    const float *k = Kc + ((int64_t)j * nkv + kh) * hd;
                     double s = 0; for (int d = 0; d < hd; d++) s += (double)q[d] * k[d];
                     att[m0++] = (float)s * scaling;
                 }
                 softmax(att, m0);
                 float *ao = AO + ((int64_t)t * H + hh) * hd;
                 for (int d = 0; d < hd; d++) ao[d] = 0;
-                for (int j = j0, mi = 0; j <= t; j++, mi++) {
-                    const float *v = V + ((int64_t)j * nkv + kh) * hd;
+                for (int j = j0, mi = 0; j <= pos; j++, mi++) {
+                    const float *v = Vc + ((int64_t)j * nkv + kh) * hd;
                     float a = att[mi];
                     for (int d = 0; d < hd; d++) ao[d] += a * v[d];
                 }
             }
+            free(att);
         }
-        free(att);
         /* per-head softplus gate (of the layer input xn) applied before o_proj */
-        for (int t = 0; t < n; t++) {
+        for (int t = 0; t < S; t++) {
             for (int hh = 0; hh < H; hh++) {
                 const float *g = L->wg + (int64_t)hh * D;
                 double s = 0; for (int i = 0; i < D; i++) s += (double)xn[t * D + i] * g[i];
@@ -342,9 +360,10 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
             matmul(scr, AO + (int64_t)t * H * hd, L->wo, H * hd, D);
             for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
         }
-        free(Q); free(K); free(V); free(AO);
+        free(Q); free(AO);
 
-        /* --- MLP / MoE --- */
+        /* --- MLP / MoE (per-token) --- */
+        int n = S;
         for (int t = 0; t < n; t++) rmsnorm(xn + t * D, h + t * D, L->ln2, D, c->rms_eps);
         if (!c->is_moe[li]) {
             int I = c->dense_inter;
@@ -404,7 +423,8 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
             free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
         }
     }
-    for (int t = 0; t < n; t++) rmsnorm(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
+    for (int t = 0; t < S; t++) rmsnorm(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
+    if (pos0 + S > kv->len) kv->len = pos0 + S;
     free(h); free(xn); free(scr);
 }
 static int argmax_logits(Model *m, const float *h_pos, int *unused) {
@@ -427,8 +447,15 @@ int main(int argc, char **argv) {
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
+    char *pbuf = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc) {   /* prompt from file (chat template etc.) */
+            FILE *pf = fopen(argv[++i], "rb"); if (!pf) { perror(argv[i]); return 1; }
+            fseek(pf, 0, SEEK_END); long pn = ftell(pf); fseek(pf, 0, SEEK_SET);
+            pbuf = malloc(pn + 1); if (fread(pbuf, 1, pn, pf) != (size_t)pn) {} pbuf[pn] = 0; fclose(pf);
+            prompt = pbuf;
+        }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n_new = atoi(argv[++i]);
         else refpath = argv[i];
     }
@@ -440,7 +467,7 @@ int main(int argc, char **argv) {
            m.c.moe_inter, m.c.sliding_window, m.c.g_rdim, m.c.g_scale, m.c.s_rdim);
     printf("resident weights loaded | RSS %.2f GB\n", (double)0);
 
-    /* ---- prompt / generate mode (greedy, streaming; full-recompute Stage A) ---- */
+    /* ---- prompt / generate mode (greedy, streaming; KV-cached) ---- */
     if (prompt) {
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -449,23 +476,29 @@ int main(int argc, char **argv) {
         int np = tok_encode(&T, prompt, plen, seq, cap);
         if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return 1; }
         printf("[%d prompt tokens]\n%s", np, prompt); fflush(stdout);
-        int D = m.c.hidden, len = np;
-        double t0 = now_s(), t1 = 0; char buf[512];
+        int D = m.c.hidden; char buf[512];
+        KVCache kv; kv_init(&kv, &m, np + n_new + 8);
+        double t0 = now_s();
+        float *Hp = falloc((int64_t)np * D);
+        forward(&m, &kv, seq, np, 0, Hp);                       /* prefill the prompt */
+        int cur = argmax_logits(&m, Hp + (int64_t)(np - 1) * D, NULL);
+        free(Hp);
+        double t1 = now_s();
+        float *Hd = falloc(D);
+        int pos = np, gen = 0;
         for (int s = 0; s < n_new; s++) {
-            float *H = falloc((int64_t)len * D);
-            hidden_states(&m, seq, len, H);
-            int nxt = argmax_logits(&m, H + (int64_t)(len - 1) * D, NULL);
-            free(H);
-            if (s == 0) t1 = now_s();
-            int is_eos = 0; for (int e = 0; e < m.c.n_eos; e++) if (nxt == m.c.eos[e]) is_eos = 1;
+            int is_eos = 0; for (int e = 0; e < m.c.n_eos; e++) if (cur == m.c.eos[e]) is_eos = 1;
             if (is_eos) { printf("\n[eos]"); break; }
-            int nb = tok_decode(&T, &nxt, 1, buf, sizeof(buf) - 1); buf[nb] = 0;
+            int nb = tok_decode(&T, &cur, 1, buf, sizeof(buf) - 1); buf[nb] = 0;
             fputs(buf, stdout); fflush(stdout);
-            seq[len++] = nxt;
+            gen++;
+            forward(&m, &kv, &cur, 1, pos, Hd);                 /* decode one token at abs pos */
+            cur = argmax_logits(&m, Hd, NULL);
+            pos++;
         }
-        int gen = len - np;
-        printf("\n[prefill %.1fs | %d tok in %.1fs = %.2f tok/s]\n",
-               t1 - t0, gen, now_s() - t1, gen > 1 ? (gen - 1) / (now_s() - t1) : 0.0);
+        free(Hd); kv_free(&kv, m.c.n_layers);
+        printf("\n[prefill %.1fs (%d tok) | %d tok in %.1fs = %.2f tok/s]\n",
+               t1 - t0, np, gen, now_s() - t1, gen > 0 ? gen / (now_s() - t1) : 0.0);
         return 0;
     }
 
@@ -482,8 +515,9 @@ int main(int argc, char **argv) {
     double t0 = now_s();
     int D = m.c.hidden;
     /* pass 1: teacher-forced argmax + perplexity over the full reference */
+    KVCache kv; kv_init(&kv, &m, nfull + 8);
     float *H = falloc((int64_t)nfull * D);
-    hidden_states(&m, full, nfull, H);
+    forward(&m, &kv, full, nfull, 0, H);
     int ok = 0; double nll = 0;
     for (int i = 0; i < nfull; i++) {
         float *lg = falloc(m.c.vocab); matmul(lg, H + (int64_t)i * D, m.lm_head, D, m.c.vocab);
@@ -501,17 +535,21 @@ int main(int argc, char **argv) {
     if (pr && pr->t == J_NUM) printf("ppl_ref: %.4f (%.2f%% diff)\n", pr->num, 100.0 * fabs(ppl - pr->num) / pr->num);
     free(H);
 
-    /* pass 2: greedy generation, token-for-token vs the oracle (full recompute) */
+    /* pass 2: greedy generation, token-for-token vs the oracle (KV-cached, fresh cache) */
     int *seq = malloc((nfull + 1) * sizeof(int));
     memcpy(seq, pids, np * sizeof(int));
-    int len = np, match = 0;
-    for (int s = 0; s < ngen; s++) {
-        float *Hs = falloc((int64_t)len * D);
-        hidden_states(&m, seq, len, Hs);
-        int nxt = argmax_logits(&m, Hs + (int64_t)(len - 1) * D, NULL);
-        free(Hs);
-        seq[len++] = nxt;
+    int match = 0;
+    KVCache kv2; kv_init(&kv2, &m, nfull + 8);
+    float *Hg = falloc((int64_t)np * D);
+    forward(&m, &kv2, pids, np, 0, Hg);
+    seq[np] = argmax_logits(&m, Hg + (int64_t)(np - 1) * D, NULL);
+    free(Hg);
+    float *Hd = falloc(D);
+    for (int s = 1; s < ngen; s++) {
+        forward(&m, &kv2, &seq[np + s - 1], 1, np + s - 1, Hd);
+        seq[np + s] = argmax_logits(&m, Hd, NULL);
     }
+    free(Hd); kv_free(&kv2, m.c.n_layers); kv_free(&kv, m.c.n_layers);
     printf("Reference: "); for (int i = np; i < nfull; i++) printf("%d ", full[i]);
     printf("\nC engine : "); for (int i = np; i < nfull; i++) { printf("%d ", seq[i]); if (seq[i] == full[i]) match++; }
     printf("\nMatching tokens: %d/%d | %.2fs\n", match, ngen, now_s() - t0);
