@@ -53,12 +53,15 @@ typedef struct {
     /* MLP: dense uses gate/up/down; MoE uses router+ebias+experts+shared */
     float *gate, *up, *down;          /* dense MLP */
     float *router, *ebias;            /* [E,hidden], [E] */
-    float **eg, **eu, **ed;           /* experts: [E] × ([I,hidden],[I,hidden],[hidden,I]) */
+    float **eg, **eu, **ed;           /* f32 experts (bits=0): [E] × gate/up/down */
+    uint8_t *gu_q, *dn_q;             /* int4 container: packed [E*2I, D/2], [E*D, I/2] */
+    float *gu_s, *dn_s;               /* per-row f32 scales [E*2I], [E*D] */
     float *sg, *su, *sd;              /* shared expert */
 } Layer;
 
 typedef struct {
     Cfg c; shards S;
+    int xq;                            /* 1 = int4 packed-expert container */
     float *embed, *lm_head, *final_norm;
     Layer *L;
 } Model;
@@ -71,6 +74,18 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) {
         const float *w = W + (int64_t)o * I;
         double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
         y[o] = (float)s;
+    }
+}
+/* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
+static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
+    for (int o = 0; o < O; o++) {
+        const uint8_t *p = packed + (int64_t)o * (I / 2);
+        double s = 0;
+        for (int c = 0; c < I / 2; c++) {
+            uint8_t b = p[c];
+            s += (double)x[2 * c] * ((int)(b & 0xF) - 8) + (double)x[2 * c + 1] * ((int)(b >> 4) - 8);
+        }
+        y[o] = (float)(s * scale[o]);
     }
 }
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
@@ -174,10 +189,22 @@ static float *load_t(Model *m, const char *name) {
     if (n < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
     float *p = falloc(n); st_read_f32(&m->S, name, p, 0); return p;
 }
+static uint8_t *load_u8(Model *m, const char *name) {
+    int64_t n = st_nbytes(&m->S, name);
+    if (n < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    uint8_t *p = malloc(n); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); }
+    st_read_raw(&m->S, name, p, 0); return p;
+}
 static void model_load(Model *m, const char *snap) {
     st_init(&m->S, snap);
     cfg_load(&m->c, snap);
     Cfg *c = &m->c;
+    /* int4 container? (converter fuses experts into packed gate_up_proj + .qs) */
+    m->xq = 0;
+    for (int i = 0; i < c->n_layers && !m->xq; i++) if (c->is_moe[i]) {
+        char nm[256]; snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);
+        m->xq = st_has(&m->S, nm);
+    }
     m->embed = load_t(m, "model.embed_tokens.weight");
     m->lm_head = st_has(&m->S, "lm_head.weight") ? load_t(m, "lm_head.weight") : m->embed;
     m->final_norm = load_t(m, "model.norm.weight");
@@ -198,11 +225,18 @@ static void model_load(Model *m, const char *snap) {
             LD(router, "mlp.gate.weight");
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.e_score_correction_bias", i);
             L->ebias = st_has(&m->S, nm) ? load_t(m, nm) : calloc(c->n_experts, sizeof(float));
-            L->eg = malloc(c->n_experts * sizeof(float*)); L->eu = malloc(c->n_experts * sizeof(float*)); L->ed = malloc(c->n_experts * sizeof(float*));
-            for (int e = 0; e < c->n_experts; e++) {
-                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.gate_proj.weight", i, e); L->eg[e] = load_t(m, nm);
-                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.up_proj.weight", i, e);   L->eu[e] = load_t(m, nm);
-                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", i, e); L->ed[e] = load_t(m, nm);
+            if (m->xq) {
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj", i);    L->gu_q = load_u8(m, nm);
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);  L->gu_s = load_t(m, nm);
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj", i);        L->dn_q = load_u8(m, nm);
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj.qs", i);     L->dn_s = load_t(m, nm);
+            } else {
+                L->eg = malloc(c->n_experts * sizeof(float*)); L->eu = malloc(c->n_experts * sizeof(float*)); L->ed = malloc(c->n_experts * sizeof(float*));
+                for (int e = 0; e < c->n_experts; e++) {
+                    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.gate_proj.weight", i, e); L->eg[e] = load_t(m, nm);
+                    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.up_proj.weight", i, e);   L->eu[e] = load_t(m, nm);
+                    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", i, e); L->ed[e] = load_t(m, nm);
+                }
             }
             LD(sg, "mlp.shared_expert.gate_proj.weight"); LD(su, "mlp.shared_expert.up_proj.weight"); LD(sd, "mlp.shared_expert.down_proj.weight");
         }
@@ -317,7 +351,7 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
             int E = c->n_experts, K = c->topk, I = c->moe_inter, SI = c->shared_inter;
             float *rl = falloc(E), *sc = falloc(E);
             int *sel = malloc(K * sizeof(int)); float *w = falloc(K);
-            float *eg = falloc(I), *eu = falloc(I), *acc = falloc(D);
+            float *eg = falloc(I), *eu = falloc(I), *acc = falloc(D), *gu = falloc(2 * I);
             float *sg = falloc(SI), *su = falloc(SI);
             for (int t = 0; t < n; t++) {
                 matmul(rl, xn + t * D, L->router, D, E);
@@ -337,10 +371,16 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
                 for (int i = 0; i < D; i++) acc[i] = 0;
                 for (int a = 0; a < K; a++) {
                     int e = sel[a];
-                    matmul(eg, xn + t * D, L->eg[e], D, I);
-                    matmul(eu, xn + t * D, L->eu[e], D, I);
-                    for (int i = 0; i < I; i++) eg[i] = siluf(eg[i]) * eu[i];
-                    matmul(scr, eg, L->ed[e], I, D);
+                    if (m->xq) {   /* int4 container: fused gate_up + down */
+                        matmul_q4(gu, xn + t * D, L->gu_q + (int64_t)(e * 2 * I) * (D / 2), L->gu_s + (int64_t)e * 2 * I, D, 2 * I);
+                        for (int i = 0; i < I; i++) gu[i] = siluf(gu[i]) * gu[I + i];
+                        matmul_q4(scr, gu, L->dn_q + (int64_t)(e * D) * (I / 2), L->dn_s + (int64_t)e * D, I, D);
+                    } else {
+                        matmul(eg, xn + t * D, L->eg[e], D, I);
+                        matmul(eu, xn + t * D, L->eu[e], D, I);
+                        for (int i = 0; i < I; i++) eg[i] = siluf(eg[i]) * eu[i];
+                        matmul(scr, eg, L->ed[e], I, D);
+                    }
                     for (int i = 0; i < D; i++) acc[i] += w[a] * scr[i];
                 }
                 for (int i = 0; i < D; i++) acc[i] *= c->route_scale;
@@ -351,7 +391,7 @@ static void hidden_states(Model *m, const int *ids, int n, float *h_out) {
                 matmul(scr, sg, L->sd, SI, D);
                 for (int i = 0; i < D; i++) h[t * D + i] += acc[i] + scr[i];
             }
-            free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(sg); free(su);
+            free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
         }
     }
     for (int t = 0; t < n; t++) rmsnorm(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
