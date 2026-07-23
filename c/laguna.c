@@ -26,6 +26,9 @@
 #include "st.h"
 #include "tok.h"
 #include "json.h"
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #define MAXL 128
 #define MAXRD 128          /* max rotary dim */
@@ -69,10 +72,28 @@ typedef struct {
 
 /* ---------- math ---------- */
 static float *falloc(int64_t n) { float *p = malloc(n * sizeof(float)); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); } return p; }
-/* y[O] = x[I] @ W[O,I]^T  (W row-major [out,in], HF Linear convention).
- * The O loop is embarrassingly parallel and each y[o] is an independent
- * double-accumulate, so OpenMP keeps the result bit-identical to serial. */
+/* g_exact: force the double-accumulate scalar kernels (bit-exact vs the oracle).
+ * Generation defaults to the AVX-512 float path (within quant noise, ~SIMD-fast). */
+static int g_exact = 0;
+/* y[O] = x[I] @ W[O,I]^T  (W row-major [out,in], HF Linear convention). */
 static void matmul(float *y, const float *x, const float *W, int I, int O) {
+#if defined(__AVX512F__)
+    if (!g_exact) {
+        #pragma omp parallel for schedule(static) if(O >= 512)
+        for (int o = 0; o < O; o++) {
+            const float *w = W + (int64_t)o * I;
+            __m512 acc = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 16 <= I; i += 16)
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(w + i), acc);
+            float s = _mm512_reduce_add_ps(acc);
+            for (; i < I; i++) s += x[i] * w[i];
+            y[o] = s;
+        }
+        return;
+    }
+#endif
+    /* exact double-accumulate reference (the oracle path) */
     #pragma omp parallel for schedule(static) if(O >= 512)
     for (int o = 0; o < O; o++) {
         const float *w = W + (int64_t)o * I;
@@ -502,6 +523,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    g_exact = 1;   /* the oracle validates the exact double-accumulate kernels */
+    if (getenv("LAG_SIMD")) g_exact = 0;   /* opt into the SIMD path for a noise check */
     FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *buf = malloc(n + 1); if (fread(buf, 1, n, f) != (size_t)n) {} buf[n] = 0; fclose(f);
