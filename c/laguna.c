@@ -51,22 +51,24 @@ typedef struct {
 } Cfg;
 
 typedef struct {
-    float *ln1, *ln2;                 /* input / post-attn layernorm [hidden] */
-    float *wq, *wk, *wv, *wo, *wg;    /* attn projections */
-    float *qn, *kn;                   /* qk RMSNorm [head_dim] */
+    float *ln1, *ln2;                 /* input / post-attn layernorm [hidden] (f32) */
+    void  *wq, *wk, *wv, *wo, *wg;    /* attn projections (bf16 real / f32 tiny) */
+    float *qn, *kn;                   /* qk RMSNorm [head_dim] (f32) */
     /* MLP: dense uses gate/up/down; MoE uses router+ebias+experts+shared */
-    float *gate, *up, *down;          /* dense MLP */
-    float *router, *ebias;            /* [E,hidden], [E] */
+    void  *gate, *up, *down;          /* dense MLP (bf16/f32) */
+    float *router, *ebias;            /* [E,hidden], [E] (f32) */
     float **eg, **eu, **ed;           /* f32 experts (bits=0): [E] × gate/up/down */
     uint8_t *gu_q, *dn_q;             /* int4 container: packed [E*2I, D/2], [E*D, I/2] */
     float *gu_s, *dn_s;               /* per-row f32 scales [E*2I], [E*D] */
-    float *sg, *su, *sd;              /* shared expert */
+    void  *sg, *su, *sd;              /* shared expert (bf16/f32) */
 } Layer;
 
 typedef struct {
     Cfg c; shards S;
     int xq;                            /* 1 = int4 packed-expert container */
-    float *embed, *lm_head, *final_norm;
+    int res_bf16;                      /* 1 = residents stored bf16 (real container) */
+    void *embed, *lm_head;             /* bf16 (real) / f32 (tiny) */
+    float *final_norm;
     Layer *L;
 } Model;
 
@@ -100,6 +102,39 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) {
         double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
         y[o] = (float)s;
     }
+}
+
+/* bf16 weight dot: W is raw bf16 [O,I]. bf16->f32 is exact (top 16 bits), so the
+ * result equals matmul() on the f32-expanded weights but reads half the bytes —
+ * the real container stores residents bf16, so this halves resident bandwidth. */
+static float bf16_f32(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
+static int g_res_bf16 = 0;   /* residents are bf16 (real container) vs f32 (tiny oracle) */
+static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int O) {
+    #pragma omp parallel for schedule(static) if(O >= 512)
+    for (int o = 0; o < O; o++) {
+        const uint16_t *w = W + (int64_t)o * I;
+#if defined(__AVX512F__)
+        if (!g_exact) {
+            __m512 acc = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 16 <= I; i += 16) {
+                __m512i we = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(w + i))), 16);
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), _mm512_castsi512_ps(we), acc);
+            }
+            float s = _mm512_reduce_add_ps(acc);
+            for (; i < I; i++) s += x[i] * bf16_f32(w[i]);
+            y[o] = s;
+            continue;
+        }
+#endif
+        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * bf16_f32(w[i]);
+        y[o] = (float)s;
+    }
+}
+/* resident GEMM: dispatch bf16 (real) or f32 (tiny/oracle) by the loaded dtype */
+static void resmm(float *y, const float *x, const void *W, int I, int O) {
+    if (g_res_bf16) matmul_bf16(y, x, (const uint16_t*)W, I, O);
+    else matmul(y, x, (const float*)W, I, O);
 }
 /* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
 static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
@@ -226,6 +261,18 @@ static uint8_t *load_u8(Model *m, const char *name) {
     uint8_t *p = malloc(n); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); }
     st_read_raw(&m->S, name, p, 0); return p;
 }
+/* resident matmul weight: keep bf16 raw (half the RAM/bandwidth) if the tensor is
+ * bf16, else load f32. bf16->f32 happens inside matmul_bf16, exactly. */
+static void *load_res(Model *m, const char *name) {
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    if (t->dtype == 0) {   /* bf16 */
+        uint16_t *p = malloc((size_t)t->numel * 2);
+        if (!p) { fprintf(stderr, "OOM %lld\n", (long long)t->numel); exit(1); }
+        st_read_raw(&m->S, name, p, 0); return p;
+    }
+    return load_t(m, name);
+}
 static void model_load(Model *m, const char *snap) {
     st_init(&m->S, snap);
     cfg_load(&m->c, snap);
@@ -236,22 +283,25 @@ static void model_load(Model *m, const char *snap) {
         char nm[256]; snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);
         m->xq = st_has(&m->S, nm);
     }
-    m->embed = load_t(m, "model.embed_tokens.weight");
-    m->lm_head = st_has(&m->S, "lm_head.weight") ? load_t(m, "lm_head.weight") : m->embed;
+    m->res_bf16 = (st_find(&m->S, "model.embed_tokens.weight")->dtype == 0);
+    g_res_bf16 = m->res_bf16;
+    m->embed = load_res(m, "model.embed_tokens.weight");
+    m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight") : m->embed;
     m->final_norm = load_t(m, "model.norm.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *L = &m->L[i];
 #define LD(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_t(m, nm); } while (0)
+#define LDR(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm); } while (0)
         LD(ln1, "input_layernorm.weight");
         LD(ln2, "post_attention_layernorm.weight");
-        LD(wq, "self_attn.q_proj.weight"); LD(wk, "self_attn.k_proj.weight");
-        LD(wv, "self_attn.v_proj.weight"); LD(wo, "self_attn.o_proj.weight");
-        LD(wg, "self_attn.g_proj.weight");
+        LDR(wq, "self_attn.q_proj.weight"); LDR(wk, "self_attn.k_proj.weight");
+        LDR(wv, "self_attn.v_proj.weight"); LDR(wo, "self_attn.o_proj.weight");
+        LDR(wg, "self_attn.g_proj.weight");
         LD(qn, "self_attn.q_norm.weight"); LD(kn, "self_attn.k_norm.weight");
         if (!c->is_moe[i]) {
-            LD(gate, "mlp.gate_proj.weight"); LD(up, "mlp.up_proj.weight"); LD(down, "mlp.down_proj.weight");
+            LDR(gate, "mlp.gate_proj.weight"); LDR(up, "mlp.up_proj.weight"); LDR(down, "mlp.down_proj.weight");
         } else {
             LD(router, "mlp.gate.weight");
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.e_score_correction_bias", i);
@@ -269,9 +319,10 @@ static void model_load(Model *m, const char *snap) {
                     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", i, e); L->ed[e] = load_t(m, nm);
                 }
             }
-            LD(sg, "mlp.shared_expert.gate_proj.weight"); LD(su, "mlp.shared_expert.up_proj.weight"); LD(sd, "mlp.shared_expert.down_proj.weight");
+            LDR(sg, "mlp.shared_expert.gate_proj.weight"); LDR(su, "mlp.shared_expert.up_proj.weight"); LDR(sd, "mlp.shared_expert.down_proj.weight");
         }
 #undef LD
+#undef LDR
     }
 }
 
@@ -308,7 +359,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
     Cfg *c = &m->c;
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
     float *h = falloc((int64_t)S * D);
-    for (int t = 0; t < S; t++) memcpy(h + t * D, m->embed + (int64_t)ids[t] * D, D * sizeof(float));
+    for (int t = 0; t < S; t++) {
+        if (m->res_bf16) { const uint16_t *e = (const uint16_t*)m->embed + (int64_t)ids[t] * D; for (int i = 0; i < D; i++) h[t * D + i] = bf16_f32(e[i]); }
+        else memcpy(h + t * D, (const float*)m->embed + (int64_t)ids[t] * D, D * sizeof(float));
+    }
 
     float *xn = falloc((int64_t)S * D);
     float *scr = falloc(D);
@@ -328,10 +382,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
         for (int t = 0; t < S; t++) {
             int pos = pos0 + t;
             rmsnorm(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
-            matmul(Q + (int64_t)t * H * hd, xn + t * D, L->wq, D, H * hd);
+            resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, D, H * hd);
             float *kt = Kc + (int64_t)pos * nkv * hd, *vt = Vc + (int64_t)pos * nkv * hd;
-            matmul(kt, xn + t * D, L->wk, D, nkv * hd);
-            matmul(vt, xn + t * D, L->wv, D, nkv * hd);
+            resmm(kt, xn + t * D, L->wk, D, nkv * hd);
+            resmm(vt, xn + t * D, L->wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
                 float *q = Q + ((int64_t)t * H + hh) * hd;
                 rmsnorm(q, q, L->qn, hd, c->rms_eps);
@@ -370,18 +424,18 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             free(att);
         }
         /* per-head softplus gate (of the layer input xn) applied before o_proj */
+        float *gate = falloc(H);
         for (int t = 0; t < S; t++) {
+            resmm(gate, xn + t * D, L->wg, D, H);   /* g_proj: hidden -> num_heads */
             for (int hh = 0; hh < H; hh++) {
-                const float *g = L->wg + (int64_t)hh * D;
-                double s = 0; for (int i = 0; i < D; i++) s += (double)xn[t * D + i] * g[i];
-                float gate = softplusf((float)s);
+                float gv = softplusf(gate[hh]);
                 float *ao = AO + ((int64_t)t * H + hh) * hd;
-                for (int d = 0; d < hd; d++) ao[d] *= gate;
+                for (int d = 0; d < hd; d++) ao[d] *= gv;
             }
-            matmul(scr, AO + (int64_t)t * H * hd, L->wo, H * hd, D);
+            resmm(scr, AO + (int64_t)t * H * hd, L->wo, H * hd, D);
             for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
         }
-        free(Q); free(AO);
+        free(gate); free(Q); free(AO);
 
         /* --- MLP / MoE (per-token) --- */
         int n = S;
@@ -390,10 +444,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             int I = c->dense_inter;
             float *g = falloc(I), *u = falloc(I);
             for (int t = 0; t < n; t++) {
-                matmul(g, xn + t * D, L->gate, D, I);
-                matmul(u, xn + t * D, L->up, D, I);
+                resmm(g, xn + t * D, L->gate, D, I);
+                resmm(u, xn + t * D, L->up, D, I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul(scr, g, L->down, I, D);
+                resmm(scr, g, L->down, I, D);
                 for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
             }
             free(g); free(u);
@@ -435,10 +489,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
                 }
                 for (int i = 0; i < D; i++) acc[i] *= c->route_scale;
                 /* shared expert (always on, unscaled) */
-                matmul(sg, xn + t * D, L->sg, D, SI);
-                matmul(su, xn + t * D, L->su, D, SI);
+                resmm(sg, xn + t * D, L->sg, D, SI);
+                resmm(su, xn + t * D, L->su, D, SI);
                 for (int i = 0; i < SI; i++) sg[i] = siluf(sg[i]) * su[i];
-                matmul(scr, sg, L->sd, SI, D);
+                resmm(scr, sg, L->sd, SI, D);
                 for (int i = 0; i < D; i++) h[t * D + i] += acc[i] + scr[i];
             }
             free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
@@ -450,7 +504,7 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
 }
 static int argmax_logits(Model *m, const float *h_pos, int *unused) {
     (void)unused; int V = m->c.vocab, D = m->c.hidden;
-    float *lg = falloc(V); matmul(lg, h_pos, m->lm_head, D, V);
+    float *lg = falloc(V); resmm(lg, h_pos, m->lm_head, D, V);
     int best = 0; for (int v = 1; v < V; v++) if (lg[v] > lg[best]) best = v;
     free(lg); return best;
 }
@@ -543,7 +597,7 @@ int main(int argc, char **argv) {
     forward(&m, &kv, full, nfull, 0, H);
     int ok = 0; double nll = 0;
     for (int i = 0; i < nfull; i++) {
-        float *lg = falloc(m.c.vocab); matmul(lg, H + (int64_t)i * D, m.lm_head, D, m.c.vocab);
+        float *lg = falloc(m.c.vocab); resmm(lg, H + (int64_t)i * D, m.lm_head, D, m.c.vocab);
         int am = 0; for (int v = 1; v < m.c.vocab; v++) if (lg[v] > lg[am]) am = v;
         if (tfref && i < ntf && am == tfref[i]) ok++;
         if (i < nfull - 1) {   /* NLL of the true next token */
