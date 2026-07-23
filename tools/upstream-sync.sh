@@ -38,6 +38,7 @@ VENDORED=(
   c/tests/test_benchmark_cuda_fixture.py c/tests/test_decode_batch.c
   c/tests/test_env_defaults.py c/tests/test_pipe_cuda.cu c/tests/test_resource_plan.py
   c/tests/test_openai_server.py c/tests/test_openai_tools_e2e.py
+  c/tests/test_anthropic_messages.py
   c/tools/convert_olmoe_merged.py c/tools/diag_harness.py c/tools/efficiency.py
   c/tools/iq3_pack.py c/tools/iq3xxs_grid.json c/tools/make_olmoe_real_oracle.py
   c/tools/repair_mtp_int8.py c/tools/test_olmoe_real.py
@@ -47,6 +48,10 @@ VENDORED=(
 # we modified these; a pending upstream PR may supersede our change
 MERGED=( c/Makefile c/openai_server.py )
 # note: tok.h moved to VENDORED after upstream #330 (o200k) merged.
+# note: openai_server.py carries the fork's inkling gateway (ARCH detect,
+# reasoning-channel rendering) + profiling on top of upstream. Re-sync it by
+# 3-way merge (base = the colibri commit it forked from, ours = here, theirs =
+# colibri/dev); last done 2026-07-23, adopting the /v1/messages Anthropic API.
 
 git remote get-url "$REMOTE" >/dev/null 2>&1 || {
   echo "adding $REMOTE remote"; git remote add "$REMOTE" https://github.com/JustVugg/colibri.git; }
