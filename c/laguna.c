@@ -141,6 +141,29 @@ static void matmul_q4(float *y, const float *x, const uint8_t *packed, const flo
     #pragma omp parallel for schedule(static) if(O >= 512)
     for (int o = 0; o < O; o++) {
         const uint8_t *p = packed + (int64_t)o * (I / 2);
+#if defined(__AVX512F__)
+        if (!g_exact) {
+            __m512 acc = _mm512_setzero_ps();
+            const __m128i m0f = _mm_set1_epi8(0x0F);
+            const __m512 v8 = _mm512_set1_ps(8.f);
+            int c = 0;
+            for (; c + 16 <= I / 2; c += 16) {                 /* 16 bytes -> 32 weights */
+                __m128i b  = _mm_loadu_si128((const __m128i*)(p + c));
+                __m128i lo = _mm_and_si128(b, m0f);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
+                __m128i il0 = _mm_unpacklo_epi8(lo, hi);        /* [lo0,hi0,lo1,hi1,...] = x[2c..2c+15] order */
+                __m128i il1 = _mm_unpackhi_epi8(lo, hi);        /* x[2c+16..2c+31] order */
+                __m512 f0 = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(il0)), v8);
+                __m512 f1 = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(il1)), v8);
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + 2 * c), f0, acc);
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + 2 * c + 16), f1, acc);
+            }
+            float s = _mm512_reduce_add_ps(acc);
+            for (; c < I / 2; c++) { uint8_t b = p[c]; s += x[2 * c] * ((int)(b & 0xF) - 8) + x[2 * c + 1] * ((int)(b >> 4) - 8); }
+            y[o] = s * scale[o];
+            continue;
+        }
+#endif
         double s = 0;
         for (int c = 0; c < I / 2; c++) {
             uint8_t b = p[c];
