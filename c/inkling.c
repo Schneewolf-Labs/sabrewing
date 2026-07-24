@@ -179,49 +179,13 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
     else     matmul_h(y, x, W.h, S, I, O);
 }
 
-/* y[1,O] = x @ q^T, int8 weights + per-row scale. Fast path: activations
- * quantized Q8 per 32-block, VNNI (or maddubs) int8 dot — same family as
- * glm.c's IDOT kernels; IDOT=0 falls back to the byte-exact scalar route. */
-/* i8dot_block is shared (moe_quant.h). */
+/* int8 GEMV, int8 weights + per-row scale, at inkling's contract (activations
+ * quantized int8 per-32-block + VNNI dot by default; IDOT=0 = f32/scalar).
+ * i8dot_block and the kernel are shared — see moe_quant.h. */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__AVX2__)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 32 == 0 && I <= 8192) {
-        int nb = I / 32;
-        int8_t xi[8192]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*32;
-            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) {
-                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
-                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)),
-                                           _mm256_loadu_si256((const __m256i*)(w + b*32)));
-                __m128i lo = _mm256_castsi256_si128(vacc), hi = _mm256_extracti128_si256(vacc, 1);
-                __m128i s4 = _mm_add_epi32(lo, hi);
-                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
-                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
-            }
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
+    matmul_q8_k(y, x, q, scale, I, O, idot ? MOE_Q8_IDOT : MOE_Q8_F32, 0);
 }
 
 /* int4 experts use the shared kernel at inkling's contract (int8 activation quant

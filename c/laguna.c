@@ -122,30 +122,13 @@ static int g_res_dt = 0;   /* resident dtype: 0=f32 (tiny), 1=bf16 (real), 2=int
 static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int O) {
     matmul_bf16_k(y, x, W, 1, I, O, 0, g_exact);
 }
-/* int8 residents: W = [int8 O*I][f32 scale O] in one buffer (per-row scale).
- * ~lossless on residents (proven by inkling's Q8), 4 GB vs 8 GB bf16. */
+/* int8 residents (RES8): W = [int8 O*I][f32 scale O] in one buffer, per-row scale
+ * (~lossless, 4 GB vs 8 GB bf16). Split into (q, scale) and use the shared kernel
+ * at laguna's contract (f32 activations, AVX-512 cvtepi8->f32). */
 static void matmul_q8(float *y, const float *x, const void *W, int I, int O) {
     const int8_t *q = (const int8_t*)W;
     const float *scale = (const float*)(q + (int64_t)I * O);
-    #pragma omp parallel for schedule(static) if(O >= 512)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-#if defined(__AVX512F__)
-        if (!g_exact) {
-            __m512 acc = _mm512_setzero_ps();
-            int i = 0;
-            for (; i + 16 <= I; i += 16)
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i),
-                        _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)(w + i)))), acc);
-            float s = _mm512_reduce_add_ps(acc);
-            for (; i < I; i++) s += x[i] * w[i];
-            y[o] = s * scale[o];
-            continue;
-        }
-#endif
-        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
-        y[o] = (float)(s * scale[o]);
-    }
+    matmul_q8_k(y, x, q, scale, I, O, MOE_Q8_F32, g_exact);
 }
 /* resident GEMM: dispatch VRAM-bf16 (CUDA) / f32 (tiny/oracle) / bf16 (real) /
  * int8 (RES8). Wdev is the weight's VRAM copy (NULL = not resident on GPU); the

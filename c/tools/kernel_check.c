@@ -92,6 +92,26 @@ int main(void) {
     ok &= report("round_x=0 (f32 act)",  b0, br, O, 1e-3);   /* weight-only bf16, f32 acts */
     ok &= report("round_x=1 (bf16 act)", b1, br, O, 1e-2);   /* + activation bf16 rounding */
 
+    /* --- int8 matmul_q8_k: per-row int8 quant of the same weights --- */
+    int8_t *q8 = malloc((size_t)O * I); float *q8s = malloc((size_t)O * 4);
+    for (int o = 0; o < O; o++) {
+        const float *w = W + (size_t)o * I;
+        float mx = 0; for (int i = 0; i < I; i++) { float a = fabsf(w[i]); if (a > mx) mx = a; }
+        float s = mx / 127.f; if (s < 1e-12f) s = 1e-12f; q8s[o] = s;
+        for (int i = 0; i < I; i++) { int v = (int)lrintf(w[i] / s); q8[(size_t)o*I+i] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v); }
+    }
+    float *q8r = malloc((size_t)O * 4), *q8f = malloc((size_t)O * 4), *q8i = malloc((size_t)O * 4);
+    for (int o = 0; o < O; o++) {   /* reference: x(f32) . dequant(int8), double accum */
+        const int8_t *w = q8 + (size_t)o * I;
+        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
+        q8r[o] = (float)(s * q8s[o]);
+    }
+    matmul_q8_k(q8f, x, q8, q8s, I, O, MOE_Q8_F32, 0);   /* f32 act (laguna) */
+    matmul_q8_k(q8i, x, q8, q8s, I, O, MOE_Q8_IDOT, 0);  /* int8 act (inkling) */
+    printf("int8 matmul_q8_k [%d->%d] vs double dequant reference:\n", I, O);
+    ok &= report("MOE_Q8_F32 simd",    q8f, q8r, O, 1e-3);
+    ok &= report("MOE_Q8_IDOT (int8a)", q8i, q8r, O, 3e-2);
+
     printf("%s\n", ok ? "KERNEL-CHECK PASS" : "KERNEL-CHECK FAIL");
     return !ok;
 }

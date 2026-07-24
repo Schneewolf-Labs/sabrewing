@@ -21,6 +21,7 @@
 #endif
 
 enum { MOE_Q4_F32 = 0, MOE_Q4_IDOT = 1 };
+enum { MOE_Q8_F32 = 0, MOE_Q8_IDOT = 1 };
 
 #if defined(__AVX2__)
 /* int8·int8 -> int32 dot accumulate over a 32-lane block, sign-folded so the
@@ -118,6 +119,67 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
             uint8_t b = p[c];
             s += (double)x[2 * c] * ((int)(b & 0xF) - 8) + (double)x[2 * c + 1] * ((int)(b >> 4) - 8);
         }
+        y[o] = (float)(s * scale[o]);
+    }
+}
+
+/* y[O] = x[I] @ dequant(q)^T; q = signed int8 [O,I], per-row f32 scale[o] (given
+ * as a SEPARATE pointer — laguna's embedded [int8 O*I][f32 O] buffer splits into
+ * (q, q+I*O) at the wrapper). mode selects the activation contract, like q4:
+ *   MOE_Q8_F32  — activations f32, AVX-512 cvtepi8->f32 FMA (laguna's default).
+ *   MOE_Q8_IDOT — activations int8 per-32-block, VNNI dot (inkling's default). */
+static void matmul_q8_k(float *y, const float *x, const int8_t *q, const float *scale,
+                        int I, int O, int mode, int exact) {
+#if defined(__AVX2__)
+    if (mode == MOE_Q8_IDOT && I % 32 == 0 && I <= 8192) {
+        int nb = I / 32;
+        int8_t xi[8192]; float xs[256];
+        for (int b = 0; b < nb; b++) {
+            const float *xb = x + b * 32;
+            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+            float s = am / 127.f; if (s < 1e-12f) s = 1e-12f;
+            xs[b] = s; float inv = 1.f / s;
+            for (int i = 0; i < 32; i++) xi[b * 32 + i] = (int8_t)lrintf(xb[i] * inv);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            float acc = 0.f;
+            for (int b = 0; b < nb; b++) {
+                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
+                                           _mm256_loadu_si256((const __m256i*)(xi + b * 32)),
+                                           _mm256_loadu_si256((const __m256i*)(w + b * 32)));
+                __m128i lo = _mm256_castsi256_si128(vacc), hi = _mm256_extracti128_si256(vacc, 1);
+                __m128i s4 = _mm_add_epi32(lo, hi);
+                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
+                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
+            }
+            y[o] = acc * scale[o];
+        }
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
+    if (mode == MOE_Q8_F32 && !exact) {
+        #pragma omp parallel for schedule(static) if(O >= 512)
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o * I;
+            __m512 acc = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 16 <= I; i += 16)
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i),
+                        _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)(w + i)))), acc);
+            float s = _mm512_reduce_add_ps(acc);
+            for (; i < I; i++) s += x[i] * w[i];
+            y[o] = s * scale[o];
+        }
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static) if(O >= 512)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
         y[o] = (float)(s * scale[o]);
     }
 }
