@@ -27,6 +27,7 @@
 #include "st.h"
 #include "tok.h"
 #include "json.h"
+#include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -56,9 +57,6 @@ static double g_exp_gpu_gb = 0;                /* expert VRAM used (GB) */
 
 #define MAXL 128
 #define MAXRD 128          /* max rotary dim */
-
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec/1e9; }
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 
 typedef struct {
     int hidden, n_layers, n_kv, head_dim, vocab;
@@ -137,10 +135,9 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) {
     }
 }
 
-/* bf16 weight dot: W is raw bf16 [O,I]. bf16->f32 is exact (top 16 bits), so the
- * result equals matmul() on the f32-expanded weights but reads half the bytes —
- * the real container stores residents bf16, so this halves resident bandwidth. */
-static float bf16_f32(uint16_t b) { uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f; }
+/* bf16 weight dot: W is raw bf16 [O,I]. bf16->f32 (bf16_f32, moe_math.h) is exact
+ * (top 16 bits), so the result equals matmul() on the f32-expanded weights but
+ * reads half the bytes — the real container stores residents bf16. */
 static int g_res_dt = 0;   /* resident dtype: 0=f32 (tiny), 1=bf16 (real), 2=int8 (RES8) */
 static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int O) {
     #pragma omp parallel for schedule(static) if(O >= 512)
@@ -238,13 +235,7 @@ static void matmul_q4(float *y, const float *x, const uint8_t *packed, const flo
         y[o] = (float)(s * scale[o]);
     }
 }
-static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
-    double ss = 0; for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
-    float inv = 1.f / sqrtf((float)(ss / n) + eps);
-    for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
-}
-static float siluf(float x) { return x / (1.f + expf(-x)); }
-static float softplusf(float x) { return x > 20.f ? x : log1pf(expf(x)); }  /* stable */
+/* rmsnorm_row, siluf, softplusf are shared (moe_math.h). */
 static void softmax(float *x, int n) {
     float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
     double s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
@@ -532,19 +523,19 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
         float *AO = falloc((int64_t)S * H * hd);
         for (int t = 0; t < S; t++) {
             int pos = pos0 + t;
-            rmsnorm(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
+            rmsnorm_row(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
             resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, L->d_wq, D, H * hd);
             float *kt = Kc + (int64_t)pos * nkv * hd, *vt = Vc + (int64_t)pos * nkv * hd;
             resmm(kt, xn + t * D, L->wk, L->d_wk, D, nkv * hd);
             resmm(vt, xn + t * D, L->wv, L->d_wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
                 float *q = Q + ((int64_t)t * H + hh) * hd;
-                rmsnorm(q, q, L->qn, hd, c->rms_eps);
+                rmsnorm_row(q, q, L->qn, hd, c->rms_eps);
                 rope_apply(q, pos, inv, rdim, rscale);
             }
             for (int hh = 0; hh < nkv; hh++) {  /* k_norm + rope, in place in the cache */
                 float *k = kt + hh * hd;
-                rmsnorm(k, k, L->kn, hd, c->rms_eps);
+                rmsnorm_row(k, k, L->kn, hd, c->rms_eps);
                 rope_apply(k, pos, inv, rdim, rscale);
             }
         }
@@ -590,7 +581,7 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
 
         /* --- MLP / MoE (per-token) --- */
         int n = S;
-        for (int t = 0; t < n; t++) rmsnorm(xn + t * D, h + t * D, L->ln2, D, c->rms_eps);
+        for (int t = 0; t < n; t++) rmsnorm_row(xn + t * D, h + t * D, L->ln2, D, c->rms_eps);
         if (!c->is_moe[li]) {
             int I = c->dense_inter;
             float *g = falloc(I), *u = falloc(I);
@@ -658,7 +649,7 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
         }
     }
-    for (int t = 0; t < S; t++) rmsnorm(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
+    for (int t = 0; t < S; t++) rmsnorm_row(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
     if (pos0 + S > kv->len) kv->len = pos0 + S;
     free(h); free(xn); free(scr);
 }

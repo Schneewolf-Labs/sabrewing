@@ -34,6 +34,7 @@
 #include "st.h"
 #include "lora.h"
 #include "tok.h"
+#include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -136,15 +137,9 @@ typedef struct {
 } Model;
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
+/* now_s, rss_gb, siluf, bf16_f32, softplusf, rmsnorm_row are shared (moe_math.h). */
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
-static float siluf(float x) { return x / (1.f + expf(-x)); }
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -358,13 +353,6 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
             qr[i] = (int8_t)v;
         }
     }
-}
-
-/* rmsnorm computed in f64 accumulate like the f32->f32 reference */
-static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
-    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
-    float r = 1.f / sqrtf((float)(ms / D) + eps);
-    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
 }
 
 static void softmax_row(float *x, int n) {
