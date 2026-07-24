@@ -30,6 +30,10 @@
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
+#ifdef COLI_CUDA
+#include "backend_cuda_laguna.h"
+static int g_cuda = 0;              /* 1 = A6000 tier active (bf16 residents in VRAM) */
+#endif
 
 #define MAXL 128
 #define MAXRD 128          /* max rotary dim */
@@ -63,6 +67,9 @@ typedef struct {
     uint8_t *gu_q, *dn_q;             /* int4 container: packed [E*2I, D/2], [E*D, I/2] */
     float *gu_s, *dn_s;               /* per-row f32 scales [E*2I], [E*D] */
     void  *sg, *su, *sd;              /* shared expert (bf16/f32) */
+    /* CUDA: device (VRAM) copies of the bf16 residents, NULL = CPU only */
+    void  *d_wq, *d_wk, *d_wv, *d_wo, *d_wg;
+    void  *d_gate, *d_up, *d_down, *d_sg, *d_su, *d_sd;
 } Layer;
 
 typedef struct {
@@ -70,6 +77,7 @@ typedef struct {
     int xq;                            /* 1 = int4 packed-expert container */
     int res_dt;                        /* resident dtype: 0=f32, 1=bf16, 2=int8 */
     void *embed, *lm_head;             /* bf16 (real) / f32 (tiny) */
+    void *d_lm_head;                   /* CUDA: VRAM copy of lm_head (NULL = CPU) */
     float *final_norm;
     Layer *L;
 } Model;
@@ -158,8 +166,15 @@ static void matmul_q8(float *y, const float *x, const void *W, int I, int O) {
         y[o] = (float)(s * scale[o]);
     }
 }
-/* resident GEMM: dispatch f32 (tiny/oracle) / bf16 (real) / int8 (RES8) */
-static void resmm(float *y, const float *x, const void *W, int I, int O) {
+/* resident GEMM: dispatch VRAM-bf16 (CUDA) / f32 (tiny/oracle) / bf16 (real) /
+ * int8 (RES8). Wdev is the weight's VRAM copy (NULL = not resident on GPU); the
+ * GPU path is skipped under g_exact so the oracle keeps its double-accumulate. */
+static void resmm(float *y, const float *x, const void *W, const void *Wdev, int I, int O) {
+#ifdef COLI_CUDA
+    if (Wdev && !g_exact && lag_cuda_matmul_bf16(y, x, Wdev, 1, I, O) == 0) return;
+#else
+    (void)Wdev;
+#endif
     if (g_res_dt == 2) matmul_q8(y, x, W, I, O);
     else if (g_res_dt == 1) matmul_bf16(y, x, (const uint16_t*)W, I, O);
     else matmul(y, x, (const float*)W, I, O);
@@ -358,6 +373,15 @@ static void model_load(Model *m, const char *snap) {
     g_res_dt = m->res_dt;
     m->embed = load_res(m, "model.embed_tokens.weight", c->hidden);
     m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight", c->hidden) : m->embed;
+    /* lm_head is a real D->V matmul (embed is a gather, stays on CPU); put its
+     * bf16 weight in VRAM too. */
+    m->d_lm_head = NULL;
+#ifdef COLI_CUDA
+    if (g_cuda && g_res_dt == 1) {
+        const char *lmn = st_has(&m->S, "lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
+        m->d_lm_head = lag_cuda_upload(m->lm_head, (size_t)st_numel(&m->S, lmn) * 2);
+    }
+#endif
     m->final_norm = load_t(m, "model.norm.weight");
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
@@ -365,7 +389,14 @@ static void model_load(Model *m, const char *snap) {
         Layer *L = &m->L[i];
         int D = c->hidden, hix = c->heads[i] * c->head_dim;   /* o_proj in-dim = H*hd */
 #define LD(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_t(m, nm); } while (0)
-#define LDR(field, suffix, indim) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm, indim); } while (0)
+/* DEV: upload a just-loaded bf16 resident to VRAM (nm still holds its name).
+ * Only for the real bf16 container with the GPU tier up; else NULL (CPU path). */
+#ifdef COLI_CUDA
+#define DEV(field) do { L->d_##field = (g_cuda && g_res_dt == 1) ? lag_cuda_upload(L->field, (size_t)st_numel(&m->S, nm) * 2) : NULL; } while (0)
+#else
+#define DEV(field) do {} while (0)
+#endif
+#define LDR(field, suffix, indim) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm, indim); DEV(field); } while (0)
         LD(ln1, "input_layernorm.weight");
         LD(ln2, "post_attention_layernorm.weight");
         LDR(wq, "self_attn.q_proj.weight", D); LDR(wk, "self_attn.k_proj.weight", D);
@@ -395,6 +426,7 @@ static void model_load(Model *m, const char *snap) {
         }
 #undef LD
 #undef LDR
+#undef DEV
     }
 }
 
@@ -460,10 +492,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
         for (int t = 0; t < S; t++) {
             int pos = pos0 + t;
             rmsnorm(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
-            resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, D, H * hd);
+            resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, L->d_wq, D, H * hd);
             float *kt = Kc + (int64_t)pos * nkv * hd, *vt = Vc + (int64_t)pos * nkv * hd;
-            resmm(kt, xn + t * D, L->wk, D, nkv * hd);
-            resmm(vt, xn + t * D, L->wv, D, nkv * hd);
+            resmm(kt, xn + t * D, L->wk, L->d_wk, D, nkv * hd);
+            resmm(vt, xn + t * D, L->wv, L->d_wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
                 float *q = Q + ((int64_t)t * H + hh) * hd;
                 rmsnorm(q, q, L->qn, hd, c->rms_eps);
@@ -504,13 +536,13 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
         /* per-head softplus gate (of the layer input xn) applied before o_proj */
         float *gate = falloc(H);
         for (int t = 0; t < S; t++) {
-            resmm(gate, xn + t * D, L->wg, D, H);   /* g_proj: hidden -> num_heads */
+            resmm(gate, xn + t * D, L->wg, L->d_wg, D, H);   /* g_proj: hidden -> num_heads */
             for (int hh = 0; hh < H; hh++) {
                 float gv = softplusf(gate[hh]);
                 float *ao = AO + ((int64_t)t * H + hh) * hd;
                 for (int d = 0; d < hd; d++) ao[d] *= gv;
             }
-            resmm(scr, AO + (int64_t)t * H * hd, L->wo, H * hd, D);
+            resmm(scr, AO + (int64_t)t * H * hd, L->wo, L->d_wo, H * hd, D);
             for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
         }
         free(gate); free(Q); free(AO);
@@ -522,10 +554,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             int I = c->dense_inter;
             float *g = falloc(I), *u = falloc(I);
             for (int t = 0; t < n; t++) {
-                resmm(g, xn + t * D, L->gate, D, I);
-                resmm(u, xn + t * D, L->up, D, I);
+                resmm(g, xn + t * D, L->gate, L->d_gate, D, I);
+                resmm(u, xn + t * D, L->up, L->d_up, D, I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                resmm(scr, g, L->down, I, D);
+                resmm(scr, g, L->down, L->d_down, I, D);
                 for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
             }
             free(g); free(u);
@@ -567,10 +599,10 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
                 }
                 for (int i = 0; i < D; i++) acc[i] *= c->route_scale;
                 /* shared expert (always on, unscaled) */
-                resmm(sg, xn + t * D, L->sg, D, SI);
-                resmm(su, xn + t * D, L->su, D, SI);
+                resmm(sg, xn + t * D, L->sg, L->d_sg, D, SI);
+                resmm(su, xn + t * D, L->su, L->d_su, D, SI);
                 for (int i = 0; i < SI; i++) sg[i] = siluf(sg[i]) * su[i];
-                resmm(scr, sg, L->sd, SI, D);
+                resmm(scr, sg, L->sd, L->d_sd, SI, D);
                 for (int i = 0; i < D; i++) h[t * D + i] += acc[i] + scr[i];
             }
             free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
@@ -582,12 +614,12 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
 }
 static int argmax_logits(Model *m, const float *h_pos, int *unused) {
     (void)unused; int V = m->c.vocab, D = m->c.hidden;
-    float *lg = falloc(V); resmm(lg, h_pos, m->lm_head, D, V);
+    float *lg = falloc(V); resmm(lg, h_pos, m->lm_head, m->d_lm_head, D, V);
     int best = 0; for (int v = 1; v < V; v++) if (lg[v] > lg[best]) best = v;
     free(lg); return best;
 }
 static void compute_logits(Model *m, const float *h_pos, float *lg) {
-    resmm(lg, h_pos, m->lm_head, m->c.hidden, m->c.vocab);
+    resmm(lg, h_pos, m->lm_head, m->d_lm_head, m->c.hidden, m->c.vocab);
 }
 
 /* ---------- serve mode: openai_server.py engine protocol (like colibri/inkling) ----------
@@ -686,7 +718,82 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
     *n_out = a->len; return r;
 }
+#ifdef COLI_CUDA
+/* Kernel-level validation: random data through the CPU kernels and the GPU
+ * kernels, reporting max abs / max relative difference. bf16 & q4 should agree
+ * to float-noise (~1e-3 rel bf16, ~1e-4 rel q4) — only the reduction order
+ * differs. No model needed: `LAG_CUDA_TEST=1 ./laguna` (SNAP unused). */
+static void frand_fill(float *p, int64_t n) { for (int64_t i = 0; i < n; i++) p[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f; }
+static int cuda_selftest(void) {
+    if (lag_cuda_init(getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0) != 0) { fprintf(stderr, "[cuda-test] init failed\n"); return 1; }
+    srand(1234); g_exact = 0; g_res_dt = 1;
+    int rc = 0;
+    /* --- bf16 matmul: weight bf16, x f32 --- */
+    {
+        int I = 3072, O = 4096;
+        float *x = falloc(I), *yc = falloc(O), *yg = falloc(O);
+        uint16_t *w = malloc((size_t)O * I * 2);
+        frand_fill(x, I);
+        for (int64_t k = 0; k < (int64_t)O * I; k++) { float f = (rand() / (float)RAND_MAX) * 2.f - 1.f; uint32_t u; memcpy(&u, &f, 4); w[k] = u >> 16; }
+        matmul_bf16(yc, x, w, I, O);
+        void *dw = lag_cuda_upload(w, (size_t)O * I * 2);
+        if (!dw || lag_cuda_matmul_bf16(yg, x, dw, 1, I, O) != 0) { fprintf(stderr, "[cuda-test] bf16 gpu call failed\n"); return 1; }
+        float md = 0, mr = 0; for (int o = 0; o < O; o++) { float d = fabsf(yc[o] - yg[o]); if (d > md) md = d; float r = d / (fabsf(yc[o]) + 1e-6f); if (r > mr) mr = r; }
+        printf("[cuda-test] bf16 matmul  [%d->%d]  max|abs|=%.3e  max_rel=%.3e  %s\n", I, O, md, mr, mr < 5e-3 ? "OK" : "FAIL");
+        if (mr >= 5e-3) rc = 1;
+        lag_cuda_free(dw); free(x); free(yc); free(yg); free(w);
+    }
+    /* --- q4 matmul: packed nibble-8, per-row scale --- */
+    {
+        int I = 3072, O = 2048;
+        float *x = falloc(I), *yc = falloc(O), *yg = falloc(O), *sc = falloc(O);
+        uint8_t *p = malloc((size_t)O * (I / 2));
+        frand_fill(x, I);
+        for (int64_t k = 0; k < (int64_t)O * (I / 2); k++) p[k] = rand() & 0xFF;
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + (rand() / (float)RAND_MAX) * 0.05f;
+        matmul_q4(yc, x, p, sc, I, O);
+        void *dp = lag_cuda_upload(p, (size_t)O * (I / 2)), *ds = lag_cuda_upload(sc, (size_t)O * 4);
+        if (!dp || !ds || lag_cuda_matmul_q4(yg, x, dp, ds, 1, I, O) != 0) { fprintf(stderr, "[cuda-test] q4 gpu call failed\n"); return 1; }
+        float md = 0, mr = 0; for (int o = 0; o < O; o++) { float d = fabsf(yc[o] - yg[o]); if (d > md) md = d; float r = d / (fabsf(yc[o]) + 1e-6f); if (r > mr) mr = r; }
+        printf("[cuda-test] q4 matmul    [%d->%d]  max|abs|=%.3e  max_rel=%.3e  %s\n", I, O, md, mr, mr < 1e-3 ? "OK" : "FAIL");
+        if (mr >= 1e-3) rc = 1;
+        lag_cuda_free(dp); lag_cuda_free(ds); free(x); free(yc); free(yg); free(sc); free(p);
+    }
+    /* --- fused expert (int4): out[D] = W2 @ siluglu(W13 @ x), block-concat gate_up --- */
+    {
+        int D = 3072, I = 1024;
+        float *x = falloc(D), *yc = falloc(D), *yg = falloc(D);
+        float *gu = falloc(2 * I), *s13 = falloc(2 * I), *s2 = falloc(D);
+        uint8_t *p13 = malloc((size_t)(2 * I) * (D / 2)), *p2 = malloc((size_t)D * (I / 2));
+        frand_fill(x, D);
+        for (int64_t k = 0; k < (int64_t)(2 * I) * (D / 2); k++) p13[k] = rand() & 0xFF;
+        for (int64_t k = 0; k < (int64_t)D * (I / 2); k++) p2[k] = rand() & 0xFF;
+        for (int r = 0; r < 2 * I; r++) s13[r] = 0.01f + (rand() / (float)RAND_MAX) * 0.03f;
+        for (int r = 0; r < D; r++) s2[r] = 0.01f + (rand() / (float)RAND_MAX) * 0.03f;
+        /* CPU reference: same as the MoE loop's int4 expert */
+        matmul_q4(gu, x, p13, s13, D, 2 * I);
+        for (int i = 0; i < I; i++) gu[i] = siluf(gu[i]) * gu[I + i];
+        matmul_q4(yc, gu, p2, s2, I, D);
+        void *dp13 = lag_cuda_upload(p13, (size_t)(2 * I) * (D / 2)), *ds13 = lag_cuda_upload(s13, (size_t)(2 * I) * 4);
+        void *dp2 = lag_cuda_upload(p2, (size_t)D * (I / 2)), *ds2 = lag_cuda_upload(s2, (size_t)D * 4);
+        if (!dp13 || !ds13 || !dp2 || !ds2 || lag_cuda_expert_q4(yg, x, dp13, ds13, dp2, ds2, I, D) != 0) { fprintf(stderr, "[cuda-test] expert gpu call failed\n"); return 1; }
+        /* chained q4->silu->q4: relative error blows up on near-zero outputs, so
+         * abs error (vs the ~0.03-scale, D-wide accumulation) is the honest signal. */
+        float md = 0, mr = 0; int nbig = 0; for (int o = 0; o < D; o++) { float d = fabsf(yc[o] - yg[o]); if (d > md) md = d; float r = d / (fabsf(yc[o]) + 1e-6f); if (r > mr) mr = r; if (r > 1e-3f) nbig++; }
+        printf("[cuda-test] expert_q4    [D=%d I=%d] max|abs|=%.3e  max_rel=%.3e (%d/%d elems >1e-3 rel)  %s\n", D, I, md, mr, nbig, D, md < 1e-3 ? "OK" : "FAIL");
+        if (md >= 1e-3) rc = 1;
+        lag_cuda_free(dp13); lag_cuda_free(ds13); lag_cuda_free(dp2); lag_cuda_free(ds2);
+        free(x); free(yc); free(yg); free(gu); free(s13); free(s2); free(p13); free(p2);
+    }
+    printf("[cuda-test] %s\n", rc ? "FAILURES" : "ALL PASS");
+    return rc;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef COLI_CUDA
+    if (getenv("LAG_CUDA_TEST")) return cuda_selftest();
+#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     const char *prompt = NULL, *refpath = "ref_laguna.json";
@@ -704,8 +811,19 @@ int main(int argc, char **argv) {
         else refpath = argv[i];
     }
 
+#ifdef COLI_CUDA
+    /* bring up the A6000 tier before load so bf16 residents upload as they read */
+    if (!getenv("NOGPU")) {
+        int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
+        if (lag_cuda_init(dev) == 0) { g_cuda = 1; fprintf(stderr, "[cuda] device %d up, %.1f GB VRAM free\n", dev, lag_cuda_free_bytes() / 1e9); }
+        else fprintf(stderr, "[cuda] init failed — CPU only\n");
+    }
+#endif
     Model m; model_load(&m, snap);
     printf("== Laguna C engine (Stage A, %s) ==\n", m.xq ? "int4 container" : "f32");
+#ifdef COLI_CUDA
+    if (g_cuda) printf("CUDA: bf16 residents in VRAM (experts stay CPU int4) | %.1f GB VRAM free\n", lag_cuda_free_bytes() / 1e9);
+#endif
     printf("cfg: D=%d L=%d kv=%d hd=%d V=%d E=%d+1 topk=%d moe_I=%d win=%d g_rdim=%d(scale %.4f) s_rdim=%d\n",
            m.c.hidden, m.c.n_layers, m.c.n_kv, m.c.head_dim, m.c.vocab, m.c.n_experts, m.c.topk,
            m.c.moe_inter, m.c.sliding_window, m.c.g_rdim, m.c.g_scale, m.c.s_rdim);
@@ -774,7 +892,7 @@ int main(int argc, char **argv) {
     forward(&m, &kv, full, nfull, 0, H);
     int ok = 0; double nll = 0;
     for (int i = 0; i < nfull; i++) {
-        float *lg = falloc(m.c.vocab); resmm(lg, H + (int64_t)i * D, m.lm_head, D, m.c.vocab);
+        float *lg = falloc(m.c.vocab); resmm(lg, H + (int64_t)i * D, m.lm_head, m.d_lm_head, D, m.c.vocab);
         int am = 0; for (int v = 1; v < m.c.vocab; v++) if (lg[v] > lg[am]) am = v;
         if (tfref && i < ntf && am == tfref[i]) ok++;
         if (i < nfull - 1) {   /* NLL of the true next token */

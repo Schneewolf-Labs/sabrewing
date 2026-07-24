@@ -197,6 +197,7 @@ CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 INK_CUDA_OBJ = backend_cuda_ink.o   # inkling's own direct-linked CUDA object (fork)
+LAG_CUDA_OBJ = backend_cuda_laguna.o  # laguna's own direct-linked CUDA object (fork)
 endif
 
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
@@ -261,6 +262,11 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
+# laguna's own CUDA backend (fork), direct-linked
+backend_cuda_laguna.o: backend_cuda_laguna.cu backend_cuda_laguna.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_laguna.cu -o $@
+
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -286,8 +292,8 @@ inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # laguna (fork): Poolside Laguna 118B/8B MoE coding engine — Stage-A f32 oracle
-laguna$(EXE): laguna.c st.h tok.h json.h compat.h
-	$(CC) $(CFLAGS) laguna.c -o laguna$(EXE) $(LDFLAGS)
+laguna$(EXE): laguna.c st.h tok.h json.h compat.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) laguna.c $(LAG_CUDA_OBJ) -o laguna$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
