@@ -48,4 +48,14 @@ static void rmsnorm_row(float *out, const float *x, const float *w, int D, float
     for (int i = 0; i < D; i++) out[i] = x[i] * inv * w[i];
 }
 
+/* In-place softmax over n logits. Denominator accumulated in double and applied
+ * as a reciprocal multiply (laguna's contract — strictly more accurate than the
+ * float-accumulate + divide that inkling/olmoe used; the token-exact oracles hold
+ * either way). Max-subtracted for numerical stability. */
+static void softmax_row(float *x, int n) {
+    float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
+    double s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
+    float inv = (float)(1.0 / s); for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
 #endif

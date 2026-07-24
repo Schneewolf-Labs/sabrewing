@@ -28,6 +28,7 @@
 #include "tok.h"
 #include "json.h"
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
+#include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -105,35 +106,11 @@ typedef struct {
 
 /* ---------- math ---------- */
 static float *falloc(int64_t n) { float *p = malloc(n * sizeof(float)); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); } return p; }
-/* g_exact: force the double-accumulate scalar kernels (bit-exact vs the oracle).
+/* g_exact: force the double-accumulate reference kernels (bit-exact vs the oracle).
  * Generation defaults to the AVX-512 float path (within quant noise, ~SIMD-fast). */
 static int g_exact = 0;
-/* y[O] = x[I] @ W[O,I]^T  (W row-major [out,in], HF Linear convention). */
-static void matmul(float *y, const float *x, const float *W, int I, int O) {
-#if defined(__AVX512F__)
-    if (!g_exact) {
-        #pragma omp parallel for schedule(static) if(O >= 512)
-        for (int o = 0; o < O; o++) {
-            const float *w = W + (int64_t)o * I;
-            __m512 acc = _mm512_setzero_ps();
-            int i = 0;
-            for (; i + 16 <= I; i += 16)
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(w + i), acc);
-            float s = _mm512_reduce_add_ps(acc);
-            for (; i < I; i++) s += x[i] * w[i];
-            y[o] = s;
-        }
-        return;
-    }
-#endif
-    /* exact double-accumulate reference (the oracle path) */
-    #pragma omp parallel for schedule(static) if(O >= 512)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];
-        y[o] = (float)s;
-    }
-}
+/* f32 GEMV is the shared batched matmul_f32 (moe_matmul.h) at S=1. */
+static void matmul(float *y, const float *x, const float *W, int I, int O) { matmul_f32(y, x, W, 1, I, O, g_exact); }
 
 /* bf16 weight dot: W is raw bf16 [O,I]. bf16->f32 (bf16_f32, moe_math.h) is exact
  * (top 16 bits), so the result equals matmul() on the f32-expanded weights but
@@ -235,12 +212,7 @@ static void matmul_q4(float *y, const float *x, const uint8_t *packed, const flo
         y[o] = (float)(s * scale[o]);
     }
 }
-/* rmsnorm_row, siluf, softplusf are shared (moe_math.h). */
-static void softmax(float *x, int n) {
-    float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
-    double s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
-    float inv = (float)(1.0 / s); for (int i = 0; i < n; i++) x[i] *= inv;
-}
+/* rmsnorm_row, siluf, softplusf, softmax_row are shared (moe_math.h). */
 
 /* ---------- config ---------- */
 static double jnum(jval *o, const char *k, double d) { jval *v = json_get(o, k); return (v && v->t == J_NUM) ? v->num : d; }
@@ -554,7 +526,7 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
                     double s = 0; for (int d = 0; d < hd; d++) s += (double)q[d] * k[d];
                     att[m0++] = (float)s * scaling;
                 }
-                softmax(att, m0);
+                softmax_row(att, m0);
                 float *ao = AO + ((int64_t)t * H + hh) * hd;
                 for (int d = 0; d < hd; d++) ao[d] = 0;
                 for (int j = j0, mi = 0; j <= pos; j++, mi++) {
@@ -944,7 +916,7 @@ int main(int argc, char **argv) {
         int am = 0; for (int v = 1; v < m.c.vocab; v++) if (lg[v] > lg[am]) am = v;
         if (tfref && i < ntf && am == tfref[i]) ok++;
         if (i < nfull - 1) {   /* NLL of the true next token */
-            softmax(lg, m.c.vocab);
+            softmax_row(lg, m.c.vocab);
             nll += -log((double)lg[full[i + 1]] + 1e-30);
         }
         free(lg);

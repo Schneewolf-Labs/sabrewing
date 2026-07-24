@@ -35,6 +35,7 @@
 #include "lora.h"
 #include "tok.h"
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
+#include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -142,18 +143,9 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+/* f32 GEMM is the shared batched matmul_f32 (moe_matmul.h). inkling's oracle uses
+ * the SIMD path (exact=0); it has no double-accumulate reference of its own. */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O) { matmul_f32(y, x, W, S, I, O, 0); }
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
@@ -355,11 +347,6 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
     }
 }
 
-static void softmax_row(float *x, int n) {
-    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
-    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-}
 
 /* ---------- depthwise causal short conv, residual inside (fp32) ----------
  * seq[S,C] in-place: out[t] = sum_j w[c,j]*in[t+j-(K-1)] + in[t], history from
