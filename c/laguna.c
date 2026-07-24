@@ -33,6 +33,8 @@
 #include "moe_quant.h"         /* matmul_q4_k (shared int4 GEMV, f32/idot contracts) */
 #include "moe_sample.h"        /* g_rng, rng_next, sample_logits (temp/top-p) */
 #include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
+#include "moe_arch.h"          /* MoeDesc, MoeHooks (descriptor-driven MoE block) */
+#include "moe_block.h"         /* moe_block (shared route/top-k/combine) */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -396,6 +398,40 @@ static void kv_init(KVCache *kv, Model *m, int max_pos) {
 }
 static void kv_free(KVCache *kv, int L) { for (int l = 0; l < L; l++) { free(kv->k[l]); free(kv->v[l]); } free(kv->k); free(kv->v); }
 
+/* ---------- MoE block hooks (moe_arch.h / moe_block.h) ----------
+ * laguna's weight-layout-specific ops behind the shared moe_block interface.
+ * ctx carries the layer + per-layer scratch (allocated once in forward). */
+typedef struct { Model *m; Layer *L; int I, D; float *gu, *eg, *eu, *sg, *su; } LagMoeCtx;
+static void lag_router(void *cx, const float *x, float *lg) {
+    LagMoeCtx *c = cx; matmul(lg, x, c->L->router, c->D, c->m->c.n_experts);
+}
+static void lag_expert(void *cx, int e, const float *x, float *out) {
+    LagMoeCtx *c = cx; Model *m = c->m; Layer *L = c->L; int I = c->I, D = c->D;
+#ifdef COLI_CUDA
+    if (m->xq && L->d_gu_q &&                      /* fused expert on the VRAM-resident layer */
+        lag_cuda_expert_q4(out, x,
+            (const uint8_t*)L->d_gu_q + (int64_t)(e * 2 * I) * (D / 2), L->d_gu_s + (int64_t)e * 2 * I,
+            (const uint8_t*)L->d_dn_q + (int64_t)(e * D) * (I / 2), L->d_dn_s + (int64_t)e * D, I, D) == 0) return;
+#endif
+    if (m->xq) {                                   /* int4 container: fused gate_up + down (CPU) */
+        matmul_q4(c->gu, x, L->gu_q + (int64_t)(e * 2 * I) * (D / 2), L->gu_s + (int64_t)e * 2 * I, D, 2 * I);
+        for (int i = 0; i < I; i++) c->gu[i] = siluf(c->gu[i]) * c->gu[I + i];
+        matmul_q4(out, c->gu, L->dn_q + (int64_t)(e * D) * (I / 2), L->dn_s + (int64_t)e * D, I, D);
+    } else {                                       /* f32 experts */
+        matmul(c->eg, x, L->eg[e], D, I);
+        matmul(c->eu, x, L->eu[e], D, I);
+        for (int i = 0; i < I; i++) c->eg[i] = siluf(c->eg[i]) * c->eu[i];
+        matmul(out, c->eg, L->ed[e], I, D);
+    }
+}
+static void lag_shared(void *cx, const float *x, float *out) {
+    LagMoeCtx *c = cx; Layer *L = c->L; int SI = c->m->c.shared_inter, D = c->D;
+    resmm(c->sg, x, L->sg, L->d_sg, D, SI);
+    resmm(c->su, x, L->su, L->d_su, D, SI);
+    for (int i = 0; i < SI; i++) c->sg[i] = siluf(c->sg[i]) * c->su[i];
+    resmm(out, c->sg, L->sd, L->d_sd, SI, D);
+}
+
 /* process S tokens at absolute positions pos0..pos0+S-1, appending K/V to the
  * cache; writes each token's post-final-norm hidden state to h_out[S*D].
  * Prefill: S=np, pos0=0. Decode: S=1, pos0=current length. */
@@ -502,59 +538,14 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             }
             free(g); free(u);
         } else {
-            int E = c->n_experts, K = c->topk, I = c->moe_inter, SI = c->shared_inter;
-            float *rl = falloc(E), *sc = falloc(E);
-            int *sel = malloc(K * sizeof(int)); float *w = falloc(K);
-            float *eg = falloc(I), *eu = falloc(I), *acc = falloc(D), *gu = falloc(2 * I);
-            float *sg = falloc(SI), *su = falloc(SI);
-            for (int t = 0; t < n; t++) {
-                matmul(rl, xn + t * D, L->router, D, E);
-                for (int e = 0; e < E; e++) sc[e] = 1.f / (1.f + expf(-rl[e]));   /* sigmoid */
-                /* top-K by (sigmoid + correction bias) */
-                for (int a = 0; a < K; a++) {
-                    int best = -1; float bv = -1e30f;
-                    for (int e = 0; e < E; e++) {
-                        int used = 0; for (int b = 0; b < a; b++) if (sel[b] == e) { used = 1; break; }
-                        if (used) continue;
-                        float s = sc[e] + L->ebias[e];
-                        if (s > bv) { bv = s; best = e; }
-                    }
-                    sel[a] = best; w[a] = sc[best];   /* unbiased weight */
-                }
-                if (c->norm_topk) { float sm = 0; for (int a = 0; a < K; a++) sm += w[a]; for (int a = 0; a < K; a++) w[a] /= sm; }
-                for (int i = 0; i < D; i++) acc[i] = 0;
-                for (int a = 0; a < K; a++) {
-                    int e = sel[a];
-                    int done = 0;
-#ifdef COLI_CUDA
-                    if (m->xq && L->d_gu_q) {   /* fused expert entirely on the GPU (VRAM-resident layer) */
-                        done = (lag_cuda_expert_q4(scr, xn + t * D,
-                                    (const uint8_t*)L->d_gu_q + (int64_t)(e * 2 * I) * (D / 2), L->d_gu_s + (int64_t)e * 2 * I,
-                                    (const uint8_t*)L->d_dn_q + (int64_t)(e * D) * (I / 2), L->d_dn_s + (int64_t)e * D, I, D) == 0);
-                    }
-#endif
-                    if (done) { /* scr filled by GPU */ }
-                    else if (m->xq) {   /* int4 container: fused gate_up + down (CPU) */
-                        matmul_q4(gu, xn + t * D, L->gu_q + (int64_t)(e * 2 * I) * (D / 2), L->gu_s + (int64_t)e * 2 * I, D, 2 * I);
-                        for (int i = 0; i < I; i++) gu[i] = siluf(gu[i]) * gu[I + i];
-                        matmul_q4(scr, gu, L->dn_q + (int64_t)(e * D) * (I / 2), L->dn_s + (int64_t)e * D, I, D);
-                    } else {
-                        matmul(eg, xn + t * D, L->eg[e], D, I);
-                        matmul(eu, xn + t * D, L->eu[e], D, I);
-                        for (int i = 0; i < I; i++) eg[i] = siluf(eg[i]) * eu[i];
-                        matmul(scr, eg, L->ed[e], I, D);
-                    }
-                    for (int i = 0; i < D; i++) acc[i] += w[a] * scr[i];
-                }
-                for (int i = 0; i < D; i++) acc[i] *= c->route_scale;
-                /* shared expert (always on, unscaled) */
-                resmm(sg, xn + t * D, L->sg, L->d_sg, D, SI);
-                resmm(su, xn + t * D, L->su, L->d_su, D, SI);
-                for (int i = 0; i < SI; i++) sg[i] = siluf(sg[i]) * su[i];
-                resmm(scr, sg, L->sd, L->d_sd, SI, D);
-                for (int i = 0; i < D; i++) h[t * D + i] += acc[i] + scr[i];
-            }
-            free(rl); free(sc); free(sel); free(w); free(eg); free(eu); free(acc); free(gu); free(sg); free(su);
+            /* sigmoid loss-free routing, corr-bias selection, norm_topk, routed
+             * *route_scale, one always-on unscaled shared expert (see moe-arch-survey). */
+            int I = c->moe_inter, SI = c->shared_inter;
+            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI) };
+            MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
+            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared };
+            for (int t = 0; t < n; t++) moe_block(&desc, &hooks, xn + t * D, h + t * D, D);
+            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su);
         }
     }
     for (int t = 0; t < S; t++) rmsnorm_row(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
