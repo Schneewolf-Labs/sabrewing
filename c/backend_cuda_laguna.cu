@@ -99,6 +99,39 @@ extern "C" int lag_cuda_matmul_bf16(float *y, const float *x, const void *W, int
     return 0;
 }
 
+/* Resident int8 GEMM: W is the combined [int8 O*I][f32 scale O] buffer (laguna's
+ * matmul_q8 layout). Activations stay f32; one warp per output row, f32 accumulate
+ * — matches the CPU MOE_Q8_F32 contract. Half the VRAM read/footprint of bf16. */
+__global__ void mm_q8_kernel(const signed char * __restrict__ W, const float * __restrict__ scale,
+                             const float * __restrict__ x, float * __restrict__ y, int I, int O) {
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y;
+    if (o >= O) return;
+    const signed char *w = W + (size_t)o * I;
+    const float *xs = x + (size_t)s * I;
+    float acc = 0.f;
+    for (int i = lane; i < I; i += 32) acc += xs[i] * (float)w[i];
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (!lane) y[(size_t)s * O + o] = acc * scale[o];
+}
+
+extern "C" int lag_cuda_matmul_q8(float *y, const float *x, const void *W, int S, int I, int O) {
+    if (!g_ok) return -1;
+    size_t xn = (size_t)S * I * 4, yn = (size_t)S * O * 4;
+    if (ensure_xy(xn, yn)) return -1;
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    const signed char *q8 = (const signed char *)W;
+    const float *scale = (const float *)(q8 + (size_t)I * O);   /* embedded per-row scales */
+    dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
+    mm_q8_kernel<<<grid, 128, 0, g_st>>>(q8, scale, g_dx, g_dy, I, O);
+    cudaMemcpyAsync(g_hy, g_dy, yn, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(y, g_hy, yn);
+    return 0;
+}
+
 /* Routed-expert int4 GEMM. Matches CPU matmul_q4: packed nibbles (low = even
  * col, high = odd col, value = nibble-8), per-output-row f32 scale, f32
  * accumulate. packed/scale are DEVICE pointers. One warp per output row. */

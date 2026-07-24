@@ -140,7 +140,11 @@ static void matmul_q8(float *y, const float *x, const void *W, int I, int O) {
  * GPU path is skipped under g_exact so the oracle keeps its double-accumulate. */
 static void resmm(float *y, const float *x, const void *W, const void *Wdev, int I, int O) {
 #ifdef COLI_CUDA
-    if (Wdev && !g_exact && lag_cuda_matmul_bf16(y, x, Wdev, 1, I, O) == 0) return;
+    if (Wdev && !g_exact) {   /* VRAM resident: int8 (RES8) or bf16 kernel */
+        int rc = (g_res_dt == 2) ? lag_cuda_matmul_q8(y, x, Wdev, 1, I, O)
+                                 : lag_cuda_matmul_bf16(y, x, Wdev, 1, I, O);
+        if (rc == 0) return;
+    }
 #else
     (void)Wdev;
 #endif
@@ -304,12 +308,14 @@ static void model_load(Model *m, const char *snap) {
     m->embed = load_res(m, "model.embed_tokens.weight", c->hidden);
     m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight", c->hidden) : m->embed;
     /* lm_head is a real D->V matmul (embed is a gather, stays on CPU); put its
-     * bf16 weight in VRAM too. */
+     * weight in VRAM too (bf16, or the int8 combined buffer under RES8). */
     m->d_lm_head = NULL;
 #ifdef COLI_CUDA
-    if (g_cuda && g_res_dt == 1) {
+    if (g_cuda && (g_res_dt == 1 || g_res_dt == 2)) {
         const char *lmn = st_has(&m->S, "lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
-        m->d_lm_head = lag_cuda_upload(m->lm_head, (size_t)st_numel(&m->S, lmn) * 2);
+        int64_t ne = st_numel(&m->S, lmn);
+        size_t b = (g_res_dt == 2) ? (size_t)ne + (size_t)(ne / c->hidden) * 4 : (size_t)ne * 2;
+        m->d_lm_head = lag_cuda_upload(m->lm_head, b);
     }
 #endif
     m->final_norm = load_t(m, "model.norm.weight");
@@ -319,14 +325,17 @@ static void model_load(Model *m, const char *snap) {
         Layer *L = &m->L[i];
         int D = c->hidden, hix = c->heads[i] * c->head_dim;   /* o_proj in-dim = H*hd */
 #define LD(field, suffix) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_t(m, nm); } while (0)
-/* DEV: upload a just-loaded bf16 resident to VRAM (nm still holds its name).
- * Only for the real bf16 container with the GPU tier up; else NULL (CPU path). */
+/* DEV: upload a just-loaded resident to VRAM (nm still holds its name). Sizes the
+ * bytes by dtype: bf16 = numel*2; int8 (RES8) = the combined [int8 O*I][f32 O]
+ * buffer = numel + (numel/indim)*4. NULL when the GPU tier is off (CPU path). */
 #ifdef COLI_CUDA
-#define DEV(field) do { int64_t _ne = st_numel(&m->S, nm); L->d_##field = (g_cuda && g_res_dt == 1 && _ne >= g_gpu_minel) ? lag_cuda_upload(L->field, (size_t)_ne * 2) : NULL; } while (0)
+#define DEV(field, indim) do { int64_t _ne = st_numel(&m->S, nm); \
+    size_t _b = (g_res_dt == 2) ? (size_t)_ne + (size_t)(_ne / (indim)) * 4 : (size_t)_ne * 2; \
+    L->d_##field = (g_cuda && (g_res_dt == 1 || g_res_dt == 2) && _ne >= g_gpu_minel) ? lag_cuda_upload(L->field, _b) : NULL; } while (0)
 #else
-#define DEV(field) do {} while (0)
+#define DEV(field, indim) do {} while (0)
 #endif
-#define LDR(field, suffix, indim) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm, indim); DEV(field); } while (0)
+#define LDR(field, suffix, indim) do { snprintf(nm, sizeof(nm), "model.layers.%d." suffix, i); L->field = load_res(m, nm, indim); DEV(field, indim); } while (0)
         LD(ln1, "input_layernorm.weight");
         LD(ln2, "post_attention_layernorm.weight");
         LDR(wq, "self_attn.q_proj.weight", D); LDR(wk, "self_attn.k_proj.weight", D);
@@ -720,8 +729,8 @@ int main(int argc, char **argv) {
 #ifdef COLI_CUDA
     if (g_cuda) {
         int moe = 0; for (int i = 0; i < m.c.n_layers; i++) moe += m.c.is_moe[i];
-        printf("CUDA: bf16 residents + %d/%d MoE layers' experts in VRAM (%.1f GB experts) | %.1f GB VRAM free\n",
-               g_exp_gpu_layers, moe, g_exp_gpu_gb, lag_cuda_free_bytes() / 1e9);
+        printf("CUDA: %s residents + %d/%d MoE layers' experts in VRAM (%.1f GB experts) | %.1f GB VRAM free\n",
+               m.res_dt == 2 ? "int8" : "bf16", g_exp_gpu_layers, moe, g_exp_gpu_gb, lag_cuda_free_bytes() / 1e9);
     }
 #endif
     printf("cfg: D=%d L=%d kv=%d hd=%d V=%d E=%d+1 topk=%d moe_I=%d win=%d g_rdim=%d(scale %.4f) s_rdim=%d\n",
