@@ -26,16 +26,8 @@ static void moe_block(const MoeDesc *d, const MoeHooks *h, const float *x, float
     else for (int e = 0; e < E; e++) sc[e] = 1.f / (1.f + expf(-rl[e]));           /* sigmoid loss-free */
 
     /* top-K by (score + correction bias); combine weight is the UNBIASED score */
-    for (int a = 0; a < K; a++) {
-        int best = -1; float bv = -1e30f;
-        for (int e = 0; e < E; e++) {
-            int used = 0; for (int b = 0; b < a; b++) if (sel[b] == e) { used = 1; break; }
-            if (used) continue;
-            float s = sc[e] + (d->use_corr_bias && h->corr_bias ? h->corr_bias[e] : 0.f);
-            if (s > bv) { bv = s; best = e; }
-        }
-        sel[a] = best; w[a] = sc[best];
-    }
+    moe_topk(sc, h->corr_bias, d->use_corr_bias, E, K, sel);
+    for (int a = 0; a < K; a++) w[a] = sc[sel[a]];
     if (d->norm_topk) { float sm = 0; for (int a = 0; a < K; a++) sm += w[a]; for (int a = 0; a < K; a++) w[a] /= sm; }
 
     for (int i = 0; i < D; i++) acc[i] = 0;

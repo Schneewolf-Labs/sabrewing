@@ -49,4 +49,24 @@ typedef struct {
     void (*shared)(void *ctx, const float *x, float *out);        /* shared expert -> out[D] (mode!=NONE) */
 } MoeHooks;
 
+/* Top-K distinct expert selection: pick the K highest (score[e] + optional
+ * correction bias), writing expert ids to sel[K]. This selection rule is
+ * genuinely identical across the engines (loss-free sigmoid or softmax scores,
+ * bias added for SELECTION only), so it is shared here even where the rest of the
+ * MoE block is not — e.g. inkling's batched, streaming-cache MoE calls this for
+ * routing but keeps its own gated-weight + expert-dispatch machinery. Ties break
+ * toward the lower expert id (ascending scan, strict >), matching the hand loops. */
+static void moe_topk(const float *score, const float *corr_bias, int use_bias, int E, int K, int *sel) {
+    for (int a = 0; a < K; a++) {
+        int best = -1; float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            int used = 0; for (int b = 0; b < a; b++) if (sel[b] == e) { used = 1; break; }
+            if (used) continue;
+            float s = score[e] + (use_bias && corr_bias ? corr_bias[e] : 0.f);
+            if (s > bv) { bv = s; best = e; }
+        }
+        sel[a] = best;
+    }
+}
+
 #endif

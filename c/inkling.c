@@ -40,6 +40,7 @@
 #include "moe_quant.h"         /* matmul_q4_k + i8dot_block (shared int4 GEMV) */
 #include "moe_sample.h"        /* g_rng, rng_next, sample_logits (temp/top-p) */
 #include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
+#include "moe_arch.h"          /* moe_topk (shared top-K expert selection) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -1014,6 +1015,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     memset(out, 0, (int64_t)S*D*sizeof(float));
     int   *idx  = malloc((size_t)S*K*sizeof(int));
     float *wgt  = malloc((size_t)S*(K+ns)*sizeof(float));
+    float *sc   = falloc(E);                              /* routed sigmoid scores (per token) */
     Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
     int  *fl    = malloc((size_t)S*K*sizeof(int));
@@ -1022,16 +1024,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*ET;
         int *si = idx + (int64_t)s*K;
-        /* selection: sigmoid(routed) + correction bias, top-K */
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                int taken = 0; for (int j = 0; j < kk; j++) if (si[j]==e){taken=1;break;}
-                float ch = sigmoidf(lg[e]) + l->rbias[e];
-                if (!taken && ch > bv) { bv = ch; best = e; }
-            }
-            si[kk] = best;
-        }
+        /* selection: sigmoid(routed) + correction bias, top-K (shared moe_topk) */
+        for (int e = 0; e < E; e++) sc[e] = sigmoidf(lg[e]);
+        moe_topk(sc, l->rbias, 1, E, K, si);
         /* FORCE_EXPERTS=1: pin routing to a fixed expert set (0..K-1) so every
          * token hits the same cached experts — zero misses, isolates the compute
          * ceiling from disk. Output is garbage (wrong experts); timing is real. */
@@ -1151,7 +1146,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_shared += now_s() - ts;
     }
-    free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
+    free(logits); free(idx); free(wgt); free(sc); free(use); free(fill); free(fl);
     free(g); free(hh); free(lt);    /* u aliases g+I */
 }
 
