@@ -40,6 +40,18 @@ static int g_cuda = 0;              /* 1 = A6000 tier active (bf16 residents in 
  * k/v/g/shared projections wins, so keeping any resident on the CPU only adds
  * un-overlapped DDR5 reads. Kept as an env knob (LAG_GPU_MINEL) for other GPUs. */
 static int64_t g_gpu_minel = 0;
+/* Expert VRAM cache: after residents upload, each MoE layer's int4 expert blobs
+ * (~1.2 GB) go to VRAM greedily until free VRAM drops below the headroom (or the
+ * CUDA_EXPERT_GB cap is hit); the rest fall back to the CPU int4 path. */
+/* Activation-staging headroom left free after the expert cache fills. The
+ * staging buffers themselves are tiny (<1 MB), but squeezing to ~0 free starves
+ * the lazy cudaMalloc for them and the big resident matmuls (lm_head/o_proj)
+ * fall back to the CPU — measured 9.0 tok/s at 0 free (36 layers) vs 11.3 at
+ * ~0.7 GB free (35 layers). 2 GB is the reproducible sweet spot; CUDA_HEADROOM_MB
+ * overrides for other GPUs. */
+static size_t g_cuda_headroom = 2ULL << 30;
+static int g_exp_gpu_layers = 0;               /* # MoE layers cached in VRAM */
+static double g_exp_gpu_gb = 0;                /* expert VRAM used (GB) */
 #endif
 
 #define MAXL 128
@@ -77,6 +89,10 @@ typedef struct {
     /* CUDA: device (VRAM) copies of the bf16 residents, NULL = CPU only */
     void  *d_wq, *d_wk, *d_wv, *d_wo, *d_wg;
     void  *d_gate, *d_up, *d_down, *d_sg, *d_su, *d_sd;
+    /* CUDA: device copies of this layer's int4 routed-expert blobs (fused expert
+     * runs on the GPU when non-NULL; NULL = CPU int4 path). All-or-nothing per
+     * layer — the whole [E,...] blob uploads or none of it does. */
+    void  *d_gu_q, *d_dn_q; float *d_gu_s, *d_dn_s;
 } Layer;
 
 typedef struct {
@@ -421,6 +437,24 @@ static void model_load(Model *m, const char *snap) {
                 snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.gate_up_proj.qs", i);  L->gu_s = load_t(m, nm);
                 snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj", i);        L->dn_q = load_u8(m, nm);
                 snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.down_proj.qs", i);     L->dn_s = load_t(m, nm);
+#ifdef COLI_CUDA
+                if (g_cuda) {   /* cache this layer's experts in VRAM if they fit */
+                    int64_t E = c->n_experts, I = c->moe_inter;
+                    size_t gub = (size_t)E * (2 * I) * (D / 2), dnb = (size_t)E * D * (I / 2);
+                    size_t gus = (size_t)E * 2 * I * 4, dns = (size_t)E * D * 4;
+                    size_t need = gub + dnb + gus + dns;
+                    size_t cap = getenv("CUDA_EXPERT_GB") ? (size_t)(atof(getenv("CUDA_EXPERT_GB")) * 1e9) : (size_t)-1;
+                    if (lag_cuda_free_bytes() > need + g_cuda_headroom && g_exp_gpu_gb * 1e9 + need <= cap) {
+                        L->d_gu_q = lag_cuda_upload(L->gu_q, gub); L->d_gu_s = (float*)lag_cuda_upload(L->gu_s, gus);
+                        L->d_dn_q = lag_cuda_upload(L->dn_q, dnb); L->d_dn_s = (float*)lag_cuda_upload(L->dn_s, dns);
+                        if (L->d_gu_q && L->d_gu_s && L->d_dn_q && L->d_dn_s) { g_exp_gpu_layers++; g_exp_gpu_gb += need / 1e9; }
+                        else {   /* partial upload (OOM mid-layer): drop back to CPU for this layer */
+                            lag_cuda_free(L->d_gu_q); lag_cuda_free(L->d_gu_s); lag_cuda_free(L->d_dn_q); lag_cuda_free(L->d_dn_s);
+                            L->d_gu_q = L->d_dn_q = NULL; L->d_gu_s = L->d_dn_s = NULL;
+                        }
+                    }
+                }
+#endif
             } else {
                 L->eg = malloc(c->n_experts * sizeof(float*)); L->eu = malloc(c->n_experts * sizeof(float*)); L->ed = malloc(c->n_experts * sizeof(float*));
                 for (int e = 0; e < c->n_experts; e++) {
@@ -592,7 +626,16 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
                 for (int i = 0; i < D; i++) acc[i] = 0;
                 for (int a = 0; a < K; a++) {
                     int e = sel[a];
-                    if (m->xq) {   /* int4 container: fused gate_up + down */
+                    int done = 0;
+#ifdef COLI_CUDA
+                    if (m->xq && L->d_gu_q) {   /* fused expert entirely on the GPU (VRAM-resident layer) */
+                        done = (lag_cuda_expert_q4(scr, xn + t * D,
+                                    (const uint8_t*)L->d_gu_q + (int64_t)(e * 2 * I) * (D / 2), L->d_gu_s + (int64_t)e * 2 * I,
+                                    (const uint8_t*)L->d_dn_q + (int64_t)(e * D) * (I / 2), L->d_dn_s + (int64_t)e * D, I, D) == 0);
+                    }
+#endif
+                    if (done) { /* scr filled by GPU */ }
+                    else if (m->xq) {   /* int4 container: fused gate_up + down (CPU) */
                         matmul_q4(gu, xn + t * D, L->gu_q + (int64_t)(e * 2 * I) * (D / 2), L->gu_s + (int64_t)e * 2 * I, D, 2 * I);
                         for (int i = 0; i < I; i++) gu[i] = siluf(gu[i]) * gu[I + i];
                         matmul_q4(scr, gu, L->dn_q + (int64_t)(e * D) * (I / 2), L->dn_s + (int64_t)e * D, I, D);
@@ -824,6 +867,7 @@ int main(int argc, char **argv) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
         if (lag_cuda_init(dev) == 0) { g_cuda = 1;
             if (getenv("LAG_GPU_MINEL")) g_gpu_minel = strtoll(getenv("LAG_GPU_MINEL"), NULL, 10);
+            if (getenv("CUDA_HEADROOM_MB")) g_cuda_headroom = (size_t)atoll(getenv("CUDA_HEADROOM_MB")) << 20;
             fprintf(stderr, "[cuda] device %d up, %.1f GB VRAM free, offload minel=%lld\n", dev, lag_cuda_free_bytes() / 1e9, (long long)g_gpu_minel); }
         else fprintf(stderr, "[cuda] init failed — CPU only\n");
     }
@@ -831,7 +875,11 @@ int main(int argc, char **argv) {
     Model m; model_load(&m, snap);
     printf("== Laguna C engine (Stage A, %s) ==\n", m.xq ? "int4 container" : "f32");
 #ifdef COLI_CUDA
-    if (g_cuda) printf("CUDA: bf16 residents in VRAM (experts stay CPU int4) | %.1f GB VRAM free\n", lag_cuda_free_bytes() / 1e9);
+    if (g_cuda) {
+        int moe = 0; for (int i = 0; i < m.c.n_layers; i++) moe += m.c.is_moe[i];
+        printf("CUDA: bf16 residents + %d/%d MoE layers' experts in VRAM (%.1f GB experts) | %.1f GB VRAM free\n",
+               g_exp_gpu_layers, moe, g_exp_gpu_gb, lag_cuda_free_bytes() / 1e9);
+    }
 #endif
     printf("cfg: D=%d L=%d kv=%d hd=%d V=%d E=%d+1 topk=%d moe_I=%d win=%d g_rdim=%d(scale %.4f) s_rdim=%d\n",
            m.c.hidden, m.c.n_layers, m.c.n_kv, m.c.head_dim, m.c.vocab, m.c.n_experts, m.c.topk,
