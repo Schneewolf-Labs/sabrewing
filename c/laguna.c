@@ -35,6 +35,7 @@
 #include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
 #include "moe_arch.h"          /* MoeDesc, MoeHooks (descriptor-driven MoE block) */
 #include "moe_block.h"         /* moe_block (shared route/top-k/combine) */
+#include "moe_attn.h"          /* sdpa_head (shared scaled-dot-product attention) */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -489,23 +490,12 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             int pos = pos0 + t;
             int j0 = (win > 0 && pos - win + 1 > 0) ? pos - win + 1 : 0;   /* sliding window */
             float *att = falloc(pos - j0 + 1);
-            for (int hh = 0; hh < H; hh++) {
-                int kh = hh / group;
-                const float *q = Q + ((int64_t)t * H + hh) * hd;
-                int m0 = 0;
-                for (int j = j0; j <= pos; j++) {                 /* attend cached K [j0..pos] */
-                    const float *k = Kc + ((int64_t)j * nkv + kh) * hd;
-                    double s = 0; for (int d = 0; d < hd; d++) s += (double)q[d] * k[d];
-                    att[m0++] = (float)s * scaling;
-                }
-                softmax_row(att, m0);
-                float *ao = AO + ((int64_t)t * H + hh) * hd;
-                for (int d = 0; d < hd; d++) ao[d] = 0;
-                for (int j = j0, mi = 0; j <= pos; j++, mi++) {
-                    const float *v = Vc + ((int64_t)j * nkv + kh) * hd;
-                    float a = att[mi];
-                    for (int d = 0; d < hd; d++) ao[d] += a * v[d];
-                }
+            for (int hh = 0; hh < H; hh++) {   /* attend cached K/V [j0..pos] (shared SDPA) */
+                int kh = hh / group;                       /* GQA: this head's KV head */
+                /* laguna's contract: scale 1/sqrt(hd), no rel-bias/tau, QK in double.
+                 * cache is [pos][kv-head][hd] so this head's rows stride by nkv*hd. */
+                sdpa_head(Q + ((int64_t)t * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
+                          hd, j0, pos, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)t * H + hh) * hd, att);
             }
             free(att);
         }

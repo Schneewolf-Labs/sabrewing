@@ -41,6 +41,7 @@
 #include "moe_sample.h"        /* g_rng, rng_next, sample_logits (temp/top-p) */
 #include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
 #include "moe_arch.h"          /* moe_topk (shared top-K expert selection) */
+#include "moe_attn.h"          /* sdpa_head (shared scaled-dot-product attention) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -959,25 +960,13 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     double en = (double)(qpos + 1) / c->log_floor;
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
-                const float *qv = q + (int64_t)s*qdim + h*hd;
+                /* inkling's contract: scale 1/hd, tau log-length factor, per-distance
+                 * relative-bias bank rl[dist<ext], QK in float. Cache is head-major
+                 * ([kv-head][pos][hd]) so this head's rows stride by hd. (shared SDPA) */
                 const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
-                for (int t = t0; t <= qpos; t++) {
-                    const float *kv = Kh + (int64_t)t*hd;
-                    float acc = 0.f;
-                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
-                    int dist = qpos - t;
-                    sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
-                }
-                int n = qpos - t0 + 1;
-                softmax_row(sc, n);
-                float *cx = ctx + (int64_t)s*qdim + h*hd;
-                for (int d = 0; d < hd; d++) cx[d] = 0.f;
                 const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
-                for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = Vh + (int64_t)t*hd;
-                    float a = sc[t - t0];
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
-                }
+                sdpa_head(q + (int64_t)s*qdim + h*hd, Kh, Vh, hd, hd, t0, qpos, scale, tau,
+                          rl, ext, 0, ctx + (int64_t)s*qdim + h*hd, sc);
             }
         }
         free(rl); free(sc);
