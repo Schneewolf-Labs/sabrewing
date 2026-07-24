@@ -416,7 +416,7 @@ static void kv_free(KVCache *kv, int L) { for (int l = 0; l < L; l++) { free(kv-
 /* ---------- MoE block hooks (moe_arch.h / moe_block.h) ----------
  * laguna's weight-layout-specific ops behind the shared moe_block interface.
  * ctx carries the layer + per-layer scratch (allocated once in forward). */
-typedef struct { Model *m; Layer *L; int I, D; float *gu, *eg, *eu, *sg, *su; } LagMoeCtx;
+typedef struct { Model *m; Layer *L; int I, D; float *gu, *eg, *eu, *sg, *su, *scr; } LagMoeCtx;
 static void lag_router(void *cx, const float *x, float *lg) {
     LagMoeCtx *c = cx; matmul(lg, x, c->L->router, c->D, c->m->c.n_experts);
 }
@@ -445,6 +445,21 @@ static void lag_shared(void *cx, const float *x, float *out) {
     resmm(c->su, x, L->su, L->d_su, D, SI);
     for (int i = 0; i < SI; i++) c->sg[i] = siluf(c->sg[i]) * c->su[i];
     resmm(out, c->sg, L->sd, L->d_sd, SI, D);
+}
+/* acc[D] = sum_k w[k]*expert(sel[k], x). For a VRAM-resident layer, all K experts
+ * run in ONE GPU submission (one sync instead of K) — the decode win. Otherwise
+ * (CPU int4 / f32) it's the per-expert loop, bit-identical to the block default. */
+static void lag_expert_batch(void *cx, const int *sel, const float *w, int K, const float *x, float *acc) {
+    LagMoeCtx *c = cx; int D = c->D;
+#ifdef COLI_CUDA
+    Model *m = c->m; Layer *L = c->L;
+    if (m->xq && L->d_gu_q &&
+        lag_cuda_moe_experts(acc, x, L->d_gu_q, L->d_gu_s, L->d_dn_q, L->d_dn_s, sel, w, K, c->I, D) == 0) return;
+#endif
+    for (int a = 0; a < K; a++) {
+        lag_expert(c, sel[a], x, c->scr);
+        for (int i = 0; i < D; i++) acc[i] += w[a] * c->scr[i];
+    }
 }
 
 /* process S tokens at absolute positions pos0..pos0+S-1, appending K/V to the
@@ -545,11 +560,11 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             /* sigmoid loss-free routing, corr-bias selection, norm_topk, routed
              * *route_scale, one always-on unscaled shared expert (see moe-arch-survey). */
             int I = c->moe_inter, SI = c->shared_inter;
-            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI) };
+            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI), falloc(D) };
             MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
-            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared };
+            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared, lag_expert_batch };
             for (int t = 0; t < n; t++) moe_block(&desc, &hooks, xn + t * D, h + t * D, D);
-            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su);
+            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su); free(lc.scr);
         }
     }
     for (int t = 0; t < S; t++) rmsnorm_row(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);

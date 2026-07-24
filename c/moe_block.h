@@ -31,9 +31,13 @@ static void moe_block(const MoeDesc *d, const MoeHooks *h, const float *x, float
     if (d->norm_topk) { float sm = 0; for (int a = 0; a < K; a++) sm += w[a]; for (int a = 0; a < K; a++) w[a] /= sm; }
 
     for (int i = 0; i < D; i++) acc[i] = 0;
-    for (int a = 0; a < K; a++) {
-        h->expert(h->ctx, sel[a], x, scr);
-        for (int i = 0; i < D; i++) acc[i] += w[a] * scr[i];
+    if (h->expert_batch) {                          /* engine batches all K (e.g. one GPU submission) */
+        h->expert_batch(h->ctx, sel, w, K, x, acc);
+    } else {
+        for (int a = 0; a < K; a++) {
+            h->expert(h->ctx, sel[a], x, scr);
+            for (int i = 0; i < D; i++) acc[i] += w[a] * scr[i];
+        }
     }
     for (int i = 0; i < D; i++) acc[i] *= d->route_scale;
 

@@ -47,6 +47,10 @@ typedef struct {
     const float *corr_bias;                                       /* [n_experts], NULL if unused */
     void (*expert)(void *ctx, int e, const float *x, float *out); /* routed expert e -> out[D] */
     void (*shared)(void *ctx, const float *x, float *out);        /* shared expert -> out[D] (mode!=NONE) */
+    /* Optional: compute the whole weighted routed sum acc[D] = sum_k w[k]*expert(sel[k],x)
+     * in one shot. Lets an engine batch the K experts (e.g. one GPU submission instead
+     * of K per-expert syncs). NULL -> the block loops `expert` per selection. */
+    void (*expert_batch)(void *ctx, const int *sel, const float *w, int K, const float *x, float *acc);
 } MoeHooks;
 
 /* Top-K distinct expert selection: pick the K highest (score[e] + optional
