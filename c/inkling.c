@@ -34,6 +34,7 @@
 #include "st.h"
 #include "lora.h"
 #include "tok.h"
+#include "moe_util.h"          /* falloc, jnum, read_int_array */
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
 #include "moe_quant.h"         /* matmul_q4_k + i8dot_block (shared int4 GEMV) */
@@ -142,7 +143,7 @@ typedef struct {
 
 /* ---------- utility ---------- */
 /* now_s, rss_gb, siluf, bf16_f32, softplusf, rmsnorm_row are shared (moe_math.h). */
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+/* falloc is shared (moe_util.h). */
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
@@ -249,10 +250,7 @@ static void sconv_apply(float *seq, int S, int C, const float *w, float *state, 
 /* ---------- config loading ----------
  * Accepts both the flat text config (tiny oracle via InklingForCausalLM) and
  * the full multimodal config.json (real checkpoint, fields under text_config). */
-static double jnum(jval *o, const char *k, double dflt) {
-    jval *v = json_get(o, k);
-    return (v && v->t == J_NUM) ? v->num : dflt;
-}
+/* jnum is shared (moe_util.h). */
 
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
@@ -1689,13 +1687,7 @@ static void serve_loop(Model *m, Tok *T) {
 }
 
 /* ---------- ref_inkling.json harness ---------- */
-static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
-}
+/* read_int_array is shared (moe_util.h). */
 
 int main(int argc, char **argv) {
     /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the

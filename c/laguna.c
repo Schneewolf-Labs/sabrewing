@@ -27,6 +27,7 @@
 #include "st.h"
 #include "tok.h"
 #include "json.h"
+#include "moe_util.h"          /* falloc, jnum, read_int_array */
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
 #include "moe_quant.h"         /* matmul_q4_k (shared int4 GEMV, f32/idot contracts) */
@@ -108,7 +109,6 @@ typedef struct {
 } Model;
 
 /* ---------- math ---------- */
-static float *falloc(int64_t n) { float *p = malloc(n * sizeof(float)); if (!p) { fprintf(stderr, "OOM %lld\n", (long long)n); exit(1); } return p; }
 /* g_exact: force the double-accumulate reference kernels (bit-exact vs the oracle).
  * Generation defaults to the AVX-512 float path (within quant noise, ~SIMD-fast). */
 static int g_exact = 0;
@@ -153,8 +153,6 @@ static void matmul_q4(float *y, const float *x, const uint8_t *packed, const flo
 /* rmsnorm_row, siluf, softplusf, softmax_row are shared (moe_math.h). */
 
 /* ---------- config ---------- */
-static double jnum(jval *o, const char *k, double d) { jval *v = json_get(o, k); return (v && v->t == J_NUM) ? v->num : d; }
-
 /* YaRN inv_freq + attention scaling (mirrors transformers _compute_yarn_parameters) */
 static void yarn_rope(Cfg *c, float base, float factor, int orig_max, float beta_fast, float beta_slow, int head_dim, float partial) {
     int dim = (int)(head_dim * partial);   /* rotary dim */
@@ -626,13 +624,7 @@ static void serve_loop(Model *m, Tok *T) {
 }
 
 /* ---------- oracle harness ---------- */
-static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
-}
+/* falloc, jnum, read_int_array are shared (moe_util.h). */
 #ifdef COLI_CUDA
 /* Kernel-level validation: random data through the CPU kernels and the GPU
  * kernels, reporting max abs / max relative difference. bf16 & q4 should agree
