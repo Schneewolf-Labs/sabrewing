@@ -149,9 +149,14 @@ static void resmm(float *y, const float *x, const void *W, const void *Wdev, int
     else matmul(y, x, (const float*)W, I, O);
 }
 /* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
-/* int4 experts use the shared kernel at laguna's contract (f32 activations). */
+/* int4 experts (the CPU tier). Default = f32 activations (accurate). LAG_IDOT=1
+ * switches to the int8-activation VNNI path (~2x faster, ~0.4% quant noise) for
+ * the CPU-resident expert layers — the decode bottleneck when most layers are on
+ * the GPU. g_exact always forces f32 (the oracle stays exact). */
 static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
-    matmul_q4_k(y, x, packed, scale, I, O, MOE_Q4_F32, g_exact);
+    static int idot = -1;
+    if (idot < 0) idot = getenv("LAG_IDOT") ? 1 : 0;
+    matmul_q4_k(y, x, packed, scale, I, O, (idot && !g_exact) ? MOE_Q4_IDOT : MOE_Q4_F32, g_exact);
 }
 /* rmsnorm_row, siluf, softplusf, softmax_row are shared (moe_math.h). */
 
