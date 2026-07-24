@@ -64,3 +64,4 @@ stats*.txt
 !web/dist/**
 c/laguna
 c/tiny_laguna/
+c/kernel-check

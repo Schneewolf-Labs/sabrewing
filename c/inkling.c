@@ -36,6 +36,7 @@
 #include "tok.h"
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
+#include "moe_quant.h"         /* matmul_q4_k + i8dot_block (shared int4 GEMV) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -220,18 +221,7 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
 /* y[1,O] = x @ q^T, int8 weights + per-row scale. Fast path: activations
  * quantized Q8 per 32-block, VNNI (or maddubs) int8 dot — same family as
  * glm.c's IDOT kernels; IDOT=0 falls back to the byte-exact scalar route. */
-#if defined(__AVX2__)
-static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
-    __m256i ax = _mm256_sign_epi8(a, a);        /* |a| as u8 */
-    __m256i sy = _mm256_sign_epi8(b, a);        /* b * sign(a) */
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    return _mm256_dpbusd_epi32(acc, ax, sy);
-#else
-    __m256i p = _mm256_maddubs_epi16(ax, sy);
-    return _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_set1_epi16(1)));
-#endif
-}
-#endif
+/* i8dot_block is shared (moe_quant.h). */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__AVX2__)
     static int idot = -1;
@@ -273,60 +263,12 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     }
 }
 
-/* y[1,O] = x @ W^T with W kept PACKED int4 (low nibble = even column, +8
- * offset, per-row scale — the on-disk container layout, cached as-is).
- * Nibbles unpack in-register: same numeric result as unpack-to-int8 +
- * matmul_q, half the cache footprint. IDOT=0 keeps the byte-exact scalar. */
+/* int4 experts use the shared kernel at inkling's contract (int8 activation quant
+ * + VNNI dot by default; IDOT=0 selects the f32/scalar route). See moe_quant.h. */
 static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
-#if defined(__AVX2__)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 32 == 0 && I <= 8192) {
-        int nb = I / 32;
-        int8_t xi[8192]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*32;
-            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        const __m128i m4 = _mm_set1_epi8(0x0F);
-        const __m256i b8 = _mm256_set1_epi8(8);
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *w = p + (int64_t)o * (I/2);
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) {
-                __m128i by = _mm_loadu_si128((const __m128i*)(w + b*16));  /* 16 B = 32 nibbles */
-                __m128i lo = _mm_and_si128(by, m4);                        /* even columns */
-                __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);     /* odd columns  */
-                __m256i nib = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),  /* cols 16..31 */
-                                               _mm_unpacklo_epi8(lo, hi)); /* cols  0..15 */
-                nib = _mm256_sub_epi8(nib, b8);
-                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
-                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)), nib);
-                __m128i l = _mm256_castsi256_si128(vacc), h = _mm256_extracti128_si256(vacc, 1);
-                __m128i s4 = _mm_add_epi32(l, h);
-                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
-                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
-            }
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = p + (int64_t)o * (I/2);
-        float acc = 0.f;
-        for (int i = 0; i < I; i += 2) {
-            uint8_t byte = w[i/2];
-            acc += x[i]   * (float)((int)(byte & 0xF) - 8);
-            acc += x[i+1] * (float)((int)(byte >> 4)  - 8);
-        }
-        y[o] = acc * scale[o];
-    }
+    matmul_q4_k(y, x, p, scale, I, O, idot ? MOE_Q4_IDOT : MOE_Q4_F32, 0);
 }
 
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {

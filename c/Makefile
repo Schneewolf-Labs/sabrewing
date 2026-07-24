@@ -295,6 +295,13 @@ inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h $(INK_CUDA_OBJ)
 laguna$(EXE): laguna.c st.h tok.h json.h compat.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) laguna.c $(LAG_CUDA_OBJ) -o laguna$(EXE) $(LDFLAGS)
 
+# MoE-runtime shared-kernel harness: validates moe_quant.h against a double
+# dequant reference (the quant kernels the f32 oracle can't cover). See
+# docs/moe-runtime-plan.md.
+kernel-check$(EXE): tools/kernel_check.c moe_quant.h
+	$(CC) $(CFLAGS) tools/kernel_check.c -o kernel-check$(EXE) $(LDFLAGS)
+	./kernel-check$(EXE)
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
