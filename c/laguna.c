@@ -30,6 +30,8 @@
 #include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
 #include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
 #include "moe_quant.h"         /* matmul_q4_k (shared int4 GEMV, f32/idot contracts) */
+#include "moe_sample.h"        /* g_rng, rng_next, sample_logits (temp/top-p) */
+#include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -575,44 +577,8 @@ static void compute_logits(Model *m, const float *h_pos, float *lg) {
  * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n / CANCEL <id>\n
  * stdout: READY sentinel + STAT, then per request DATA <id> <n>\n<bytes>\n frames and
  *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <limited>\n + PROF.  */
-static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
-static double rng_next(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (double)(g_rng >> 11) / 9007199254740992.0; }
-typedef struct { float p; int i; } PI;
-static int pi_desc(const void *a, const void *b) { float d = ((const PI*)b)->p - ((const PI*)a)->p; return d > 0 ? 1 : d < 0 ? -1 : 0; }
-static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    int best = 0; for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
-    if (temp <= 0.f) return best;
-    PI *c = malloc((size_t)n * sizeof(PI)); double sum = 0;
-    for (int i = 0; i < n; i++) { c[i].p = expf((logit[i] - logit[best]) / temp); c[i].i = i; sum += c[i].p; }
-    qsort(c, n, sizeof(PI), pi_desc);
-    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum, acc = 0; int k = 0;
-    while (k < n && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0; int pick = c[0].i;
-    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
-    free(c); return pick;
-}
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
-#define SRV_QMAX 16
-static SReq g_q[SRV_QMAX]; static int g_qn = 0;
-static int stdin_readable(void) { fd_set r; struct timeval tv = {0, 0}; FD_ZERO(&r); FD_SET(0, &r); return select(1, &r, NULL, NULL, &tv) > 0; }
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 || plen < 0 || plen > (1 << 22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        int nl = fgetc(stdin); (void)nl; pl[plen] = 0;
-        if (g_qn < SRV_QMAX) { SReq *q = &g_q[g_qn++]; snprintf(q->id, sizeof(q->id), "%s", id); q->max_tok = max_tok; q->temp = temp; q->top_p = top_p; q->payload = pl; q->plen = plen; }
-        else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
-    }
-    return 0;
-}
+/* g_rng, rng_next, PI, pi_desc, sample_logits are shared (moe_sample.h). */
+/* SReq, SRV_QMAX, g_q/g_qn, stdin_readable, serve_read_cmd are shared (moe_serve.h). */
 static void serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c; int D = c->hidden;
     int cap = q->plen + 16; int *ids = malloc((size_t)cap * sizeof(int));
