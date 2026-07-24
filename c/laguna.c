@@ -152,6 +152,23 @@ static void resmm(float *y, const float *x, const void *W, const void *Wdev, int
     else if (g_res_dt == 1) matmul_bf16(y, x, (const uint16_t*)W, I, O);
     else matmul(y, x, (const float*)W, I, O);
 }
+/* Batched resident GEMM: y[S,O] = x[S,I] @ W^T over S rows at once — reads the
+ * weight ONCE for all S (the whole point of batched decode: amortize the resident
+ * bandwidth across S concurrent streams). Per-row identical to resmm at S=1. */
+static void resmm_b(float *y, const float *x, const void *W, const void *Wdev, int S, int I, int O) {
+#ifdef COLI_CUDA
+    if (Wdev && !g_exact) {
+        int rc = (g_res_dt == 2) ? lag_cuda_matmul_q8(y, x, Wdev, S, I, O)
+                                 : lag_cuda_matmul_bf16(y, x, Wdev, S, I, O);
+        if (rc == 0) return;
+    }
+#else
+    (void)Wdev;
+#endif
+    if (g_res_dt == 2) { for (int s = 0; s < S; s++) matmul_q8(y + (int64_t)s * O, x + (int64_t)s * I, W, I, O); }
+    else if (g_res_dt == 1) matmul_bf16_k(y, x, (const uint16_t*)W, S, I, O, 0, g_exact);
+    else matmul_f32(y, x, (const float*)W, S, I, O, g_exact);
+}
 /* y[O] = x[I] @ dequant(packed)^T; packed [O,I/2] int4 (nibble-8)*scale[o] */
 /* int4 experts (the CPU tier). Default = f32 activations (accurate). LAG_IDOT=1
  * switches to the int8-activation VNNI path (~2x faster, ~0.4% quant noise) for
@@ -571,6 +588,97 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
     if (pos0 + S > kv->len) kv->len = pos0 + S;
     free(h); free(xn); free(scr);
 }
+
+/* Batched DECODE: B independent sequences, one token each, each at its own
+ * position with its own KV cache (kvs[b]). The RESIDENT matmuls run batched over
+ * B (resmm_b: one weight read for B streams — the throughput lever); attention and
+ * MoE stay per-sequence. h_out[B*D] gets each stream's post-final-norm state.
+ * Per-stream identical to forward() at S=1, so B copies of a prompt reproduce the
+ * single-stream output exactly. */
+static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float *h_out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
+    int *pos = malloc((size_t)B * sizeof(int));
+    for (int b = 0; b < B; b++) pos[b] = kvs[b]->len;
+    float *h = falloc((int64_t)B * D);
+    for (int b = 0; b < B; b++) {
+        if (m->res_dt == 2) { const int8_t *q = (const int8_t*)m->embed + (int64_t)ids[b] * D;
+            float s = ((const float*)((const int8_t*)m->embed + (int64_t)c->vocab * D))[ids[b]];
+            for (int i = 0; i < D; i++) h[b * D + i] = q[i] * s; }
+        else if (m->res_dt == 1) { const uint16_t *e = (const uint16_t*)m->embed + (int64_t)ids[b] * D;
+            for (int i = 0; i < D; i++) h[b * D + i] = bf16_f32(e[i]); }
+        else memcpy(h + b * D, (const float*)m->embed + (int64_t)ids[b] * D, D * sizeof(float));
+    }
+    float *xn = falloc((int64_t)B * D);
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *L = &m->L[li];
+        int H = c->heads[li], group = H / nkv;
+        int rdim = c->is_sliding[li] ? c->s_rdim : c->g_rdim;
+        const float *inv = c->is_sliding[li] ? c->s_inv : c->g_inv;
+        float rscale = c->is_sliding[li] ? c->s_scale : c->g_scale;
+        int win = c->is_sliding[li] ? c->sliding_window : 0;
+        float *Q = falloc((int64_t)B * H * hd), *Kt = falloc((int64_t)B * nkv * hd);
+        float *Vt = falloc((int64_t)B * nkv * hd), *AO = falloc((int64_t)B * H * hd);
+        for (int b = 0; b < B; b++) rmsnorm_row(xn + b * D, h + b * D, L->ln1, D, c->rms_eps);
+        resmm_b(Q,  xn, L->wq, L->d_wq, B, D, H * hd);      /* batched: one weight read for B */
+        resmm_b(Kt, xn, L->wk, L->d_wk, B, D, nkv * hd);
+        resmm_b(Vt, xn, L->wv, L->d_wv, B, D, nkv * hd);
+        for (int b = 0; b < B; b++) {                       /* per-seq qk-norm + rope + store K/V */
+            for (int hh = 0; hh < H; hh++) { float *q = Q + ((int64_t)b * H + hh) * hd;
+                rmsnorm_row(q, q, L->qn, hd, c->rms_eps); rope_apply(q, pos[b], inv, rdim, rscale); }
+            float *kt = kvs[b]->k[li] + (int64_t)pos[b] * nkv * hd;
+            float *vt = kvs[b]->v[li] + (int64_t)pos[b] * nkv * hd;
+            memcpy(kt, Kt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
+            memcpy(vt, Vt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
+            for (int hh = 0; hh < nkv; hh++) { float *k = kt + hh * hd;
+                rmsnorm_row(k, k, L->kn, hd, c->rms_eps); rope_apply(k, pos[b], inv, rdim, rscale); }
+        }
+        float scaling = 1.f / sqrtf((float)hd);
+        #pragma omp parallel for schedule(dynamic) if(B > 1)
+        for (int b = 0; b < B; b++) {                       /* attention: each seq over its own cache */
+            int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
+            float *att = falloc(p - j0 + 1);
+            float *Kc = kvs[b]->k[li], *Vc = kvs[b]->v[li];
+            for (int hh = 0; hh < H; hh++) {
+                int kh = hh / group;
+                sdpa_head(Q + ((int64_t)b * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
+                          hd, j0, p, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)b * H + hh) * hd, att);
+            }
+            free(att);
+        }
+        float *gate = falloc((int64_t)B * H);
+        resmm_b(gate, xn, L->wg, L->d_wg, B, D, H);         /* softplus output gate */
+        for (int b = 0; b < B; b++) for (int hh = 0; hh < H; hh++) {
+            float gv = softplusf(gate[(int64_t)b * H + hh]);
+            float *ao = AO + ((int64_t)b * H + hh) * hd; for (int d = 0; d < hd; d++) ao[d] *= gv;
+        }
+        float *ao_out = falloc((int64_t)B * D);
+        resmm_b(ao_out, AO, L->wo, L->d_wo, B, H * hd, D);  /* batched o_proj */
+        for (int b = 0; b < B; b++) for (int i = 0; i < D; i++) h[b * D + i] += ao_out[b * D + i];
+        for (int b = 0; b < B; b++) rmsnorm_row(xn + b * D, h + b * D, L->ln2, D, c->rms_eps);
+        if (!c->is_moe[li]) {                               /* dense MLP (layer 0), per-seq */
+            int I = c->dense_inter; float *g = falloc(I), *u = falloc(I), *scr = falloc(D);
+            for (int b = 0; b < B; b++) {
+                resmm(g, xn + b * D, L->gate, L->d_gate, D, I); resmm(u, xn + b * D, L->up, L->d_up, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                resmm(scr, g, L->down, L->d_down, I, D);
+                for (int i = 0; i < D; i++) h[b * D + i] += scr[i];
+            }
+            free(g); free(u); free(scr);
+        } else {                                            /* MoE, per-seq (shared moe_block) */
+            int I = c->moe_inter, SI = c->shared_inter;
+            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI), falloc(D) };
+            MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
+            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared, lag_expert_batch };
+            for (int b = 0; b < B; b++) moe_block(&desc, &hooks, xn + b * D, h + b * D, D);
+            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su); free(lc.scr);
+        }
+        free(Q); free(Kt); free(Vt); free(AO); free(gate); free(ao_out);
+    }
+    for (int b = 0; b < B; b++) rmsnorm_row(h_out + b * D, h + b * D, m->final_norm, D, c->rms_eps);
+    for (int b = 0; b < B; b++) kvs[b]->len = pos[b] + 1;
+    free(h); free(xn); free(pos);
+}
 static int argmax_logits(Model *m, const float *h_pos, int *unused) {
     (void)unused; int V = m->c.vocab, D = m->c.hidden;
     float *lg = falloc(V); resmm(lg, h_pos, m->lm_head, m->d_lm_head, D, V);
@@ -758,6 +866,51 @@ int main(int argc, char **argv) {
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
         serve_loop(&m, &T);
+        return 0;
+    }
+
+    /* ---- BATCH throughput bench: decode B copies of the prompt concurrently ----
+     * proves the batched-serving thesis (residents read once for B streams). All B
+     * streams must reproduce the single-stream greedy output identically. */
+    if (prompt && getenv("BATCH")) {
+        int B = atoi(getenv("BATCH")); if (B < 1) B = 1;
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        int plen = (int)strlen(prompt), cap = plen + 16;
+        int *seq = malloc((size_t)(cap + n_new) * sizeof(int));
+        int np = tok_encode(&T, prompt, plen, seq, cap);
+        if (np <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
+        int D = m.c.hidden, V = m.c.vocab;
+        KVCache **kvs = malloc((size_t)B * sizeof(KVCache*));
+        int *cur = malloc((size_t)B * sizeof(int));
+        float *Hp = falloc((int64_t)np * D);
+        double tp = now_s();
+        for (int b = 0; b < B; b++) {   /* prefill each stream with the same prompt */
+            kvs[b] = malloc(sizeof(KVCache)); kv_init(kvs[b], &m, np + n_new + 8);
+            forward(&m, kvs[b], seq, np, 0, Hp);
+            cur[b] = argmax_logits(&m, Hp + (int64_t)(np - 1) * D, NULL);
+        }
+        free(Hp);
+        printf("[BATCH=%d, %d prompt tok, prefill %.1fs] decoding...\n", B, np, now_s() - tp); fflush(stdout);
+        float *Hd = falloc((int64_t)B * D), *lg = falloc((int64_t)B * V);
+        int **out = malloc((size_t)B * sizeof(int*)); for (int b = 0; b < B; b++) out[b] = malloc((size_t)n_new * sizeof(int));
+        double t1 = now_s(); int gen = 0;
+        for (int s = 0; s < n_new; s++) {
+            forward_batch(&m, kvs, cur, B, Hd);
+            resmm_b(lg, Hd, m.lm_head, m.d_lm_head, B, D, V);      /* batched lm_head */
+            for (int b = 0; b < B; b++) {
+                const float *l = lg + (int64_t)b * V; int best = 0;
+                for (int v = 1; v < V; v++) if (l[v] > l[best]) best = v;
+                cur[b] = best; out[b][s] = best;
+            }
+            gen++;
+        }
+        double dt = now_s() - t1;
+        int allmatch = 1;
+        for (int b = 1; b < B; b++) for (int s = 0; s < gen; s++) if (out[b][s] != out[0][s]) { allmatch = 0; break; }
+        printf("stream 0 tokens:"); for (int s = 0; s < (gen < 12 ? gen : 12); s++) printf(" %d", out[0][s]); printf("\n");
+        printf("BATCH=%d: %d streams x %d tok = %d total in %.2fs = %.2f tok/s AGGREGATE (%.2f/stream) | streams %s\n",
+               B, B, gen, B * gen, dt, B * gen / dt, gen / dt, allmatch ? "IDENTICAL (correct)" : "DIVERGED (BUG)");
         return 0;
     }
 
