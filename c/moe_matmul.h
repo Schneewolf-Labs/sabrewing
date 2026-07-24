@@ -17,6 +17,7 @@
 #ifndef MOE_MATMUL_H
 #define MOE_MATMUL_H
 #include <stdint.h>
+#include "moe_math.h"          /* bf16_f32 */
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -48,6 +49,73 @@ static void matmul_f32(float *y, const float *x, const float *W, int S, int I, i
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
             double sm = 0; for (int i = 0; i < I; i++) sm += (double)xs[i] * w[i];
+            y[(int64_t)s * O + o] = (float)sm;
+        }
+    }
+}
+
+/* bf16-weight GEMM: W is raw bf16 [O,I]. Two activation contracts:
+ *   round_x=0 — activations kept f32, weight expanded bf16->f32 EXACT, f32 FMA
+ *               (laguna's default; strictly more accurate).
+ *   round_x=1 — activations ALSO rounded to bf16, hardware vdpbf16ps dot where
+ *               available (inkling's default; matches an HF bf16-activations ref).
+ * exact forces the double-accumulate scalar reference (round_x=0 contract). For
+ * S=1 the round_x=0 SIMD path is bit-identical to laguna's old matmul_bf16; the
+ * round_x=1 dpbf16 path is bit-identical to inkling's matmul_h fast path. */
+static void matmul_bf16_k(float *y, const float *x, const uint16_t *W, int S, int I, int O, int round_x, int exact) {
+#if defined(__AVX512BF16__) && defined(__AVX512F__)
+    if (round_x && !exact && I % 32 == 0) {
+        uint16_t *xh = (uint16_t*)malloc((size_t)S * I * sizeof(uint16_t));
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I; uint16_t *xd = xh + (int64_t)s * I;
+            for (int i = 0; i < I; i += 32) {
+                __m512 a = _mm512_loadu_ps(xs + i), b = _mm512_loadu_ps(xs + i + 16);
+                _mm512_storeu_si512(xd + i, (__m512i)_mm512_cvtne2ps_pbh(b, a));
+            }
+        }
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *w = W + (int64_t)o * I;
+            for (int s = 0; s < S; s++) {
+                const uint16_t *xs = xh + (int64_t)s * I;
+                __m512 acc = _mm512_setzero_ps();
+                for (int i = 0; i < I; i += 32)
+                    acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
+                                                (__m512bh)_mm512_loadu_si512(w + i));
+                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
+            }
+        }
+        free(xh);
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
+    if (!exact) {   /* weight bf16->f32 exact, activations f32 */
+        #pragma omp parallel for schedule(static) if(O >= 512)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *w = W + (int64_t)o * I;
+            for (int s = 0; s < S; s++) {
+                const float *xs = x + (int64_t)s * I;
+                __m512 acc = _mm512_setzero_ps();
+                int i = 0;
+                for (; i + 16 <= I; i += 16) {
+                    __m512i we = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(w + i))), 16);
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i), _mm512_castsi512_ps(we), acc);
+                }
+                float sm = _mm512_reduce_add_ps(acc);
+                for (; i < I; i++) sm += xs[i] * bf16_f32(w[i]);
+                y[(int64_t)s * O + o] = sm;
+            }
+        }
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static) if(O >= 512)
+    for (int o = 0; o < O; o++) {
+        const uint16_t *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            double sm = 0; for (int i = 0; i < I; i++) sm += (double)xs[i] * bf16_f32(w[i]);
             y[(int64_t)s * O + o] = (float)sm;
         }
     }

@@ -12,8 +12,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include <stdint.h>
 #include "../moe_quant.h"
+#include "../moe_matmul.h"
+
+/* round f32 -> bf16 (round-to-nearest-even), as bf16 weights are stored */
+static uint16_t f2bf16(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7FFF + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
 
 /* quantize one row to int4 (nibble-8, per-row scale) — matches the converter's
  * quant_int4_rows (convert_laguna_int4.py). */
@@ -71,6 +76,22 @@ int main(void) {
     int bitexact = 1;
     for (int o = 0; o < O; o++) if (ye[o] != yref[o]) { bitexact = 0; break; }
     if (!bitexact) { printf("  FAIL: exact path not bit-identical to reference\n"); ok = 0; }
+
+    /* --- bf16 matmul_bf16_k: same random weights rounded to bf16 --- */
+    uint16_t *Wb = malloc((size_t)O * I * sizeof(uint16_t));
+    for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) Wb[(size_t)o * I + i] = f2bf16(W[(size_t)o * I + i]);
+    float *br = malloc((size_t)O * 4), *b0 = malloc((size_t)O * 4), *b1 = malloc((size_t)O * 4);
+    for (int o = 0; o < O; o++) {   /* reference: x(f32) . dequant(bf16 W), double accum */
+        const uint16_t *w = Wb + (size_t)o * I;
+        double s = 0; for (int i = 0; i < I; i++) { uint32_t u = (uint32_t)w[i] << 16; float wf; memcpy(&wf, &u, 4); s += (double)x[i] * wf; }
+        br[o] = (float)s;
+    }
+    matmul_bf16_k(b0, x, Wb, 1, I, O, 0, 0);   /* round_x=0: activations f32 (laguna) */
+    matmul_bf16_k(b1, x, Wb, 1, I, O, 1, 0);   /* round_x=1: activations bf16 (inkling) */
+    printf("bf16 matmul_bf16_k [%d->%d] vs double dequant reference:\n", I, O);
+    ok &= report("round_x=0 (f32 act)",  b0, br, O, 1e-3);   /* weight-only bf16, f32 acts */
+    ok &= report("round_x=1 (bf16 act)", b1, br, O, 1e-2);   /* + activation bf16 rounding */
+
     printf("%s\n", ok ? "KERNEL-CHECK PASS" : "KERNEL-CHECK FAIL");
     return !ok;
 }

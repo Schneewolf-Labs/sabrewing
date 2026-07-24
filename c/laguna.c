@@ -117,27 +117,10 @@ static void matmul(float *y, const float *x, const float *W, int I, int O) { mat
  * (top 16 bits), so the result equals matmul() on the f32-expanded weights but
  * reads half the bytes — the real container stores residents bf16. */
 static int g_res_dt = 0;   /* resident dtype: 0=f32 (tiny), 1=bf16 (real), 2=int8 (RES8) */
+/* bf16 residents use the shared kernel at laguna's contract (round_x=0: keep
+ * activations in f32, weight bf16->f32 exact). */
 static void matmul_bf16(float *y, const float *x, const uint16_t *W, int I, int O) {
-    #pragma omp parallel for schedule(static) if(O >= 512)
-    for (int o = 0; o < O; o++) {
-        const uint16_t *w = W + (int64_t)o * I;
-#if defined(__AVX512F__)
-        if (!g_exact) {
-            __m512 acc = _mm512_setzero_ps();
-            int i = 0;
-            for (; i + 16 <= I; i += 16) {
-                __m512i we = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(w + i))), 16);
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), _mm512_castsi512_ps(we), acc);
-            }
-            float s = _mm512_reduce_add_ps(acc);
-            for (; i < I; i++) s += x[i] * bf16_f32(w[i]);
-            y[o] = s;
-            continue;
-        }
-#endif
-        double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * bf16_f32(w[i]);
-        y[o] = (float)s;
-    }
+    matmul_bf16_k(y, x, W, 1, I, O, 0, g_exact);
 }
 /* int8 residents: W = [int8 O*I][f32 scale O] in one buffer (per-row scale).
  * ~lossless on residents (proven by inkling's Q8), 4 GB vs 8 GB bf16. */

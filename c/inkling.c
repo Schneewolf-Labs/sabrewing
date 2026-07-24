@@ -156,50 +156,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
 #include <immintrin.h>
 #endif
 
-/* bf16-weight matmul: activations rounded to bf16 per row (matches the HF
- * bf16 reference numerics), hardware vdpbf16ps dot where available,
- * shift-to-f32 scalar otherwise. */
+/* bf16-weight matmul at inkling's contract (round_x=1): activations rounded to
+ * bf16, vdpbf16ps where available (matches the HF bf16-activations reference),
+ * shift-to-f32 scalar otherwise. Shared kernel — see moe_matmul.h. */
 static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
-#ifdef HAVE_BF16_DOT
-    if (I % 32 == 0) {
-        uint16_t *xh = malloc((size_t)S * I * sizeof(uint16_t));
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            uint16_t *xd = xh + (int64_t)s * I;
-            for (int i = 0; i < I; i += 32) {
-                __m512 a = _mm512_loadu_ps(xs + i), b = _mm512_loadu_ps(xs + i + 16);
-                _mm512_storeu_si512(xd + i, (__m512i)_mm512_cvtne2ps_pbh(b, a));
-            }
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint16_t *w = W + (int64_t)o * I;
-            for (int s = 0; s < S; s++) {
-                const uint16_t *xs = xh + (int64_t)s * I;
-                __m512 acc = _mm512_setzero_ps();
-                for (int i = 0; i < I; i += 32)
-                    acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
-                                                (__m512bh)_mm512_loadu_si512(w + i));
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
-            }
-        }
-        free(xh);
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint16_t *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) {
-                union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
-                acc += xs[i] * v.f;
-            }
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
+    matmul_bf16_k(y, x, W, S, I, O, 1, 0);
 }
 
 /* dispatch on where the weight lives */
