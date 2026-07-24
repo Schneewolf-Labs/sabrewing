@@ -33,6 +33,13 @@
 #ifdef COLI_CUDA
 #include "backend_cuda_laguna.h"
 static int g_cuda = 0;              /* 1 = A6000 tier active (bf16 residents in VRAM) */
+/* Offload a resident matmul to the GPU only when its weight has >= this many
+ * elements (O*I). Default 0 = offload ALL residents: a sweep on the A6000 box
+ * showed offload-all (5.26 tok/s) beats a 6M threshold (4.74) — the spin-sync
+ * round-trip is cheap enough that the DDR5 bandwidth saved on even the small
+ * k/v/g/shared projections wins, so keeping any resident on the CPU only adds
+ * un-overlapped DDR5 reads. Kept as an env knob (LAG_GPU_MINEL) for other GPUs. */
+static int64_t g_gpu_minel = 0;
 #endif
 
 #define MAXL 128
@@ -392,7 +399,7 @@ static void model_load(Model *m, const char *snap) {
 /* DEV: upload a just-loaded bf16 resident to VRAM (nm still holds its name).
  * Only for the real bf16 container with the GPU tier up; else NULL (CPU path). */
 #ifdef COLI_CUDA
-#define DEV(field) do { L->d_##field = (g_cuda && g_res_dt == 1) ? lag_cuda_upload(L->field, (size_t)st_numel(&m->S, nm) * 2) : NULL; } while (0)
+#define DEV(field) do { int64_t _ne = st_numel(&m->S, nm); L->d_##field = (g_cuda && g_res_dt == 1 && _ne >= g_gpu_minel) ? lag_cuda_upload(L->field, (size_t)_ne * 2) : NULL; } while (0)
 #else
 #define DEV(field) do {} while (0)
 #endif
@@ -815,7 +822,9 @@ int main(int argc, char **argv) {
     /* bring up the A6000 tier before load so bf16 residents upload as they read */
     if (!getenv("NOGPU")) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
-        if (lag_cuda_init(dev) == 0) { g_cuda = 1; fprintf(stderr, "[cuda] device %d up, %.1f GB VRAM free\n", dev, lag_cuda_free_bytes() / 1e9); }
+        if (lag_cuda_init(dev) == 0) { g_cuda = 1;
+            if (getenv("LAG_GPU_MINEL")) g_gpu_minel = strtoll(getenv("LAG_GPU_MINEL"), NULL, 10);
+            fprintf(stderr, "[cuda] device %d up, %.1f GB VRAM free, offload minel=%lld\n", dev, lag_cuda_free_bytes() / 1e9, (long long)g_gpu_minel); }
         else fprintf(stderr, "[cuda] init failed — CPU only\n");
     }
 #endif
