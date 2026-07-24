@@ -22,6 +22,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <sys/select.h>                              /* serve-loop stdin poll (POSIX) */
 #endif
 #include "st.h"
 #include "tok.h"
@@ -34,6 +35,7 @@
 #define MAXRD 128          /* max rotary dim */
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec/1e9; }
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 
 typedef struct {
     int hidden, n_layers, n_kv, head_dim, vocab;
@@ -584,6 +586,97 @@ static int argmax_logits(Model *m, const float *h_pos, int *unused) {
     int best = 0; for (int v = 1; v < V; v++) if (lg[v] > lg[best]) best = v;
     free(lg); return best;
 }
+static void compute_logits(Model *m, const float *h_pos, float *lg) {
+    resmm(lg, h_pos, m->lm_head, m->c.hidden, m->c.vocab);
+}
+
+/* ---------- serve mode: openai_server.py engine protocol (like colibri/inkling) ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n / CANCEL <id>\n
+ * stdout: READY sentinel + STAT, then per request DATA <id> <n>\n<bytes>\n frames and
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <limited>\n + PROF.  */
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static double rng_next(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (double)(g_rng >> 11) / 9007199254740992.0; }
+typedef struct { float p; int i; } PI;
+static int pi_desc(const void *a, const void *b) { float d = ((const PI*)b)->p - ((const PI*)a)->p; return d > 0 ? 1 : d < 0 ? -1 : 0; }
+static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    int best = 0; for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    if (temp <= 0.f) return best;
+    PI *c = malloc((size_t)n * sizeof(PI)); double sum = 0;
+    for (int i = 0; i < n; i++) { c[i].p = expf((logit[i] - logit[best]) / temp); c[i].i = i; sum += c[i].p; }
+    qsort(c, n, sizeof(PI), pi_desc);
+    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum, acc = 0; int k = 0;
+    while (k < n && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0; int pick = c[0].i;
+    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    free(c); return pick;
+}
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define SRV_QMAX 16
+static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static int stdin_readable(void) { fd_set r; struct timeval tv = {0, 0}; FD_ZERO(&r); FD_SET(0, &r); return select(1, &r, NULL, NULL, &tv) > 0; }
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 || plen < 0 || plen > (1 << 22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        (void)slot;
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        int nl = fgetc(stdin); (void)nl; pl[plen] = 0;
+        if (g_qn < SRV_QMAX) { SReq *q = &g_q[g_qn++]; snprintf(q->id, sizeof(q->id), "%s", id); q->max_tok = max_tok; q->temp = temp; q->top_p = top_p; q->payload = pl; q->plen = plen; }
+        else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+static void serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c; int D = c->hidden;
+    int cap = q->plen + 16; int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+    if (np + q->max_tok > ctx_max) { printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+    KVCache kv; kv_init(&kv, m, np + q->max_tok + 8);
+    double t0 = now_s();
+    float *Hp = falloc((int64_t)np * D); forward(m, &kv, ids, np, 0, Hp);
+    float *lg = falloc(c->vocab); compute_logits(m, Hp + (int64_t)(np - 1) * D, lg); free(Hp);
+    float *Hd = falloc(D); char buf[512];
+    int gen = 0, limited = 1, pos = np, cancelled = 0;
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        int tk = sample_logits(lg, c->vocab, q->temp, q->top_p);
+        int is_eos = 0; for (int e = 0; e < c->n_eos; e++) if (tk == c->eos[e]) is_eos = 1;
+        if (is_eos) { limited = 0; break; }
+        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf) - 1);
+        printf("DATA %s %d\n", q->id, nb); fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout); fflush(stdout);
+        gen++;
+        forward(m, &kv, &tk, 1, pos, Hd); pos++;
+        compute_logits(m, Hd, lg);
+        while (stdin_readable()) { int r = serve_read_cmd(q->id); if (r < 0) { free(ids); free(lg); free(Hd); kv_free(&kv, c->n_layers); return; } if (r > 0) { cancelled = 1; limited = 0; } }
+    }
+    double dt = now_s() - t0;
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen, dt > 0 ? gen / dt : 0.0, 100.0, rss_gb(), np, limited);
+    printf("PROF %.3f %d %d 0.000 0.000 %.3f 0.000 0.000 %d\n", dt, np, gen, dt, gen + 1);
+    fflush(stdout);
+    free(ids); free(lg); free(Hd); kv_free(&kv, c->n_layers);
+}
+static void serve_loop(Model *m, Tok *T) {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    g_rng ^= sd ? (uint64_t)strtoull(sd, NULL, 10) : (uint64_t)time(NULL) * 2654435761u;
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q);
+        free(q.payload);
+    }
+}
 
 /* ---------- oracle harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
@@ -616,7 +709,15 @@ int main(int argc, char **argv) {
     printf("cfg: D=%d L=%d kv=%d hd=%d V=%d E=%d+1 topk=%d moe_I=%d win=%d g_rdim=%d(scale %.4f) s_rdim=%d\n",
            m.c.hidden, m.c.n_layers, m.c.n_kv, m.c.head_dim, m.c.vocab, m.c.n_experts, m.c.topk,
            m.c.moe_inter, m.c.sliding_window, m.c.g_rdim, m.c.g_scale, m.c.s_rdim);
-    printf("resident weights loaded | RSS %.2f GB\n", (double)0);
+    printf("resident weights loaded | RSS %.2f GB\n", rss_gb());
+
+    /* ---- serve mode: the openai_server.py gateway drives us over stdin/stdout ---- */
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        serve_loop(&m, &T);
+        return 0;
+    }
 
     /* ---- prompt / generate mode (greedy, streaming; KV-cached) ---- */
     if (prompt) {

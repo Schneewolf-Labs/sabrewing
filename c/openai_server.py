@@ -517,6 +517,51 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     return "".join(prompt)
 
 
+LAGUNA_DEFAULT_SYSTEM = ("You are a helpful, conversationally-fluent assistant made by Poolside. "
+                         "You are here to be helpful to users through natural language conversations.")
+
+def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Poolside Laguna chat template: 〈|EOS|〉 BOS, <system>/<user>/<assistant> role
+    tags, generation prompt ends <assistant><think> (thinking on) or <assistant></think>
+    (thinking off — closes the think channel immediately so the model answers directly)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Laguna engine yet.",
+                       "tools", "unsupported_parameter")
+    think = bool(enable_thinking or (reasoning_effort not in (None, "none", "minimal")))
+    msgs = list(messages)
+    sys = LAGUNA_DEFAULT_SYSTEM
+    if msgs and msgs[0].get("role") in ("system", "developer"):
+        sys = content_text(msgs[0].get("content"), "messages.0.content") if msgs[0].get("content") is not None else ""
+        msgs = msgs[1:]
+    prompt = ["〈|EOS|〉"]
+    if sys.strip() or think:
+        prompt.append(f"<system>{sys.rstrip()}</system>\n")
+    for index, message in enumerate(msgs):
+        role = message.get("role")
+        text = content_text(message.get("content"), f"messages.{index}.content") if message.get("content") is not None else ""
+        if role == "user":
+            prompt.append(f"<user>{text}</user>\n")
+        elif role == "assistant":
+            prompt.append(f"<assistant>{text}</assistant>")
+        elif role in ("system", "developer"):
+            prompt.append(f"<system>{text}</system>\n")
+        else:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+    prompt.append("<assistant>" + ("<think>" if think else "</think>"))
+    return "".join(prompt)
+
+
+def split_laguna(text):
+    """Laguna reasoning is between <think> and </think>; the answer follows </think>."""
+    if "</think>" in text:
+        reasoning, _, content = text.partition("</think>")
+        return content.lstrip("\n"), reasoning.replace("<think>", "").strip()
+    return text, ""
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
@@ -1482,6 +1527,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning = ""
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
+                elif ARCH == "laguna":
+                    text, reasoning = split_laguna(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = parse_tool_calls(text, tools)
@@ -1671,7 +1718,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = render_chat_inkling if ARCH == "inkling" else render_chat
+        renderer = {"inkling": render_chat_inkling, "laguna": render_chat_laguna}.get(ARCH, render_chat)
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
@@ -1959,7 +2006,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "laguna"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--lora", default=os.environ.get("LORA"),
                         help="LoRA adapter directory (Tinker raw format; inkling engine only)")
@@ -1981,11 +2028,12 @@ def main():
     if ARCH == "auto":
         try:
             with open(Path(args.model) / "config.json") as fh:
-                ARCH = "inkling" if "inkling" in (json.load(fh).get("model_type") or "") else "glm"
+                mt = json.load(fh).get("model_type") or ""
+                ARCH = "inkling" if "inkling" in mt else "laguna" if "laguna" in mt else "glm"
         except OSError:
             ARCH = "glm"
     if args.model_id is None:
-        args.model_id = "inkling-colibri" if ARCH == "inkling" else "glm-5.2-colibri"
+        args.model_id = {"inkling": "inkling-colibri", "laguna": "laguna-s-2.1-colibri"}.get(ARCH, "glm-5.2-colibri")
     if args.lora:
         # the engine reads LORA from its environment (serve-mode twin of -l)
         os.environ["LORA"] = str(args.lora)
