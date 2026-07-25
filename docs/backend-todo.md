@@ -77,6 +77,13 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   ceiling: 465 GB experts vs ~195 GB addressable — capacity narrows the gap
   (coverage → fewer cold touches) but cannot fully close it without a RAM upgrade.
 
+## Laguna variants
+
+- [ ] **Laguna M.1 gate width** — `laguna.c` hardcodes the attention output gate to
+  `n_head` outputs. The M.1 shape uses a per-*element* gate (`n_head*head_dim`), which
+  we would silently mis-read rather than reject. Also read `mlp_layer_types` as a
+  fallback for `mlp_only_layers`. Both noted in `docs/llamacpp-notes.md`.
+
 ## Done
 
 - **Multimodal token rejection** — `prompt_reject()` refuses prompts containing

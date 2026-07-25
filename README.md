@@ -134,6 +134,11 @@ swing info                    # model / cache / hardware status
 
 ## Roadmap
 
+- Online-softmax attention + int8 KV (attention is 41% of a 2k-context step; would
+  also take KV from 1.11 GB/slot to ~0.28) — see [`docs/llamacpp-notes.md`](docs/llamacpp-notes.md)
+- Per-*expert* VRAM cache instead of per-layer all-or-nothing (the capacity gap is
+  ~⅓ of a short-context step, 10× per layer)
+- Tensor-core int8 expert GEMM (our warp-per-row kernel is the last big GPU ceiling)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land
