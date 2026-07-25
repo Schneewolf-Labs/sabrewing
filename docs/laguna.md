@@ -66,6 +66,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `BATCH_AB=1` | bench both MoE paths in one process (+ asserts they are token-identical) |
 | `LAG_NOGROUP=1` | disable group-by-expert batching (A/B knob; output is identical either way) |
 | `LAG_GROUP_CHUNK=N` | rows per grouping chunk, default 128 (prefill is chunked; bounds scratch) |
+| `LAG_PREFILL_CHUNK=N` | serve mode: prompt tokens prefilled per step, default 128 (the decoders' worst-case stall when a long prompt arrives) |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
@@ -84,7 +85,7 @@ both bit-exact:
    (row, expert) pairs by expert and run one GEMM per **distinct** expert, so an
    expert's ~1.2 MB of int4 weights is read once per step no matter how many
    streams routed to it. This is what carries past the batch-16 wall, and it also
-   speeds up **prefill**, where a chunk of 64 prompt tokens groups the same way.
+   speeds up **prefill**, where a chunk of prompt tokens groups the same way.
 
 ```
 BATCH=16 SNAP=~/models/laguna_i4 ./laguna -f chat.txt -n 48               # identical streams
@@ -171,11 +172,25 @@ request waits out the other seven before it emits anything.
 tokens are what the serial path would produce; only the RNG stream differs, since
 each slot samples from its own seed. `CANCEL` is honored at the next step boundary.
 
-**v1 limitations, both measured:**
-- Admission is blocking — a newly arriving request prefills before the next decode
-  step, so a long agentic prompt pauses the other slots for the duration of its
-  prefill. With 8 requests × 48 tokens, prefill is ~37% of the wall. Chunked prefill
-  interleaved with decode is the next step.
+**Chunked prefill.** A newly admitted request used to prefill in one blocking call,
+so an agentic 2k-token prompt arriving mid-flight froze every stream already decoding
+for its whole prefill. The prompt is now fed `LAG_PREFILL_CHUNK` tokens per outer
+iteration, interleaved with the decode steps of the running slots. Measured with 6
+streams mid-generation when a 2139-token prompt arrives:
+
+| prefill chunk | worst decoder stall | new request's TTFT | total wall |
+|---|---|---|---|
+| one-shot (`999999`) | 70.8 s | 70.5 s | 153.4 s |
+| **128** (default) | **4.9 s** | 73.4 s | 154.0 s |
+| 32 | 1.8 s | 96.8 s | 168.1 s |
+
+128 buys a 14× smaller stall for ~4% of the newcomer's time-to-first-token and no
+change in total wall; 32 halves the stall again but starts charging the newcomer
+(+37% TTFT) because smaller chunks group worse. Chunking is **bit-identical** to
+one-shot prefill — positions are absolute, attention reads the same cached K/V, and
+every kernel reduces per row — so `LAG_PREFILL_CHUNK=999999` is an exact A/B knob for
+the old behavior (verified: 4 requests × 40 greedy tokens byte-identical at chunk 17
+vs one-shot).
 - ~~The shared sampler qsorts the whole 100k-token vocabulary per token for
   top-p~~ **fixed**: `sample_logits` now takes a top-64 head by partial selection
   and only widens (finally deferring to the full sort) when the nucleus needs more,

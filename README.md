@@ -134,8 +134,6 @@ swing info                    # model / cache / hardware status
 
 ## Roadmap
 
-- Chunked prefill interleaved with decode (a long agentic prompt currently blocks
-  the batch while it prefills — ~37% of the wall at 8 requests × 48 tokens)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land
