@@ -94,14 +94,25 @@ architectures map to descriptors).
 Ryzen 9 7900 · 187 GB DDR5 · RTX A6000 · NVMe.
 
 **Laguna 118B (fits the A6000).** Single-stream decode is bandwidth/latency-bound
-at ~12–14 tok/s; the real win is throughput — batched decode amortizes the
-resident read across streams:
+at ~12–16 tok/s; the real win is throughput. Two levers, both bit-exact: batched
+decode amortizes the *resident* read across streams, and group-by-expert (Megablocks
+-style) MoE reads each *distinct* expert once per step no matter how many streams
+routed to it — which is what carries past the batch-16 wall:
 
-| Batch | Aggregate tok/s | Speedup |
-|---|---|---|
-| 1 | 11.5 | 1.0× |
-| 8 | 28.9 | 2.5× |
-| 16 | 30.9 | 2.7× |
+| Batch | resident-batched | + group-by-expert | divergent streams |
+|---|---|---|---|
+| 1 | 15.7 | 16.4 | — |
+| 8 | 30.5 | **40.9** | 36.0 |
+| 16 | 34.0 | **43.2** | 38.4 |
+| 32 | 30.3 | **47.2** | 44.3 |
+
+Resident-only batching saturates ~30–34 tok/s (B=32 is no better than B=16 — every
+stream still paid for its own expert reads); grouping keeps the curve climbing.
+
+Grouping also speeds prefill (a chunk of prompt tokens groups the same way).
+Divergent-stream numbers are reported alongside identical-stream ones because
+identical streams route identically and flatter the grouping — see
+[`docs/laguna.md`](docs/laguna.md).
 
 **Inkling 975B (streamed).** Decode speed is a function of cache warmth, and the
 cache learns your workload — from ~0.06 tok/s cold to ~2.5 tok/s once your hot
@@ -119,8 +130,11 @@ swing info                    # model / cache / hardware status
 
 ## Roadmap
 
-- Group-by-expert (Megablocks-style) batching to push aggregate throughput past 2.7×
-- Continuous batching wired into the serve loop (multi-tenant server)
+- Continuous batching wired into the serve loop (multi-tenant server) — the bench
+  proves the throughput; the gateway can't reach it until serve mode keeps several
+  requests in flight
+- Chunked prefill interleaved with decode (a long agentic prompt currently blocks
+  the batch while it prefills)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land

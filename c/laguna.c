@@ -174,10 +174,13 @@ static void resmm_b(float *y, const float *x, const void *W, const void *Wdev, i
  * switches to the int8-activation VNNI path (~2x faster, ~0.4% quant noise) for
  * the CPU-resident expert layers — the decode bottleneck when most layers are on
  * the GPU. g_exact always forces f32 (the oracle stays exact). */
-static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
+static int lag_q4_mode(void) {
     static int idot = -1;
     if (idot < 0) idot = getenv("LAG_IDOT") ? 1 : 0;
-    matmul_q4_k(y, x, packed, scale, I, O, (idot && !g_exact) ? MOE_Q4_IDOT : MOE_Q4_F32, g_exact);
+    return (idot && !g_exact) ? MOE_Q4_IDOT : MOE_Q4_F32;
+}
+static void matmul_q4(float *y, const float *x, const uint8_t *packed, const float *scale, int I, int O) {
+    matmul_q4_k(y, x, packed, scale, I, O, lag_q4_mode(), g_exact);
 }
 /* rmsnorm_row, siluf, softplusf, softmax_row are shared (moe_math.h). */
 
@@ -479,6 +482,172 @@ static void lag_expert_batch(void *cx, const int *sel, const float *w, int K, co
     }
 }
 
+/* ---------- grouped (Megablocks-style) batched MoE ----------
+ * The per-token block reads an expert's int4 weights once PER TOKEN that routes to
+ * it. With S rows in flight (B concurrent decode streams, or a prefill chunk) the
+ * same expert is usually wanted by several rows, so: route all S rows with one
+ * router weight read, sort the S*K (row, expert) pairs by expert, and run ONE GEMM
+ * per DISTINCT expert over all its rows. An expert's ~1.2 MB of int4 weights then
+ * streams from VRAM/RAM once instead of n_e times — the lever past plain batched
+ * decode, where only the *resident* weights were amortized and the experts still
+ * cost one read per token.
+ *
+ * Bit-exactness (the non-negotiable): every dot product keeps the ungrouped
+ * kernel's reduction order (matmul_q4_kb / matmul_f32 reduce each (row, output)
+ * independently), each expert's output lands in its own slot, and the per-token
+ * combine sums the slots in RANK order — the same float op sequence as the
+ * per-token path. So the grouped path is bit-identical, not merely close; the
+ * teacher-forced oracle runs through it (prefill S=36) and stays 36/36. */
+static int64_t g_grp_rows = 0, g_grp_groups = 0, g_grp_calls = 0;   /* grouping stats */
+
+/* rows per grouping chunk: bounds the S*K scratch (a chunk allocates S*K*2I floats)
+ * and keeps the packed rows cache-resident. Decode batches are one chunk; long
+ * prefills are split, which costs nothing but grouping breadth across chunks. */
+static int lag_group_chunk(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("LAG_GROUP_CHUNK"); n = e ? atoi(e) : 64;
+        if (n < 1) n = 1;
+        if (n > 1024) n = 1024;      /* scratch is O(chunk*K*(2I+D)) floats — keep it sane */
+    }
+    return n;
+}
+/* group-by-expert on/off. Set from LAG_NOGROUP at startup; the BATCH_AB bench
+ * flips it between passes so both paths can be timed in ONE process (same page
+ * cache, same clocks — cross-process A/B on a 57 GB model is too noisy to trust). */
+static int g_group = 1;
+static int lag_group_on(void) { return g_group; }
+
+/* hout[S,D] += MoE(x[S,D]) for S rows at once, grouped by expert. */
+static void lag_moe_group(Model *m, Layer *L, const float *x, float *hout, int S) {
+    Cfg *c = &m->c;
+    int D = c->hidden, I = c->moe_inter, SI = c->shared_inter, E = c->n_experts, K = c->topk;
+    int T = S * K;                                   /* (row, expert) pairs */
+
+    /* --- route every row with ONE router weight read --- */
+    float *rl = falloc((int64_t)S * E), *w = falloc((int64_t)T);
+    int *sel = malloc((size_t)T * sizeof(int));
+    matmul_f32(rl, x, L->router, S, D, E, g_exact);
+    for (int s = 0; s < S; s++) {
+        float *r = rl + (int64_t)s * E;
+        for (int e = 0; e < E; e++) r[e] = 1.f / (1.f + expf(-r[e]));   /* sigmoid loss-free */
+        int *sl = sel + s * K; float *wr = w + s * K;
+        moe_topk(r, L->ebias, 1, E, K, sl);          /* bias for SELECTION, unbiased weight */
+        float sm = 0; for (int a = 0; a < K; a++) { wr[a] = r[sl[a]]; sm += wr[a]; }
+        if (c->norm_topk) for (int a = 0; a < K; a++) wr[a] /= sm;
+    }
+
+    /* --- counting-sort the pairs by expert: packed rows, grouped, ascending id --- */
+    int *cnt = calloc((size_t)E, sizeof(int));
+    for (int i = 0; i < T; i++) cnt[sel[i]]++;
+    int *gexp = malloc((size_t)E * sizeof(int)), *gbeg = malloc((size_t)E * sizeof(int));
+    int *gcnt = malloc((size_t)E * sizeof(int)), *pos = malloc((size_t)E * sizeof(int));
+    int G = 0, off = 0;
+    for (int e = 0; e < E; e++) {
+        if (!cnt[e]) continue;
+        gexp[G] = e; gbeg[G] = off; gcnt[G] = cnt[e]; pos[e] = off; off += cnt[e]; G++;
+    }
+    int *grow = malloc((size_t)T * sizeof(int));     /* packed row -> source row */
+    int *rowof = malloc((size_t)T * sizeof(int));    /* (row, rank) -> packed row */
+    for (int s = 0; s < S; s++) for (int a = 0; a < K; a++) {
+        int slot = pos[sel[s * K + a]]++;
+        grow[slot] = s; rowof[s * K + a] = slot;
+    }
+    g_grp_calls++; g_grp_rows += T; g_grp_groups += G;
+
+    /* --- one GEMM per distinct expert, then a rank-order combine --- */
+    float *acc = falloc((int64_t)S * D);
+    int done = 0;
+#ifdef COLI_CUDA
+    if (m->xq && L->d_gu_q && !g_exact &&                /* VRAM-resident expert layer */
+        lag_cuda_moe_group(acc, x, L->d_gu_q, L->d_gu_s, L->d_dn_q, L->d_dn_s,
+                           gexp, gbeg, gcnt, G, grow, rowof, w, S, K, I, D) == 0) done = 1;
+#endif
+    if (!done) {                                     /* CPU tier: int4 (or f32 oracle) */
+        float *slots = falloc((int64_t)T * D);
+        float *xg = falloc((int64_t)S * D), *gu = falloc((int64_t)S * 2 * I), *glu = falloc((int64_t)S * I);
+        int mode = lag_q4_mode();
+        for (int g = 0; g < G; g++) {
+            int e = gexp[g], n = gcnt[g], beg = gbeg[g];
+            for (int j = 0; j < n; j++)              /* gather this expert's rows */
+                memcpy(xg + (int64_t)j * D, x + (int64_t)grow[beg + j] * D, (size_t)D * sizeof(float));
+            if (m->xq) {                             /* int4: fused gate_up, then down */
+                matmul_q4_kb(gu, xg, L->gu_q + (int64_t)(e * 2 * I) * (D / 2),
+                             L->gu_s + (int64_t)e * 2 * I, n, D, 2 * I, mode, g_exact);
+                for (int j = 0; j < n; j++) {
+                    const float *gr = gu + (int64_t)j * 2 * I; float *o = glu + (int64_t)j * I;
+                    for (int i = 0; i < I; i++) o[i] = siluf(gr[i]) * gr[I + i];
+                }
+                matmul_q4_kb(slots + (int64_t)beg * D, glu, L->dn_q + (int64_t)(e * D) * (I / 2),
+                             L->dn_s + (int64_t)e * D, n, I, D, mode, g_exact);
+            } else {                                 /* f32 experts (tiny oracle model) */
+                float *gg = gu, *uu = gu + (int64_t)n * I;
+                matmul_f32(gg, xg, L->eg[e], n, D, I, g_exact);
+                matmul_f32(uu, xg, L->eu[e], n, D, I, g_exact);
+                for (int64_t i = 0; i < (int64_t)n * I; i++) glu[i] = siluf(gg[i]) * uu[i];
+                matmul_f32(slots + (int64_t)beg * D, glu, L->ed[e], n, I, D, g_exact);
+            }
+        }
+        for (int s = 0; s < S; s++) {                /* combine in RANK order (bit-exact) */
+            float *o = acc + (int64_t)s * D;
+            for (int i = 0; i < D; i++) o[i] = 0;
+            for (int a = 0; a < K; a++) {
+                const float *v = slots + (int64_t)rowof[s * K + a] * D; float wa = w[s * K + a];
+                for (int i = 0; i < D; i++) o[i] += wa * v[i];
+            }
+        }
+        free(slots); free(xg); free(gu); free(glu);
+    }
+    for (int64_t i = 0; i < (int64_t)S * D; i++) acc[i] *= c->route_scale;
+
+    /* --- shared expert, batched over S (its residents are read once too) --- */
+    float *sg = falloc((int64_t)S * SI), *su = falloc((int64_t)S * SI), *so = falloc((int64_t)S * D);
+    resmm_b(sg, x, L->sg, L->d_sg, S, D, SI);
+    resmm_b(su, x, L->su, L->d_su, S, D, SI);
+    for (int64_t i = 0; i < (int64_t)S * SI; i++) sg[i] = siluf(sg[i]) * su[i];
+    resmm_b(so, sg, L->sd, L->d_sd, S, SI, D);
+    for (int64_t i = 0; i < (int64_t)S * D; i++) hout[i] += acc[i] + so[i];   /* routed*scale + shared */
+
+    free(rl); free(w); free(sel); free(cnt); free(gexp); free(gbeg); free(gcnt); free(pos);
+    free(grow); free(rowof); free(acc); free(sg); free(su); free(so);
+}
+
+/* Dense MLP (laguna's layer 0) over S rows: batched so its three residents — the
+ * widest in the model at dense_inter=12288 — are read once for all S rows.
+ * Per-row identical to the S=1 path (resmm_b reduces each row independently). */
+static void lag_dense_rows(Model *m, Layer *L, const float *xn, float *h, int S) {
+    int D = m->c.hidden, I = m->c.dense_inter;
+    float *g = falloc((int64_t)S * I), *u = falloc((int64_t)S * I), *o = falloc((int64_t)S * D);
+    resmm_b(g, xn, L->gate, L->d_gate, S, D, I);
+    resmm_b(u, xn, L->up, L->d_up, S, D, I);
+    for (int64_t i = 0; i < (int64_t)S * I; i++) g[i] = siluf(g[i]) * u[i];
+    resmm_b(o, g, L->down, L->d_down, S, I, D);
+    for (int64_t i = 0; i < (int64_t)S * D; i++) h[i] += o[i];
+    free(g); free(u); free(o);
+}
+
+/* MoE over S rows: grouped when there is more than one row to group (chunked),
+ * else the per-token shared moe_block. Both paths produce identical bits. */
+static void lag_moe_rows(Model *m, Layer *L, const float *xn, float *h, int S) {
+    Cfg *c = &m->c;
+    int D = c->hidden, I = c->moe_inter, SI = c->shared_inter;
+    if (S > 1 && lag_group_on()) {
+        int chunk = lag_group_chunk();
+        for (int s0 = 0; s0 < S; s0 += chunk) {
+            int n = S - s0 < chunk ? S - s0 : chunk;
+            lag_moe_group(m, L, xn + (int64_t)s0 * D, h + (int64_t)s0 * D, n);
+        }
+        return;
+    }
+    /* sigmoid loss-free routing, corr-bias selection, norm_topk, routed
+     * *route_scale, one always-on unscaled shared expert (see moe-arch-survey). */
+    LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI), falloc(D) };
+    MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
+    MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared, lag_expert_batch };
+    for (int s = 0; s < S; s++) moe_block(&desc, &hooks, xn + (int64_t)s * D, h + (int64_t)s * D, D);
+    free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su); free(lc.scr);
+}
+
 /* process S tokens at absolute positions pos0..pos0+S-1, appending K/V to the
  * cache; writes each token's post-final-norm hidden state to h_out[S*D].
  * Prefill: S=np, pos0=0. Decode: S=1, pos0=current length. */
@@ -559,29 +728,13 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
         }
         free(gate); free(Q); free(AO);
 
-        /* --- MLP / MoE (per-token) --- */
+        /* --- MLP / MoE over the S rows (batched dense; MoE grouped by expert) --- */
         int n = S;
         for (int t = 0; t < n; t++) rmsnorm_row(xn + t * D, h + t * D, L->ln2, D, c->rms_eps);
         if (!c->is_moe[li]) {
-            int I = c->dense_inter;
-            float *g = falloc(I), *u = falloc(I);
-            for (int t = 0; t < n; t++) {
-                resmm(g, xn + t * D, L->gate, L->d_gate, D, I);
-                resmm(u, xn + t * D, L->up, L->d_up, D, I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                resmm(scr, g, L->down, L->d_down, I, D);
-                for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
-            }
-            free(g); free(u);
+            lag_dense_rows(m, L, xn, h, n);     /* batched over the S rows */
         } else {
-            /* sigmoid loss-free routing, corr-bias selection, norm_topk, routed
-             * *route_scale, one always-on unscaled shared expert (see moe-arch-survey). */
-            int I = c->moe_inter, SI = c->shared_inter;
-            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI), falloc(D) };
-            MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
-            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared, lag_expert_batch };
-            for (int t = 0; t < n; t++) moe_block(&desc, &hooks, xn + t * D, h + t * D, D);
-            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su); free(lc.scr);
+            lag_moe_rows(m, L, xn, h, n);   /* grouped by expert when n > 1 (prefill) */
         }
     }
     for (int t = 0; t < S; t++) rmsnorm_row(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
@@ -591,10 +744,13 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
 
 /* Batched DECODE: B independent sequences, one token each, each at its own
  * position with its own KV cache (kvs[b]). The RESIDENT matmuls run batched over
- * B (resmm_b: one weight read for B streams — the throughput lever); attention and
- * MoE stay per-sequence. h_out[B*D] gets each stream's post-final-norm state.
- * Per-stream identical to forward() at S=1, so B copies of a prompt reproduce the
- * single-stream output exactly. */
+ * B (resmm_b: one weight read for B streams — the first throughput lever), and the
+ * MoE runs GROUPED BY EXPERT over the B rows (lag_moe_rows: one weight read per
+ * DISTINCT expert — the second lever, which is what carries past batch ~16). Only
+ * attention stays per-sequence, since each stream has its own KV cache.
+ * h_out[B*D] gets each stream's post-final-norm state. Per-stream identical to
+ * forward() at S=1, so B copies of a prompt reproduce the single-stream output
+ * exactly (bit-identical, both levers included). */
 static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float *h_out) {
     Cfg *c = &m->c;
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
@@ -656,22 +812,10 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         resmm_b(ao_out, AO, L->wo, L->d_wo, B, H * hd, D);  /* batched o_proj */
         for (int b = 0; b < B; b++) for (int i = 0; i < D; i++) h[b * D + i] += ao_out[b * D + i];
         for (int b = 0; b < B; b++) rmsnorm_row(xn + b * D, h + b * D, L->ln2, D, c->rms_eps);
-        if (!c->is_moe[li]) {                               /* dense MLP (layer 0), per-seq */
-            int I = c->dense_inter; float *g = falloc(I), *u = falloc(I), *scr = falloc(D);
-            for (int b = 0; b < B; b++) {
-                resmm(g, xn + b * D, L->gate, L->d_gate, D, I); resmm(u, xn + b * D, L->up, L->d_up, D, I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                resmm(scr, g, L->down, L->d_down, I, D);
-                for (int i = 0; i < D; i++) h[b * D + i] += scr[i];
-            }
-            free(g); free(u); free(scr);
-        } else {                                            /* MoE, per-seq (shared moe_block) */
-            int I = c->moe_inter, SI = c->shared_inter;
-            LagMoeCtx lc = { m, L, I, D, falloc(2 * I), falloc(I), falloc(I), falloc(SI), falloc(SI), falloc(D) };
-            MoeDesc desc = { c->n_experts, c->topk, MOE_ROUTE_SIGMOID, 1, c->norm_topk, c->route_scale, MOE_SHARED_UNSCALED };
-            MoeHooks hooks = { &lc, lag_router, L->ebias, lag_expert, lag_shared, lag_expert_batch };
-            for (int b = 0; b < B; b++) moe_block(&desc, &hooks, xn + b * D, h + b * D, D);
-            free(lc.gu); free(lc.eg); free(lc.eu); free(lc.sg); free(lc.su); free(lc.scr);
+        if (!c->is_moe[li]) {                               /* dense MLP (layer 0), batched */
+            lag_dense_rows(m, L, xn, h, B);
+        } else {                                            /* MoE: grouped by expert over B */
+            lag_moe_rows(m, L, xn, h, B);
         }
         free(Q); free(Kt); free(Vt); free(AO); free(gate); free(ao_out);
     }
@@ -679,6 +823,28 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
     for (int b = 0; b < B; b++) kvs[b]->len = pos[b] + 1;
     free(h); free(xn); free(pos);
 }
+/* Cheap top-k sampler for the BATCH_VARY bench: enough entropy to make the
+ * streams' routing genuinely diverge, without the shared sample_logits cost
+ * (a 100k-entry qsort per stream per step would dominate the very step time the
+ * bench is measuring). One selection pass over the logits, softmax over the top 8. */
+#define BENCH_TOPK 8
+static int bench_sample_topk(const float *logit, int n, float temp) {
+    float tv[BENCH_TOPK]; int ti[BENCH_TOPK]; int k = 0;
+    for (int i = 0; i < n; i++) {                      /* insertion into a tiny top-k */
+        if (k < BENCH_TOPK || logit[i] > tv[k - 1]) {
+            int j = k < BENCH_TOPK ? k++ : k - 1;
+            while (j > 0 && tv[j - 1] < logit[i]) { tv[j] = tv[j - 1]; ti[j] = ti[j - 1]; j--; }
+            tv[j] = logit[i]; ti[j] = i;
+        }
+    }
+    if (temp <= 0.f) return ti[0];
+    double p[BENCH_TOPK], sum = 0;
+    for (int a = 0; a < k; a++) { p[a] = exp((tv[a] - tv[0]) / temp); sum += p[a]; }
+    double r = rng_next() * sum, run = 0;
+    for (int a = 0; a < k; a++) { run += p[a]; if (run >= r) return ti[a]; }
+    return ti[0];
+}
+
 static int argmax_logits(Model *m, const float *h_pos, int *unused) {
     (void)unused; int V = m->c.vocab, D = m->c.hidden;
     float *lg = falloc(V); resmm(lg, h_pos, m->lm_head, m->d_lm_head, D, V);
@@ -810,6 +976,48 @@ static int cuda_selftest(void) {
         lag_cuda_free(dp13); lag_cuda_free(ds13); lag_cuda_free(dp2); lag_cuda_free(ds2);
         free(x); free(yc); free(yg); free(gu); free(s13); free(s2); free(p13); free(p2);
     }
+    /* --- grouped experts vs the per-token path: must be BIT-identical ---
+     * Same dots (same lane-strided reduction), same SiLU-GLU expression, same
+     * rank-order accumulate — grouping only changes WHEN the weight is read, so any
+     * nonzero difference here means the grouped path perturbed the numerics. */
+    {
+        int D = 3072, I = 1024, E = 6, S = 4, K = 3;
+        int sel[4][3] = { {0,1,2}, {1,2,3}, {0,2,4}, {2,3,5} };   /* deliberate overlap */
+        float *x = falloc((int64_t)S * D), *w = falloc((int64_t)S * K);
+        float *yref = falloc((int64_t)S * D), *ygrp = falloc((int64_t)S * D);
+        float *s13 = falloc((int64_t)E * 2 * I), *s2 = falloc((int64_t)E * D);
+        uint8_t *p13 = malloc((size_t)E * (2 * I) * (D / 2)), *p2 = malloc((size_t)E * D * (I / 2));
+        frand_fill(x, (int64_t)S * D);
+        for (int i = 0; i < S * K; i++) w[i] = 0.05f + (rand() / (float)RAND_MAX) * 0.3f;
+        for (int64_t k = 0; k < (int64_t)E * (2 * I) * (D / 2); k++) p13[k] = rand() & 0xFF;
+        for (int64_t k = 0; k < (int64_t)E * D * (I / 2); k++) p2[k] = rand() & 0xFF;
+        for (int64_t r = 0; r < (int64_t)E * 2 * I; r++) s13[r] = 0.01f + (rand() / (float)RAND_MAX) * 0.03f;
+        for (int64_t r = 0; r < (int64_t)E * D; r++) s2[r] = 0.01f + (rand() / (float)RAND_MAX) * 0.03f;
+        void *dp13 = lag_cuda_upload(p13, (size_t)E * (2 * I) * (D / 2));
+        void *ds13 = lag_cuda_upload(s13, (size_t)E * (2 * I) * 4);
+        void *dp2 = lag_cuda_upload(p2, (size_t)E * D * (I / 2));
+        void *ds2 = lag_cuda_upload(s2, (size_t)E * D * 4);
+        int ok = dp13 && ds13 && dp2 && ds2;
+        for (int s = 0; ok && s < S; s++)                     /* reference: per-token path */
+            ok = lag_cuda_moe_experts(yref + (int64_t)s * D, x + (int64_t)s * D, dp13, (const float*)ds13,
+                                      dp2, (const float*)ds2, sel[s], w + s * K, K, I, D) == 0;
+        /* same counting sort the engine does */
+        int cnt[6] = {0}, gexp[6], gbeg[6], gcnt[6], pos[6], grow[12], rowof[12], G = 0, off = 0;
+        for (int s = 0; s < S; s++) for (int a = 0; a < K; a++) cnt[sel[s][a]]++;
+        for (int e = 0; e < E; e++) { if (!cnt[e]) continue;
+            gexp[G] = e; gbeg[G] = off; gcnt[G] = cnt[e]; pos[e] = off; off += cnt[e]; G++; }
+        for (int s = 0; s < S; s++) for (int a = 0; a < K; a++) {
+            int slot = pos[sel[s][a]]++; grow[slot] = s; rowof[s * K + a] = slot; }
+        if (ok) ok = lag_cuda_moe_group(ygrp, x, dp13, (const float*)ds13, dp2, (const float*)ds2,
+                                       gexp, gbeg, gcnt, G, grow, rowof, w, S, K, I, D) == 0;
+        if (!ok) { fprintf(stderr, "[cuda-test] grouped gpu call failed\n"); return 1; }
+        float md = 0; for (int64_t i = 0; i < (int64_t)S * D; i++) { float d = fabsf(yref[i] - ygrp[i]); if (d > md) md = d; }
+        printf("[cuda-test] moe_group    [S=%d K=%d G=%d] max|abs| vs per-token = %.3e  %s\n",
+               S, K, G, md, md == 0.f ? "BIT-IDENTICAL" : "FAIL (not bit-exact)");
+        if (md != 0.f) rc = 1;
+        lag_cuda_free(dp13); lag_cuda_free(ds13); lag_cuda_free(dp2); lag_cuda_free(ds2);
+        free(x); free(w); free(yref); free(ygrp); free(s13); free(s2); free(p13); free(p2);
+    }
     printf("[cuda-test] %s\n", rc ? "FAILURES" : "ALL PASS");
     return rc;
 }
@@ -821,6 +1029,7 @@ int main(int argc, char **argv) {
 #endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    if (getenv("LAG_NOGROUP")) g_group = 0;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
     char *pbuf = NULL;
@@ -869,11 +1078,20 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* ---- BATCH throughput bench: decode B copies of the prompt concurrently ----
-     * proves the batched-serving thesis (residents read once for B streams). All B
-     * streams must reproduce the single-stream greedy output identically. */
+    /* ---- BATCH throughput bench: decode B streams concurrently ----
+     * proves the batched-serving thesis (residents read once for B streams, each
+     * expert read once per DISTINCT expert per step). Two modes:
+     *   BATCH=N              B greedy copies of the prompt — every stream must
+     *                        reproduce the single-stream output (correctness), but
+     *                        identical streams route identically, so expert
+     *                        grouping collapses to topk and OVERSTATES throughput.
+     *   BATCH=N BATCH_VARY=1 B sampled streams (temp 1.0, per-stream seed) that
+     *                        diverge after a few tokens — the honest multi-tenant
+     *                        number, where the streams' expert sets really differ. */
     if (prompt && getenv("BATCH")) {
         int B = atoi(getenv("BATCH")); if (B < 1) B = 1;
+        int vary = getenv("BATCH_VARY") ? 1 : 0;
+        float vtemp = getenv("BATCH_TEMP") ? (float)atof(getenv("BATCH_TEMP")) : 1.0f;
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
         int plen = (int)strlen(prompt), cap = plen + 16;
@@ -883,7 +1101,20 @@ int main(int argc, char **argv) {
         int D = m.c.hidden, V = m.c.vocab;
         KVCache **kvs = malloc((size_t)B * sizeof(KVCache*));
         int *cur = malloc((size_t)B * sizeof(int));
+        int ab = getenv("BATCH_AB") ? 1 : 0;    /* time BOTH MoE paths in this process */
         float *Hp = falloc((int64_t)np * D);
+        if (ab) {                               /* prefill A/B on one stream, fresh KV each pass */
+            KVCache tkv; kv_init(&tkv, &m, np + 8);
+            for (int pass = 0; pass < 2; pass++) {
+                g_group = pass; tkv.len = 0;
+                double t = now_s(); forward(&m, &tkv, seq, np, 0, Hp); double d = now_s() - t;
+                printf("prefill %-9s %d tok in %.2fs = %.1f tok/s\n",
+                       pass ? "grouped:" : "per-token:", np, d, np / d);
+                fflush(stdout);
+            }
+            kv_free(&tkv, m.c.n_layers);
+        }
+        g_group = ab ? 1 : g_group;
         double tp = now_s();
         for (int b = 0; b < B; b++) {   /* prefill each stream with the same prompt */
             kvs[b] = malloc(sizeof(KVCache)); kv_init(kvs[b], &m, np + n_new + 8);
@@ -891,26 +1122,60 @@ int main(int argc, char **argv) {
             cur[b] = argmax_logits(&m, Hp + (int64_t)(np - 1) * D, NULL);
         }
         free(Hp);
-        printf("[BATCH=%d, %d prompt tok, prefill %.1fs] decoding...\n", B, np, now_s() - tp); fflush(stdout);
+        printf("[BATCH=%d%s, %d prompt tok, prefill %.1fs] decoding...\n",
+               B, vary ? " VARY" : "", np, now_s() - tp); fflush(stdout);
         float *Hd = falloc((int64_t)B * D), *lg = falloc((int64_t)B * V);
         int **out = malloc((size_t)B * sizeof(int*)); for (int b = 0; b < B; b++) out[b] = malloc((size_t)n_new * sizeof(int));
-        double t1 = now_s(); int gen = 0;
-        for (int s = 0; s < n_new; s++) {
-            forward_batch(&m, kvs, cur, B, Hd);
-            resmm_b(lg, Hd, m.lm_head, m.d_lm_head, B, D, V);      /* batched lm_head */
-            for (int b = 0; b < B; b++) {
-                const float *l = lg + (int64_t)b * V; int best = 0;
-                for (int v = 1; v < V; v++) if (l[v] > l[best]) best = v;
-                cur[b] = best; out[b][s] = best;
+        int *first = malloc((size_t)B * sizeof(int));   /* each stream's post-prefill token */
+        for (int b = 0; b < B; b++) first[b] = cur[b];
+        int *prev = ab ? malloc((size_t)B * n_new * sizeof(int)) : NULL;
+        uint64_t *seed = malloc((size_t)B * sizeof(uint64_t));
+        /* A/B: pass 0 = per-token MoE, pass 1 = grouped, on the SAME loaded model.
+         * Between passes every KV cache rewinds to the prompt (positions are
+         * absolute, so re-decoding overwrites cleanly) and the per-stream RNG seeds
+         * reset — so the two passes must emit IDENTICAL tokens. That makes this a
+         * correctness check on the real 118B model, not just a timing harness. */
+        for (int pass = ab ? 0 : 1; pass < 2; pass++) {
+            if (ab) g_group = pass;
+            for (int b = 0; b < B; b++) { kvs[b]->len = np; cur[b] = first[b]; }
+            for (int b = 0; b < B; b++) seed[b] = 0x9E3779B97F4A7C15ull + 0x1000193ull * (uint64_t)(b + 1);
+            g_grp_calls = g_grp_rows = g_grp_groups = 0;   /* decode-only grouping stats */
+            double t1 = now_s(); int gen = 0;
+            for (int s = 0; s < n_new; s++) {
+                forward_batch(&m, kvs, cur, B, Hd);
+                resmm_b(lg, Hd, m.lm_head, m.d_lm_head, B, D, V);      /* batched lm_head */
+                for (int b = 0; b < B; b++) {
+                    const float *l = lg + (int64_t)b * V;
+                    int pick;
+                    if (vary) { g_rng = seed[b]; pick = bench_sample_topk(l, V, vtemp); seed[b] = g_rng; }
+                    else { pick = 0; for (int v = 1; v < V; v++) if (l[v] > l[pick]) pick = v; }
+                    cur[b] = pick; out[b][s] = pick;
+                }
+                gen++;
             }
-            gen++;
+            double dt = now_s() - t1;
+            int allmatch = 1;
+            for (int b = 1; b < B; b++) for (int s = 0; s < gen; s++) if (out[b][s] != out[0][s]) { allmatch = 0; break; }
+            printf("BATCH=%d%s %-9s %d streams x %d tok = %d total in %.2fs = %.2f tok/s AGGREGATE (%.2f/stream) | streams %s\n",
+                   B, vary ? " VARY" : "", ab ? (pass ? "grouped:" : "per-token:") : "", B, gen, B * gen, dt,
+                   B * gen / dt, gen / dt,
+                   vary ? (allmatch ? "identical (sampling collapsed?)" : "divergent (as intended)")
+                        : (allmatch ? "IDENTICAL (correct)" : "DIVERGED (BUG)"));
+            if (g_grp_calls) printf("grouping: %.1f distinct experts per MoE layer per step over %.0f routed pairs"
+                                    " = %.2fx expert-weight-read amortization\n",
+                                    (double)g_grp_groups / g_grp_calls, (double)g_grp_rows / g_grp_calls,
+                                    (double)g_grp_rows / (double)g_grp_groups);
+            if (ab && pass == 0) { for (int b = 0; b < B; b++) memcpy(prev + (int64_t)b * n_new, out[b], (size_t)gen * sizeof(int)); }
+            else if (ab) {
+                int same = 1;
+                for (int b = 0; b < B; b++) for (int s = 0; s < gen; s++)
+                    if (prev[(int64_t)b * n_new + s] != out[b][s]) { same = 0; break; }
+                printf("grouped vs per-token: %d streams x %d tok %s\n", B, gen,
+                       same ? "TOKEN-IDENTICAL (grouping is bit-exact)" : "DIFFER (BUG)");
+            }
+            printf("stream 0 tokens:"); for (int s = 0; s < (gen < 12 ? gen : 12); s++) printf(" %d", out[0][s]); printf("\n");
+            fflush(stdout);
         }
-        double dt = now_s() - t1;
-        int allmatch = 1;
-        for (int b = 1; b < B; b++) for (int s = 0; s < gen; s++) if (out[b][s] != out[0][s]) { allmatch = 0; break; }
-        printf("stream 0 tokens:"); for (int s = 0; s < (gen < 12 ? gen : 12); s++) printf(" %d", out[0][s]); printf("\n");
-        printf("BATCH=%d: %d streams x %d tok = %d total in %.2fs = %.2f tok/s AGGREGATE (%.2f/stream) | streams %s\n",
-               B, B, gen, B * gen, dt, B * gen / dt, gen / dt, allmatch ? "IDENTICAL (correct)" : "DIVERGED (BUG)");
         return 0;
     }
 

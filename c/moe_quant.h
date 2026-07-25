@@ -123,6 +123,98 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
     }
 }
 
+/* Batched int4: y[S,O] = x[S,I] @ dequant(packed)^T, reading each weight ROW ONCE
+ * for all S activation rows. This is the group-by-expert lever: an expert's int4
+ * blob streams from RAM (or VRAM) once and serves every token routed to it, so a
+ * group of n tokens costs one weight read instead of n.
+ *
+ * Every (o,s) output reduces independently, in the same order as the S=1 kernel,
+ * so each row is BIT-IDENTICAL to matmul_q4_k — grouping changes bandwidth, not
+ * numerics. The fast paths unpack the weight row once (into an L1-resident buffer)
+ * and reuse it across the S rows, which also removes the repeated nibble unpack;
+ * they need I%32==0 (laguna: D=3072, I=1024) and defer to the per-row loop
+ * otherwise, same result either way. */
+static void matmul_q4_kb(float *y, const float *x, const uint8_t *packed, const float *scale,
+                         int S, int I, int O, int mode, int exact) {
+    if (S == 1) { matmul_q4_k(y, x, packed, scale, I, O, mode, exact); return; }
+#if defined(__AVX2__)
+    if (mode == MOE_Q4_IDOT && I % 32 == 0 && I <= 8192) {
+        int nb = I / 32;
+        int8_t *xi = (int8_t*)malloc((size_t)S * I);
+        float  *xs = (float*)malloc((size_t)S * nb * sizeof(float));
+        for (int s = 0; s < S; s++) {   /* per-row int8 quant, identical to the S=1 path */
+            const float *xr = x + (int64_t)s * I;
+            for (int b = 0; b < nb; b++) {
+                const float *xb = xr + b * 32;
+                float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
+                float sc = am / 127.f; if (sc < 1e-12f) sc = 1e-12f;
+                xs[(int64_t)s * nb + b] = sc; float inv = 1.f / sc;
+                for (int i = 0; i < 32; i++) xi[(int64_t)s * I + b * 32 + i] = (int8_t)lrintf(xb[i] * inv);
+            }
+        }
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256i b8 = _mm256_set1_epi8(8);
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *w = packed + (int64_t)o * (I / 2);
+            int8_t wq[8192];                                  /* the row's nibbles, unpacked once */
+            for (int b = 0; b < nb; b++) {
+                __m128i by = _mm_loadu_si128((const __m128i*)(w + b * 16));
+                __m128i lo = _mm_and_si128(by, m4);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+                __m256i nib = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+                _mm256_storeu_si256((__m256i*)(wq + b * 32), _mm256_sub_epi8(nib, b8));
+            }
+            for (int s = 0; s < S; s++) {
+                float acc = 0.f;
+                for (int b = 0; b < nb; b++) {
+                    __m256i vacc = i8dot_block(_mm256_setzero_si256(),
+                                               _mm256_loadu_si256((const __m256i*)(xi + (int64_t)s * I + b * 32)),
+                                               _mm256_loadu_si256((const __m256i*)(wq + b * 32)));
+                    __m128i l = _mm256_castsi256_si128(vacc), h = _mm256_extracti128_si256(vacc, 1);
+                    __m128i s4 = _mm_add_epi32(l, h);
+                    s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
+                    acc += xs[(int64_t)s * nb + b] * (float)_mm_cvtsi128_si32(s4);
+                }
+                y[(int64_t)s * O + o] = acc * scale[o];
+            }
+        }
+        free(xi); free(xs);
+        return;
+    }
+#endif
+#if defined(__AVX512F__)
+    if (mode == MOE_Q4_F32 && !exact && I % 32 == 0 && I <= 8192) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *p = packed + (int64_t)o * (I / 2);
+            const __m128i m0f = _mm_set1_epi8(0x0F);
+            const __m512 v8 = _mm512_set1_ps(8.f);
+            float wf[8192];                                   /* dequantized row, reused for all S */
+            for (int c = 0; c < I / 2; c += 16) {              /* 16 bytes -> 32 weights */
+                __m128i b  = _mm_loadu_si128((const __m128i*)(p + c));
+                __m128i lo = _mm_and_si128(b, m0f);
+                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
+                _mm512_storeu_ps(wf + 2 * c,
+                    _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi))), v8));
+                _mm512_storeu_ps(wf + 2 * c + 16,
+                    _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi))), v8));
+            }
+            for (int s = 0; s < S; s++) {
+                const float *xr = x + (int64_t)s * I;
+                __m512 acc = _mm512_setzero_ps();
+                for (int i = 0; i < I; i += 16)                /* same FMA order as the S=1 kernel */
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(xr + i), _mm512_loadu_ps(wf + i), acc);
+                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc) * scale[o];
+            }
+        }
+        return;
+    }
+#endif
+    for (int s = 0; s < S; s++)
+        matmul_q4_k(y + (int64_t)s * O, x + (int64_t)s * I, packed, scale, I, O, mode, exact);
+}
+
 /* y[O] = x[I] @ dequant(q)^T; q = signed int8 [O,I], per-row f32 scale[o] (given
  * as a SEPARATE pointer — laguna's embedded [int8 O*I][f32 O] buffer splits into
  * (q, q+I*O) at the wrapper). mode selects the activation contract, like q4:

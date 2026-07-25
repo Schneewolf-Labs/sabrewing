@@ -95,7 +95,13 @@ heat-quant analysis already has the Pareto numbers; this productionizes them.
    leverage, lowest risk. *(The migration this branch begins.)*
 2. **Unified pager** → RAM/VRAM + mmap first; io_uring NVMe tier second.
 3. **Overlap engine** → pipeline prefetch (easy win) → cross-layer lookahead (the bet).
-4. **Split-bandwidth dispatch** + batched expert GEMM.
+4. **Split-bandwidth dispatch** + batched expert GEMM. *(Batched expert GEMM has
+   LANDED on Laguna, out of order — the descriptor refactor made batched decode
+   cheap enough to reach for first, and throughput is the axis the primary target
+   cares about: `forward_batch` for the residents, then group-by-expert GEMM so a
+   distinct expert is read once per step no matter how many streams want it. Both
+   bit-exact. Numbers in `docs/laguna.md`. Split-bandwidth CPU+GPU dispatch of one
+   token's experts is still open.)*
 5. **MoE-native quant** → group scales → imatrix → heat-tiered.
 
 ## Two non-negotiables that keep it *sabrewing* and not a ggml clone
