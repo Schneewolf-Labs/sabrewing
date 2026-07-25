@@ -1,84 +1,134 @@
 # sabrewing
 
-**Trillion-parameter open models on hardware you own.** A pure-C inference engine
-running [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling)
-(975B MoE) on a single workstation — expert weights streamed from NVMe, hot experts
-cached in RAM, dense weights on GPU if you have one, and an OpenAI-compatible API
-in front. No Python in the inference path, no frameworks, no cluster.
+**Large open MoE models on hardware you own.** A pure-C, dependency-free
+inference engine for mixture-of-experts LLMs — from a 118B coding model that fits
+one GPU to a 975B model streamed from NVMe — with an OpenAI- and
+Anthropic-compatible API and a browser chat UI in front. No Python in the
+inference path, no frameworks, no cluster. Validated **token-exact** against the
+HuggingFace `transformers` reference.
 
-*A sabrewing (**Campylopterus**) is one of the largest hummingbirds. This project is a
-fork of [JustVugg/colibrì](https://github.com/JustVugg/colibri) — colibrì being Italian
-for hummingbird — grown to carry heavier models. It was built on a machine named
-`sabre`, and the name was sitting right there.*
+*A sabrewing (**Campylopterus**) is one of the largest hummingbirds. This project
+is a fork of [JustVugg/colibrì](https://github.com/JustVugg/colibri) — colibrì
+being Italian for hummingbird — grown to carry heavier models. It was built on a
+machine named `sabre`, and the name was sitting right there.*
+
+## Supported models
+
+Each model is a small standalone engine over a shared MoE runtime (see
+[Architecture](#the-moe-native-runtime)). All are validated token-exact against a
+tiny-model `transformers` oracle.
+
+| Engine | Model | Size (total / active) | Notes |
+|---|---|---|---|
+| `laguna` | [Poolside Laguna-S-2.1](https://huggingface.co/poolside/Laguna-S-2.1) | 118B / 8B | Agentic coding model; **fits one 48 GB GPU**. YaRN + sliding attention, softplus gate, 256 experts top-10 + shared |
+| `inkling` | [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling) | 975B / 41B | Streamed from NVMe on a workstation. Learned rel-bias, short-convs, MTP |
+| `colibri` | GLM-5.2 (and the upstream arch family) | — | The multi-arch engine sabrewing forks from; MLA + DSA indexer |
+| `olmoe` | [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct) | 7B / 1B | Softmax router, whole-vector QK-norm |
+
+Pre-converted int4 weights on the Hub:
+[`nbeerbower/Laguna-S-2.1-colibri-int4`](https://huggingface.co/nbeerbower/Laguna-S-2.1-colibri-int4),
+[`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4).
 
 ## What it does
 
-- **Inkling 975B / 41B-active**, text generation, token-exact against the HF
-  transformers reference (validated by a tiny-model oracle in four numeric modes,
-  including the CUDA path)
-- **Runs in ~120 GB RAM** (CPU-only) — int4 experts + bf16 residents; a 24 GB+
-  NVIDIA GPU moves residents to VRAM and speeds decode substantially
-- **OpenAI-compatible API** (`/v1/chat/completions`, streaming, temperature/top-p)
-  with Inkling's chat template, plus a browser chat UI
-- **Cache warming that learns**: expert usage history accumulates across runs and
-  pins your workload's hot experts at startup (all toggleable)
+- **Runs models that don't fit** — int4 experts + bf16/int8 residents, with a
+  hierarchy that keeps hot weights close: an expert VRAM cache on GPU, a RAM cache,
+  an NVMe stream for the truly enormous. Laguna's 118B runs entirely on one A6000;
+  Inkling's 975B streams on a 187 GB workstation.
+- **Token-exact numerics** — every engine validates bit-for-bit against
+  `transformers` via a tiny-model oracle; the quantized kernels validate against a
+  double-precision reference (`make kernel-check`). No "fast but subtly wrong."
+- **A6000 GPU tier** — bf16/int8 residents in VRAM, a per-layer int4 expert cache,
+  batched GPU expert kernels.
+- **Batched serving** — decode many requests together and the resident weights are
+  read once for the whole batch: **~2.7× aggregate throughput** at batch 16, every
+  stream bit-identical to single-stream.
+- **OpenAI + Anthropic APIs** (`/v1/chat/completions`, `/v1/messages`, streaming,
+  temperature/top-p) with each model's chat template, plus a browser chat UI.
 
 ## Quickstart
 
 ```sh
-# converted weights (int4 experts + bf16 residents, ~469 GiB)
-hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/models/inkling_i4
-
 git clone git@github.com:Schneewolf-Labs/sabrewing.git && cd sabrewing/c
-make inkling                 # pure CPU
-make inkling CUDA=1          # + NVIDIA GPU for resident weights (~37 GB VRAM,
-                             #   or partial upload on smaller cards)
+
+# --- Laguna 118B: fits a single 48 GB GPU ---
+hf download nbeerbower/Laguna-S-2.1-colibri-int4 --local-dir ~/models/laguna_i4
+make laguna CUDA=1 ARCH=native            # GPU tier (or `make laguna` for CPU)
 
 # one-shot generation
-SNAP=~/models/inkling_i4 ./inkling -p "The capital of France is" -n 64
+SNAP=~/models/laguna_i4 ./laguna -p "def is_prime(n):" -n 128
 
-# OpenAI API + web chat UI on http://127.0.0.1:8000
-python3 openai_server.py --engine ./inkling --model ~/models/inkling_i4 --cap 0
+# OpenAI + Anthropic API + web chat UI on http://127.0.0.1:8000
+python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4
 ```
 
-See [`docs/inkling.md`](docs/inkling.md) for cache-warming knobs, the container
-format, and benchmark methodology.
+Speed levers (all opt-in; the oracle stays exact): `RES8=1` int8 residents in VRAM
+(fits more experts), `LAG_IDOT=1` int8-VNNI CPU experts, `BATCH=N` batched-decode
+throughput bench. Build `ARCH=native` for AVX-512/VNNI; `CUDA=1` for the GPU tier.
 
-## Performance (Ryzen 9 7900 · 187 GB DDR5 · RTX A6000 · NVMe)
+## The MoE-native runtime
 
-| Configuration | Prefill (5 tok) | Decode | Cache hit |
-|---|---|---|---|
-| first light | 150 s | 0.06 tok/s | ~0% |
-| tuned CPU | 21 s | 0.25 tok/s | 82% |
-| + GPU residents | 18 s | 0.32 tok/s | 84% |
-| + deep pins, workload-trained | **1.9 s** | **2.51 tok/s** | 100% |
-| steady state (novel prompts) | 35 s | 0.25 tok/s | 82% |
+The engines are not four copies of the same code. They share one substrate and
+diverge only where the architectures genuinely differ:
 
-Decode speed is a function of cache warmth, and the cache learns your workload —
-the steady-state number climbs toward the trained number with use. Phase-profiled
-honestly: at high hit rates the bottleneck is CPU expert matmul, which is the
-roadmap's next target.
+- **Shared kernels & core** (`c/moe_*.h`): the f32/bf16/int4/int8 matmuls, RMSNorm,
+  softmax, sampling, the serve protocol, scaled-dot-product attention
+  (`sdpa_head`), and a descriptor-driven MoE block (`moe_block` — route → top-k →
+  combine). Contract differences (activation precision, RoPE vs learned bias,
+  KV-cache layout, shared-expert policy) are *parameters*, not forks.
+- **Per-engine forward** wires those primitives together for each architecture's
+  quirks (Laguna's softplus gate, Inkling's short-convs, GLM's MLA/DSA indexer).
+- **Oracle-gated refactor**: the shared substrate was extracted step by step with
+  every engine's token-exact oracle green at each commit — the dedup cost zero
+  numeric drift.
+
+Design docs: [`docs/moe-runtime-plan.md`](docs/moe-runtime-plan.md) (the five-pillar
+plan) and [`docs/moe-arch-survey.md`](docs/moe-arch-survey.md) (how the four
+architectures map to descriptors).
+
+## Performance
+
+Ryzen 9 7900 · 187 GB DDR5 · RTX A6000 · NVMe.
+
+**Laguna 118B (fits the A6000).** Single-stream decode is bandwidth/latency-bound
+at ~12–14 tok/s; the real win is throughput — batched decode amortizes the
+resident read across streams:
+
+| Batch | Aggregate tok/s | Speedup |
+|---|---|---|
+| 1 | 11.5 | 1.0× |
+| 8 | 28.9 | 2.5× |
+| 16 | 30.9 | 2.7× |
+
+**Inkling 975B (streamed).** Decode speed is a function of cache warmth, and the
+cache learns your workload — from ~0.06 tok/s cold to ~2.5 tok/s once your hot
+experts are pinned. Honest phase-profiling: at high hit rates the bottleneck is
+CPU expert matmul.
+
+## `swing` CLI
+
+```sh
+swing run "prompt" [-n N]     # one-shot generation
+swing api [args...]           # OpenAI/Anthropic API + web UI (port 8000)
+swing build [cuda]            # build the engine
+swing info                    # model / cache / hardware status
+```
 
 ## Roadmap
 
-- LoRA adapter serving (fine-tune on [Tinker](https://thinkingmachines.ai/tinker),
-  run the adapter here)
-- mmap expert path for RAM ≥ model machines (512 GB box = every prompt runs warm)
-- GPU expert tier + MTP speculative decoding
-- Perplexity harness (quantization quality, measured not vibed)
-- The rest of the hummingbird catalog as open trillion-scale models keep landing
+- Group-by-expert (Megablocks-style) batching to push aggregate throughput past 2.7×
+- Continuous batching wired into the serve loop (multi-tenant server)
+- Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
+- Heat-tiered quantization (measured, not vibed) for capacity
+- More of the hummingbird catalog as open MoE models land
 
 ## Relationship to colibrì
 
-sabrewing is a friendly fork, not a rival. The GLM-5.2 engine (`c/glm.c`) that
-colibrì is built around ships here unchanged and working; the substrate this fork
-stands on — expert streaming, the int4 container, the oracle-validation culture —
-is colibrì's design, and improvements that belong upstream go upstream
-([tokenizer](https://github.com/JustVugg/colibri/pull/330),
-[I/O robustness](https://github.com/JustVugg/colibri/pull/331),
-[profiling](https://github.com/JustVugg/colibri/pull/232) — merged, and the
-[Inkling engine itself](https://github.com/JustVugg/colibri/pull/312) is offered
-there too). Licensed [Apache 2.0](LICENSE), same as upstream and same as the model.
+sabrewing is a friendly fork, not a rival. The GLM engine (`c/colibri.c`) that
+colibrì is built around ships here and works; the substrate this fork stands on —
+expert streaming, the int4 container, the oracle-validation culture — is colibrì's
+design, and improvements that belong upstream go upstream. Licensed
+[Apache 2.0](LICENSE), same as upstream.
 
 ---
 
