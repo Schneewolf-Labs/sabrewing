@@ -306,3 +306,58 @@
   .typing i:nth-child(3) { animation-delay: 0.3s; }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; } }
 }
+
+/* ---- markdown rendering (assistant messages) ---- */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 0.7em; }
+.md h1, .md h2, .md h3, .md h4 { margin: 1em 0 0.4em; line-height: 1.25; font-weight: 650; }
+.md h1 { font-size: var(--step-1); }
+.md h2 { font-size: 1.15em; }
+.md h3, .md h4 { font-size: 1.02em; }
+.md ul, .md ol { margin: 0 0 0.7em; padding-left: 1.4em; }
+.md li { margin: 0.2em 0; }
+.md a { color: var(--gorget); text-underline-offset: 2px; }
+.md blockquote {
+  margin: 0 0 0.7em; padding: 0.1em 0 0.1em 0.9em;
+  border-left: 3px solid var(--violet-dim); color: var(--mist-dim);
+}
+.md hr { border: 0; border-top: 1px solid var(--night-3); margin: 1em 0; }
+.md code.inline {
+  font-family: var(--font-mono); font-size: 0.88em;
+  background: var(--night-0); border: 1px solid var(--night-3);
+  border-radius: 5px; padding: 0.08em 0.36em;
+}
+
+/* fenced code blocks */
+.md .code-block {
+  margin: 0 0 0.8em; border: 1px solid var(--night-3);
+  border-radius: var(--radius-sm); overflow: hidden; background: var(--night-0);
+}
+.md .code-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.3em 0.7em; background: var(--night-1);
+  border-bottom: 1px solid var(--night-3);
+}
+.md .code-lang { font-size: var(--step--1); color: var(--mist-faint); letter-spacing: 0.03em; }
+.md .copy-code {
+  font: inherit; font-size: var(--step--1); cursor: pointer;
+  color: var(--mist-dim); background: transparent; border: 1px solid var(--night-3);
+  border-radius: 6px; padding: 0.12em 0.6em; transition: color var(--quick), border-color var(--quick);
+}
+.md .copy-code:hover { color: var(--gorget); border-color: var(--gorget-dim); }
+.md pre {
+  margin: 0; padding: 0.8em 0.9em; overflow-x: auto;
+  font-family: var(--font-mono); font-size: 0.86em; line-height: 1.5;
+}
+.md pre code { font-family: inherit; background: none; border: 0; padding: 0; }
+
+/* light-touch syntax colors (theme-aware via oklch lightness) */
+.tok-com { color: var(--mist-faint); font-style: italic; }
+.tok-str { color: oklch(72% 0.13 45); }
+.tok-num { color: oklch(74% 0.12 300); }
+.tok-kw  { color: var(--gorget); }
+@media (prefers-color-scheme: light) {
+  .tok-str { color: oklch(52% 0.14 40); }
+  .tok-num { color: oklch(50% 0.15 300); }
+}

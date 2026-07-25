@@ -1,10 +1,11 @@
 <script setup>
 import { ref, nextTick, onMounted } from "vue"
 import { streamChat, fetchModel } from "./lib/api.js"
+import { renderMarkdown } from "./lib/markdown.js"
 import ExpertBrain from "./components/ExpertBrain.vue"
 import Settings from "./components/Settings.vue"
 
-const model = ref("inkling-colibri")
+const model = ref("sabrewing")
 const messages = ref([])          // {role, content, think, phase}
 const draft = ref("")
 const busy = ref(false)
@@ -14,11 +15,23 @@ const thread = ref(null)
 let controller = null
 
 const PROMPTS = [
-  "Explain how a hummingbird hovers.",
-  "Write a haiku about dusk.",
-  "What makes an MoE model efficient?",
-  "Translate 'the night is quiet' into three languages.",
+  "Write a Python function to debounce a callback.",
+  "Explain the difference between a process and a thread.",
+  "Refactor a nested for-loop into a list comprehension.",
+  "Write a SQL query for the top 5 customers by revenue.",
 ]
+
+// copy-code buttons live inside v-html markdown; catch clicks via delegation
+function onThreadClick(e) {
+  const btn = e.target.closest?.(".copy-code")
+  if (!btn) return
+  const code = btn.closest(".code-block")?.querySelector("code")
+  if (!code) return
+  navigator.clipboard?.writeText(code.textContent)
+  const prev = btn.textContent
+  btn.textContent = "Copied"
+  setTimeout(() => { btn.textContent = prev }, 1200)
+}
 
 onMounted(async () => { model.value = await fetchModel() })
 
@@ -100,14 +113,14 @@ function reset() { messages.value = [] }
       <section class="chat">
         <div v-if="!messages.length" class="empty">
           <img class="big" src="/sabrewing.svg" alt="" />
-          <h2>A trillion parameters, on your hardware.</h2>
+          <h2>Large open models, on hardware you own.</h2>
           <p>Streaming straight from the machine in front of you — nothing leaves this endpoint.</p>
           <div class="chips">
             <button v-for="p in PROMPTS" :key="p" class="chip" @click="send(p)">{{ p }}</button>
           </div>
         </div>
 
-        <div v-else class="thread" ref="thread">
+        <div v-else class="thread" ref="thread" @click="onThreadClick">
           <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
             <div class="who">{{ m.role === "user" ? "You" : "◈" }}</div>
             <div class="body">
@@ -123,7 +136,8 @@ function reset() { messages.value = [] }
               </details>
 
               <div v-if="m.content || m.phase !== 'thinking'" class="bubble">
-                <template v-if="m.content">{{ m.content }}</template>
+                <template v-if="m.content && m.role === 'assistant'"><div class="md" v-html="renderMarkdown(m.content)" /></template>
+                <template v-else-if="m.content">{{ m.content }}</template>
                 <span v-else-if="busy && i === messages.length - 1" class="typing" aria-label="Generating"><i /><i /><i /></span>
               </div>
             </div>

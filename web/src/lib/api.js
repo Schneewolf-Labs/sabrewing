@@ -8,12 +8,15 @@ const base = () => settings.baseUrl || ""
 const CTRL = /<\|[^|]*\|>/g   // any Inkling control marker, belt-and-suspenders
 
 export async function streamChat(messages, { model, reasoning, signal, onToken, onThink }) {
+  const sys = settings.systemPrompt?.trim()
+  const msgs = sys ? [{ role: "system", content: sys }, ...messages] : messages
   const body = {
-    model, messages, stream: true,
+    model, messages: msgs, stream: true,
     temperature: settings.temperature,
+    top_p: settings.topP,
     max_tokens: settings.maxTokens,
   }
-  if (reasoning) body.reasoning_effort = "high"
+  if (reasoning) body.reasoning_effort = settings.reasoningEffort || "high"
   const res = await fetch(`${base()}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -49,8 +52,8 @@ export async function fetchModel() {
   try {
     const r = await fetch(`${base()}/v1/models`, { headers: authHeaders() })
     const j = await r.json()
-    return j.data?.[0]?.id || "inkling-colibri"
-  } catch { return "inkling-colibri" }
+    return j.data?.[0]?.id || "sabrewing"
+  } catch { return "sabrewing" }
 }
 
 // /experts -> { rows, cols, map (hex, 1 byte/expert: tier<<6 | heat) }

@@ -19,9 +19,31 @@ defineEmits(["close"])
       </label>
 
       <label class="field">
+        <span>Top-p <b>{{ settings.topP.toFixed(2) }}</b></span>
+        <input type="range" min="0.1" max="1" step="0.01" v-model.number="settings.topP" />
+        <small>Nucleus mass kept when sampling (1.0 = off).</small>
+      </label>
+
+      <label class="field">
         <span>Max tokens <b>{{ settings.maxTokens }}</b></span>
         <input type="range" min="32" max="4096" step="32" v-model.number="settings.maxTokens" />
         <small>Longest reply before the engine stops.</small>
+      </label>
+
+      <label class="field">
+        <span>Reasoning effort</span>
+        <select v-model="settings.reasoningEffort">
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+        <small>Depth of the reasoning pass (when the Reasoning toggle is on).</small>
+      </label>
+
+      <label class="field">
+        <span>System prompt</span>
+        <textarea rows="3" v-model="settings.systemPrompt" placeholder="Optional — steer the model's role/behavior"></textarea>
+        <small>Prepended to every conversation. Leave blank for the model's default.</small>
       </label>
 
       <label class="field">

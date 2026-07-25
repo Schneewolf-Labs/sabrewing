@@ -3,10 +3,13 @@ import { reactive, watch } from "vue"
 // Shared, persisted settings. Both the UI and the API client read this object,
 // so a change in the panel takes effect on the next request with no plumbing.
 const DEFAULTS = {
-  baseUrl: "",       // "" = same origin the UI is served from
-  apiKey: "",        // sent as Authorization: Bearer <key> when set
+  baseUrl: "",              // "" = same origin the UI is served from
+  apiKey: "",              // sent as Authorization: Bearer <key> when set
   temperature: 0.7,
+  topP: 0.95,              // nucleus sampling mass
   maxTokens: 1024,
+  systemPrompt: "",        // prepended as a system message when set
+  reasoningEffort: "high", // low | medium | high (when reasoning is on)
 }
 
 function load() {
