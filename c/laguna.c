@@ -174,6 +174,11 @@ static void resmm_b(float *y, const float *x, const void *W, const void *Wdev, i
  * switches to the int8-activation VNNI path (~2x faster, ~0.4% quant noise) for
  * the CPU-resident expert layers — the decode bottleneck when most layers are on
  * the GPU. g_exact always forces f32 (the oracle stays exact). */
+/* QK accumulation contract: double under g_exact (the oracle validates that path, as
+ * with the matmuls), AVX-512 FMA otherwise. LAG_ATTN_EXACT=1 forces double everywhere
+ * for A/B. Attention was 35% of a 2k-context decode step in scalar double math. */
+static int g_attn_exact = 0;
+static int lag_qk_mode(void) { return (g_exact || g_attn_exact) ? MOE_QK_DBL : MOE_QK_SIMD; }
 static int lag_q4_mode(void) {
     static int idot = -1;
     if (idot < 0) idot = getenv("LAG_IDOT") ? 1 : 0;
@@ -810,8 +815,8 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
                 /* laguna's contract: scale 1/sqrt(hd), no rel-bias/tau, QK in double.
                  * cache is [pos][kv-head][hd] so this head's rows stride by nkv*hd. */
                 sdpa_head(Q + ((int64_t)t * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
-                          hd, j0, pos, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)t * H + hh) * hd, att,
-                          kv->ring[li]);
+                          hd, j0, pos, scaling, 1.f, NULL, 0, lag_qk_mode(),
+                          AO + ((int64_t)t * H + hh) * hd, att, kv->ring[li]);
             }
             free(att);
         }
@@ -870,6 +875,11 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
     int *pos = malloc((size_t)B * sizeof(int));
     for (int b = 0; b < B; b++) pos[b] = kvs[b]->len;
+    /* one score-scratch buffer for the whole call: B * heads rows, longest window */
+    int maxp = 0, Hmax = 0;
+    for (int b = 0; b < B; b++) if (pos[b] > maxp) maxp = pos[b];
+    for (int l = 0; l < c->n_layers; l++) if (c->heads[l] > Hmax) Hmax = c->heads[l];
+    float *att_all = falloc((int64_t)B * Hmax * (maxp + 1));
     float *h = falloc((int64_t)B * D);
     for (int b = 0; b < B; b++) {
         if (m->res_dt == 2) { const int8_t *q = (const int8_t*)m->embed + (int64_t)ids[b] * D;
@@ -908,18 +918,25 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         PROF_ADD(pr_proj, tp);
         double ta = PROF_T0();
         float scaling = 1.f / sqrtf((float)hd);
-        #pragma omp parallel for schedule(dynamic) if(B > 1)
-        for (int b = 0; b < B; b++) {                       /* attention: each seq over its own cache */
+        /* Attention is the one per-sequence phase left, and at B=8 a per-stream loop
+         * only fed 8 threads on a 24-core box while being 35% of a long-context step.
+         * Parallelize over (stream, head) — B*H work items — with per-item score
+         * scratch carved from one buffer instead of a malloc per item. */
+        int span = 0;
+        for (int b = 0; b < B; b++) {
             int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
-            float *att = falloc(p - j0 + 1);
-            float *Kc = kvs[b]->k[li], *Vc = kvs[b]->v[li];
+            if (p - j0 + 1 > span) span = p - j0 + 1;
+        }
+        #pragma omp parallel for schedule(dynamic) collapse(2) if(B * H > 1)
+        for (int b = 0; b < B; b++) {                       /* each seq over its own cache */
             for (int hh = 0; hh < H; hh++) {
-                int kh = hh / group;
-                sdpa_head(Q + ((int64_t)b * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
-                          hd, j0, p, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)b * H + hh) * hd, att,
-                          kvs[b]->ring[li]);
+                int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
+                float *att = att_all + ((int64_t)b * H + hh) * span;
+                int kh = hh / group;                        /* GQA: this head's KV head */
+                sdpa_head(Q + ((int64_t)b * H + hh) * hd, kvs[b]->k[li] + kh * hd,
+                          kvs[b]->v[li] + kh * hd, nkv * hd, hd, j0, p, scaling, 1.f, NULL, 0,
+                          lag_qk_mode(), AO + ((int64_t)b * H + hh) * hd, att, kvs[b]->ring[li]);
             }
-            free(att);
         }
         PROF_ADD(pr_attn, ta);
         double tg = PROF_T0();
@@ -945,7 +962,7 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
     }
     for (int b = 0; b < B; b++) rmsnorm_row(h_out + b * D, h + b * D, m->final_norm, D, c->rms_eps);
     for (int b = 0; b < B; b++) kvs[b]->len = pos[b] + 1;
-    free(h); free(xn); free(pos);
+    free(h); free(xn); free(pos); free(att_all);
 }
 /* Cheap top-k sampler for the BATCH_VARY bench: enough entropy to make the
  * streams' routing genuinely diverge, without the shared sample_logits cost
@@ -1299,6 +1316,7 @@ int main(int argc, char **argv) {
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("LAG_NOGROUP")) g_group = 0;
     if (getenv("LAG_PROF")) g_prof = 1;
+    if (getenv("LAG_ATTN_EXACT")) g_attn_exact = 1;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
     char *pbuf = NULL;

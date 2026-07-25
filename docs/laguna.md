@@ -70,6 +70,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `LAG_PROF=1` | phase breakdown of a decode step (where the wall time actually goes) |
 | `LAG_KVFULL=1` | store full-length KV on sliding layers too (A/B; same output, 2.9x the memory) |
 | `LAG_KV_SPAN=N` | positions per forward pass, default 128 — also sets the sliding ring size |
+| `LAG_ATTN_EXACT=1` | attention QK in scalar double (the oracle contract) instead of AVX-512 |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
@@ -230,37 +231,85 @@ vs one-shot).
 ## Where a decode step's time goes (`LAG_PROF=1`)
 
 Batched decode and grouped experts changed the shape of the problem, so the costs
-that matter now are not the ones single-stream profiling found. Divergent streams
-(`BATCH_VARY=1`), A6000 tier, `RES8=1`:
+that matter now are not the ones single-stream profiling found. All three columns are
+one build, one measurement pass, nothing else on the machine (divergent streams,
+A6000, `RES8=1`):
 
 | phase | B=8, 88-tok ctx | B=32, 88-tok ctx | B=8, 2187-tok ctx |
 |---|---|---|---|
-| **experts CPU** (10 of 47 MoE layers) | **38.3%** | **37.7%** | **54.5%** |
-| attention (per-sequence) | 17.7% | 11.9% | **35.0%** |
-| qkv+rope projections | 12.9% | 15.0% | 3.1% |
-| experts VRAM (37 layers) | 9.9% | 11.6% | 2.4% |
-| routing + group sort | 7.5% | 7.9% | 1.8% |
-| gate + o_proj | 7.7% | 9.2% | 1.8% |
-| shared expert | 3.7% | 3.5% | 0.9% |
-| dense MLP / lm_head / sampling | 2.4% | 3.0% | 0.5% |
-| ms per step | 269 | 825 | 1226 |
+| **experts CPU** (10 of 47 MoE layers) | **35.3%** | **32.2%** | 27.3% |
+| **attention** (per-sequence) | 8.9% | 11.3% | **41.3%** |
+| qkv+rope projections | 16.5% | 16.4% | 9.2% |
+| experts VRAM (37 layers) | 12.5% | 13.1% | 7.1% |
+| gate + o_proj | 9.7% | 10.5% | 5.5% |
+| routing + group sort | 9.6% | 9.0% | 5.4% |
+| shared expert | 4.6% | 4.0% | 2.6% |
+| dense MLP / lm_head / sampling | 2.8% | 3.4% | 1.5% |
+| ms per step | 211 | 741 | 402 |
+| aggregate tok/s | 37.9 | 43.2 | 19.9 |
 
-Two things this says, both of which contradict a reasonable guess:
+Two costs dominate, and which one depends on context length:
 
-1. **The capacity gap dominates.** The ~12 GB of routed experts that don't fit VRAM
-   are 10 of 47 MoE layers but 38–55% of the step: **10.3 ms per CPU layer vs 0.72 ms
-   per VRAM layer, 14×**. Every other optimization is now shaving the remaining half.
-   The levers are capacity (a per-*expert* VRAM cache instead of per-layer
-   all-or-nothing, so hot experts of the overflow layers are resident too, and
-   heat-tiered quant to shrink the 57 GB), `LAG_IDOT=1` (int8-VNNI CPU experts, an
-   existing knob never measured in this regime), and pillar 4's split-bandwidth
-   dispatch (run the CPU and VRAM experts of a layer concurrently).
-2. **Attention scales with context, not batch.** Its share *falls* as batch grows
-   (17.7% → 11.9%) but triples with context (→ 35.0% at 2k) — and it is the one part
-   of `forward_batch` still per-sequence, computing QK in scalar double precision
-   (laguna's oracle contract) parallelized only over B. A SIMD float path for
-   generation plus parallelism over (stream, head) is the obvious next fix for
-   long-context agents.
+1. **The capacity gap.** The ~12 GB of routed experts that don't fit VRAM are 10 of
+   47 MoE layers but ~⅓ of a short-context step — **7.3 ms per CPU layer vs 0.71 ms
+   per VRAM layer, 10×**. The levers: a per-*expert* VRAM cache instead of per-layer
+   all-or-nothing (so hot experts of the overflow layers are resident too), heat-tiered
+   quant to shrink the 57 GB, and pillar 4's split-bandwidth dispatch (run a layer's
+   CPU and VRAM experts concurrently).
+2. **Attention scales with context, not batch.** Its share is ~9-11% at short context
+   but **41% at 2k** — and it is the one part of `forward_batch` still per-sequence.
+   Quantized KV would cut its bandwidth; a flash-attention-style tiled kernel would
+   cut its passes.
+
+> **A note on these numbers.** An earlier revision of this table reported 54.5% for
+> CPU experts and 35% for attention at 2k context. That column was measured while a
+> compile and two oracle runs shared the machine, which inflated it — the numbers
+> above replace it. Two published claims about `LAG_IDOT` were also wrong for related
+> reasons (a cross-build comparison, and comparing a B=8 run's eight prefills against
+> a B=1 run's one). The benchmarking rules in `CLAUDE.md` exist because of these.
+
+### `LAG_IDOT` after grouping: no longer a win
+
+Grouping changed which int4 expert kernel is better, because the f32 path dequantizes
+each weight row **once per group** and reuses it across the group's rows, while
+`MOE_Q4_IDOT` skips dequant but pays a horizontal reduction per 32-element block.
+`make kernel-check` measures it directly (GMAC/s, f32 / idot):
+
+| shape | S=1 | S=2 | S=4 | S=8 | S=16 |
+|---|---|---|---|---|---|
+| gate_up (D→2I) | 77.8 / **90.3** | 157.7 / **170.8** | 181.7 / 187.2 | **196.1** / 153.0 | **206.7** / 196.6 |
+| down (I→D) | **205.1** / 146.8 | 163.2 / **177.5** | **215.4** / 209.9 | **243.4** / 181.8 | **278.3** / 214.9 |
+
+IDOT keeps its ~+16% only for `gate_up` at one or two rows — the regime it was
+measured in originally — and loses from four rows up and on `down` almost everywhere.
+End to end the differences cancel: B=32 short measured 43.56 tok/s with `LAG_IDOT=1`
+vs 43.19 without, i.e. noise. It stays **off by default**: no speed to buy, and it
+costs ~0.4% quant noise. The same table quantifies the batched kernel itself —
+`gate_up` f32 goes 77.8 → 206.7 GMAC/s (2.7×) purely from having rows to amortize
+dequant over.
+
+### Attention: SIMD for generation, and threads over heads
+
+Attention computed QK in **scalar double** (laguna's oracle contract) and
+parallelized over streams only — at B=8 that fed 8 threads on a 24-core box.
+`MOE_QK_SIMD` (AVX-512 FMA dot + vectorized value accumulation) now runs for
+generation while `g_exact` keeps the double path, and decode parallelizes over
+(stream, head). Measured within one build:
+
+| | attention ms/step | aggregate |
+|---|---|---|
+| B=8 @2k, scalar double + per-stream threads | 238.8 | 17.6 tok/s |
+| B=8 @2k, SIMD + per-head threads | **166** (−30%) | **19.9** (+13%) |
+| B=1 short, scalar double | 5.68 | 20.8 tok/s |
+| B=1 short, SIMD + per-head | **2.47** (2.3×) | 21.9 |
+| B=32 short (attention is only ~11% there) | 86.5 → 83.4 | 43.4 → 43.2 (noise) |
+
+Long-prompt prefill also improves (583 → 464 s for 8 × 2139 tokens, −20%). The win is
+where the profile said it would be — long context — and invisible at short context,
+which is why the table above matters more than the change itself.
+`LAG_ATTN_EXACT=1` restores the double path. The oracle still validates that exact
+path, so the SIMD path is checked in `make kernel-check` against it (windows of
+1/17/512/2187, agreeing to ~1e-7).
 
 ## KV cache: sliding layers on a ring
 

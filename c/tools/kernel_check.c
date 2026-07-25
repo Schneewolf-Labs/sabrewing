@@ -17,6 +17,7 @@
 #include "../moe_quant.h"
 #include "../moe_matmul.h"
 #include "../moe_sample.h"   /* sample_logits: head path vs exhaustive sort */
+#include "../moe_attn.h"     /* sdpa_head: SIMD generation path vs the exact contract */
 
 /* round f32 -> bf16 (round-to-nearest-even), as bf16 weights are stored */
 static uint16_t f2bf16(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7FFF + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
@@ -113,6 +114,35 @@ int main(void) {
     ok &= report("MOE_Q8_F32 simd",    q8f, q8r, O, 1e-3);
     ok &= report("MOE_Q8_IDOT (int8a)", q8i, q8r, O, 3e-2);
 
+    /* ---- attention: the SIMD generation path vs the double-accumulate contract ----
+     * laguna's oracle runs MOE_QK_DBL, so the fast path used for generation needs its
+     * own check: same scores, same weighted sum, to float noise. Long windows are the
+     * interesting case (more accumulation), so sweep the window length. */
+    {
+        int hd = 128, kvs_stride = 8 * 128;
+        int wins[] = {1, 17, 512, 2187};
+        printf("attention sdpa_head [hd=%d] MOE_QK_SIMD vs MOE_QK_DBL:\n", hd);
+        for (size_t wi = 0; wi < sizeof(wins) / sizeof(wins[0]); wi++) {
+            int npos = wins[wi];
+            float *q = malloc((size_t)hd * 4);
+            float *K = malloc((size_t)npos * kvs_stride * 4), *V = malloc((size_t)npos * kvs_stride * 4);
+            float *o1 = malloc((size_t)hd * 4), *o2 = malloc((size_t)hd * 4);
+            float *sc = malloc((size_t)npos * 4);
+            for (int i = 0; i < hd; i++) q[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            for (int64_t i = 0; i < (int64_t)npos * kvs_stride; i++) {
+                K[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+                V[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            }
+            sdpa_head(q, K, V, kvs_stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                      NULL, 0, MOE_QK_DBL, o1, sc, 0);
+            sdpa_head(q, K, V, kvs_stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                      NULL, 0, MOE_QK_SIMD, o2, sc, 0);
+            char name[64]; snprintf(name, sizeof(name), "window %d", npos);
+            ok &= report(name, o2, o1, hd, 1e-5);
+            free(q); free(K); free(V); free(o1); free(o2); free(sc);
+        }
+    }
+
     /* ---- sampler: the top-k head path must pick EXACTLY what the full sort picks ----
      * Same RNG state in, same token out, across distribution shapes: peaked (the head
      * covers top_p immediately), realistic, near-uniform (forces the head to widen),
@@ -145,6 +175,47 @@ int main(void) {
                bad ? "FAIL" : "OK");
         if (bad) ok = 0;
         free(lg);
+    }
+
+    /* ---- int4 expert GEMM: which activation contract wins at which group size? ----
+     * Group-by-expert changed this question. The f32 path dequantizes a weight row
+     * ONCE per call and reuses it across the group's rows (dequant costs several times
+     * the multiply), while MOE_Q4_IDOT pays a horizontal reduction per 32-element
+     * block but skips dequant entirely. So the answer depends on rows-per-group, and
+     * guessing it from end-to-end runs on a 57 GB model produced two wrong claims —
+     * hence this direct measurement. Timing only; it does not gate PASS. */
+    {
+        struct { int I, O; const char *what; } shapes[] = {
+            {3072, 2048, "gate_up (D->2I)"}, {1024, 3072, "down (I->D)"},
+        };
+        int rows[] = {1, 2, 4, 8, 16};
+        printf("int4 expert GEMM throughput (GMAC/s), f32 vs idot by rows-per-group:\n");
+        for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+            int I = shapes[si].I, O = shapes[si].O;
+            uint8_t *pk = malloc((size_t)O * (I / 2));
+            float *scl = malloc((size_t)O * 4);
+            for (int64_t i = 0; i < (int64_t)O * (I / 2); i++) pk[i] = rand() & 0xFF;
+            for (int o = 0; o < O; o++) scl[o] = 0.01f + (rand() / (float)RAND_MAX) * 0.03f;
+            printf("  %-16s", shapes[si].what);
+            for (size_t ri = 0; ri < sizeof(rows) / sizeof(rows[0]); ri++) {
+                int S = rows[ri];
+                float *xb = malloc((size_t)S * I * 4), *yb = malloc((size_t)S * O * 4);
+                for (int64_t i = 0; i < (int64_t)S * I; i++) xb[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+                double mac = (double)S * I * O, best[2];
+                for (int mode = 0; mode < 2; mode++) {
+                    int m = mode ? MOE_Q4_IDOT : MOE_Q4_F32;
+                    matmul_q4_kb(yb, xb, pk, scl, S, I, O, m, 0);          /* warm */
+                    int reps = (int)(2e9 / mac); if (reps < 3) reps = 3;
+                    double t0 = now_s();
+                    for (int r = 0; r < reps; r++) matmul_q4_kb(yb, xb, pk, scl, S, I, O, m, 0);
+                    best[mode] = mac * reps / (now_s() - t0) / 1e9;
+                }
+                printf("  S=%-2d f32 %5.1f idot %5.1f", S, best[0], best[1]);
+                free(xb); free(yb);
+            }
+            printf("\n");
+            free(pk); free(scl);
+        }
     }
 
     printf("%s\n", ok ? "KERNEL-CHECK PASS" : "KERNEL-CHECK FAIL");

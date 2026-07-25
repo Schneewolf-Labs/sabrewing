@@ -74,9 +74,25 @@ on a box with a newer transformers, don't delete them casually).
 Extra checks that matter for batching/grouping work:
 - `BATCH=N` asserts every stream reproduces the single-stream greedy output.
 - `BATCH_AB=1` times per-token vs grouped MoE **in one process** (KV rewound
-  between passes) and asserts the two passes are token-identical. Always A/B this
-  way — cross-process timing on a 57 GB model swings ~2× with page-cache state, and
-  a `make` running alongside a bench silently biases it.
+  between passes) and asserts the two passes are token-identical.
+
+**Benchmarking rules — violating these has produced wrong numbers here more than
+once, and a wrong number is worse than no number:**
+1. **Nothing else runs during a bench.** No `make`, no oracle run, no second engine.
+   A compile alongside a 24-core bench inflated one config by ~4× and made a change
+   look good that wasn't; a still-exiting engine holding 47 GB of VRAM crippled the
+   next run's expert cache.
+2. **Never compare across builds.** Timings on this model swing ~2× with page-cache
+   and allocation state. Put both arms of every A/B in ONE pass over ONE binary
+   (`BATCH_AB=1`, `LAG_ATTN_EXACT=1`, `LAG_NOGROUP=1`, `LAG_KVFULL=1` all exist for
+   this).
+3. **Check what a number is per.** A B=8 run prefills eight prompts; a B=1 run
+   prefills one. Comparing their prefill totals produced a fictitious "7.8× slower"
+   claim about `LAG_IDOT`.
+4. **Don't filter a test's stderr into oblivion.** `grep ERROR` swallowed a Python
+   traceback and left an empty log that read as a successful run.
+5. **`pkill -f <pattern>` matches your own shell** if the pattern appears in its
+   command line. Twice this killed the harness instead of the target.
 - `LAG_NOGROUP=1` runs the per-token MoE path — an A/B against the grouped path
   must be **token-identical** (grouping is bit-exact by construction: per-row
   reductions keep their order and the combine sums in top-k rank order).
