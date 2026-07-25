@@ -52,6 +52,27 @@ int    lag_cuda_moe_experts(float *out, const float *x,
                             const void *gu_q, const float *gu_s,
                             const void *dn_q, const float *dn_s,
                             const int *sel, const float *w, int K, int I, int D);
+/* GROUPED routed experts (Megablocks-style) for one VRAM-resident layer: S token
+ * rows, each routed to K experts, with the S*K (row, expert) pairs already sorted
+ * into G groups by expert. Each *distinct* expert's int4 blob is read from VRAM
+ * ONCE and applied to all its rows as a GEMM — so B concurrent streams that share
+ * an expert pay for it once, which is the lever past batched-resident decode.
+ *   gexp[G]   expert id of each group
+ *   gbeg[G]   first packed row of the group      (packed rows total S*K)
+ *   gcnt[G]   rows in the group
+ *   grow[S*K] source token row of each packed row
+ *   rowof[S*K] packed row holding (token s, rank a) — rowof[s*K+a]
+ *   w[S*K]    combine weight of (token s, rank a)
+ * acc[S,D] = sum_a w[s,a]*expert_out, summed in RANK order — the same order the
+ * per-token path accumulates in, so results are bit-identical to it.
+ * The whole layer is ONE submission: gather + 2 grouped int4 GEMMs + SiLU-GLU +
+ * combine, five launches and one sync regardless of G. */
+int    lag_cuda_moe_group(float *acc, const float *x,
+                          const void *gu_q, const float *gu_s,
+                          const void *dn_q, const float *dn_s,
+                          const int *gexp, const int *gbeg, const int *gcnt, int G,
+                          const int *grow, const int *rowof, const float *w,
+                          int S, int K, int I, int D);
 
 #ifdef __cplusplus
 }

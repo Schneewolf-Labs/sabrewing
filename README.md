@@ -40,9 +40,12 @@ Pre-converted int4 weights on the Hub:
   double-precision reference (`make kernel-check`). No "fast but subtly wrong."
 - **A6000 GPU tier** — bf16/int8 residents in VRAM, a per-layer int4 expert cache,
   batched GPU expert kernels.
-- **Batched serving** — decode many requests together and the resident weights are
-  read once for the whole batch: **~2.7× aggregate throughput** at batch 16, every
-  stream bit-identical to single-stream.
+- **Batched serving** — decode many requests together so the resident weights are
+  read once for the whole batch *and* each distinct expert once per step
+  (group-by-expert GEMM): **47 tok/s aggregate at batch 32 vs 16 single-stream**,
+  every stream bit-identical to single-stream. `--kv-slots N` puts it behind the API
+  as continuous batching (+76% aggregate, 14× better tail latency on 8 concurrent
+  requests).
 - **OpenAI + Anthropic APIs** (`/v1/chat/completions`, `/v1/messages`, streaming,
   temperature/top-p) with each model's chat template, plus a browser chat UI.
 
@@ -59,7 +62,8 @@ make laguna CUDA=1 ARCH=native            # GPU tier (or `make laguna` for CPU)
 SNAP=~/models/laguna_i4 ./laguna -p "def is_prime(n):" -n 128
 
 # OpenAI + Anthropic API + web chat UI on http://127.0.0.1:8000
-python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4
+# --kv-slots 8 = continuous batching: 8 requests in flight, decoded in lockstep
+python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4 --kv-slots 8
 ```
 
 Speed levers (all opt-in; the oracle stays exact): `RES8=1` int8 residents in VRAM
@@ -94,14 +98,25 @@ architectures map to descriptors).
 Ryzen 9 7900 · 187 GB DDR5 · RTX A6000 · NVMe.
 
 **Laguna 118B (fits the A6000).** Single-stream decode is bandwidth/latency-bound
-at ~12–14 tok/s; the real win is throughput — batched decode amortizes the
-resident read across streams:
+at ~12–16 tok/s; the real win is throughput. Two levers, both bit-exact: batched
+decode amortizes the *resident* read across streams, and group-by-expert (Megablocks
+-style) MoE reads each *distinct* expert once per step no matter how many streams
+routed to it — which is what carries past the batch-16 wall:
 
-| Batch | Aggregate tok/s | Speedup |
-|---|---|---|
-| 1 | 11.5 | 1.0× |
-| 8 | 28.9 | 2.5× |
-| 16 | 30.9 | 2.7× |
+| Batch | resident-batched | + group-by-expert | divergent streams |
+|---|---|---|---|
+| 1 | 15.7 | 16.4 | — |
+| 8 | 30.5 | **40.9** | 36.0 |
+| 16 | 34.0 | **43.2** | 38.4 |
+| 32 | 30.3 | **47.2** | 44.3 |
+
+Resident-only batching saturates ~30–34 tok/s (B=32 is no better than B=16 — every
+stream still paid for its own expert reads); grouping keeps the curve climbing.
+
+Grouping also speeds prefill (a chunk of prompt tokens groups the same way).
+Divergent-stream numbers are reported alongside identical-stream ones because
+identical streams route identically and flatter the grouping — see
+[`docs/laguna.md`](docs/laguna.md).
 
 **Inkling 975B (streamed).** Decode speed is a function of cache warmth, and the
 cache learns your workload — from ~0.06 tok/s cold to ~2.5 tok/s once your hot
@@ -119,8 +134,6 @@ swing info                    # model / cache / hardware status
 
 ## Roadmap
 
-- Group-by-expert (Megablocks-style) batching to push aggregate throughput past 2.7×
-- Continuous batching wired into the serve loop (multi-tenant server)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land

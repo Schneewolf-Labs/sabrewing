@@ -62,29 +62,75 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `RES8=1` | int8 residents in VRAM (fits more experts, +bandwidth) |
 | `LAG_IDOT=1` | CPU experts via int8-VNNI (~+19% on the CPU tier; ~0.4% quant noise) |
 | `BATCH=N` | batched-decode throughput bench (N copies of the prompt) |
+| `BATCH_VARY=1` | bench with *divergent* streams (sampled, per-stream seed) — the honest multi-tenant number |
+| `BATCH_AB=1` | bench both MoE paths in one process (+ asserts they are token-identical) |
+| `LAG_NOGROUP=1` | disable group-by-expert batching (A/B knob; output is identical either way) |
+| `LAG_GROUP_CHUNK=N` | rows per grouping chunk, default 128 (prefill is chunked; bounds scratch) |
+| `LAG_PREFILL_CHUNK=N` | serve mode: prompt tokens prefilled per step, default 128 (the decoders' worst-case stall when a long prompt arrives) |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
 
 ## Batched serving (the throughput win)
 
-Single-stream decode is bandwidth/latency-bound (~12–14 tok/s). Decoding many
-requests together reads the resident weights **once for the whole batch**
-(`forward_batch`), so aggregate throughput scales:
+Single-stream decode is bandwidth/latency-bound (~12–16 tok/s) — one token has to
+walk the whole model, so it is a latency problem no amount of compute fixes. The
+axis that *does* scale is **throughput**, and it has two levers, both landed and
+both bit-exact:
+
+1. **Batched residents** (`forward_batch`) — decode B streams in lockstep so the
+   resident weights (attention, dense, shared expert, lm_head) are read **once for
+   the whole batch** instead of once per stream.
+2. **Group-by-expert MoE** (`lag_moe_group`, Megablocks-style) — sort the B·top_k
+   (row, expert) pairs by expert and run one GEMM per **distinct** expert, so an
+   expert's ~1.2 MB of int4 weights is read once per step no matter how many
+   streams routed to it. This is what carries past the batch-16 wall, and it also
+   speeds up **prefill**, where a chunk of prompt tokens groups the same way.
 
 ```
-BATCH=16 SNAP=~/models/laguna_i4 ./laguna -f chat.txt -n 24
+BATCH=16 SNAP=~/models/laguna_i4 ./laguna -f chat.txt -n 48               # identical streams
+BATCH=16 BATCH_VARY=1 SNAP=~/models/laguna_i4 ./laguna -f chat.txt -n 48  # divergent streams
+LAG_NOGROUP=1 ...                                                          # lever 2 off (A/B)
 ```
 
-| Batch | Aggregate tok/s | Speedup |
-|---|---|---|
-| 1 | 11.5 | 1.0× |
-| 8 | 28.9 | 2.5× |
-| 16 | 30.9 | 2.7× |
+Measured on the A6000 tier (`RES8=1`, 37/47 expert layers in VRAM, 40-token prompt,
+48 tokens/stream). `BATCH_AB=1` times both MoE paths **in one process** — same
+loaded model, same page cache, KV rewound between passes — because cross-process
+A/B on a 57 GB model is far too noisy to trust. Aggregate tok/s:
 
-Every stream is bit-identical to single-stream (per-row identical to `forward` at
-S=1). Throughput saturates ~batch 16 because experts are still computed per-token;
-group-by-expert batching is the next lever.
+| Batch | resident-batched only | + group-by-expert | gain | distinct experts / layer / step |
+|---|---|---|---|---|
+| 1 | 15.7 | 16.4 | — (S=1 doesn't group) | — |
+| **identical streams** (`BATCH=N`) ||||
+| 8 | 30.5 | **40.9** | +34% | 10 of 80 pairs (8.0× fewer reads) |
+| 16 | 34.0 | **43.2** | +27% | 10 of 160 (16.0×) |
+| 32 | 30.3 | **47.2** | +56% | 10 of 320 (32.0×) |
+| **divergent streams** (`BATCH_VARY=1`) ||||
+| 8 | 29.3 | **36.0** | +23% | 29.6 of 80 (2.7×) |
+| 16 | 30.3 | **38.4** | +27% | 41.1 of 160 (3.9×) |
+| 32 | 31.8 | **44.3** | +39% | 64.2 of 320 (5.0×) |
+
+The shape is the point: **resident-only batching saturates at ~30–34 tok/s** and
+B=32 is no better than B=16 (it is slightly *worse*) because every stream still paid
+for its own expert reads. With grouping the curve keeps climbing — 40.9 → 43.2 →
+47.2 — so the batch-16 wall moved. Real divergent traffic keeps most of it: even
+with 32 independently sampled streams, 320 routed pairs collapse onto ~64 distinct
+experts, because expert popularity is skewed and streams share context.
+
+Prefill benefits too (a chunk of prompt tokens groups exactly like a batch of
+streams) — on a 2139-token agentic prompt, **22.0 → 28.6 tok/s (+30%)**.
+
+**Read the two columns honestly.** `BATCH=N` decodes N *copies* of one prompt, so
+every stream routes identically and the distinct-expert count collapses to top_k
+(10) — a best case for grouping, and the number a demo would quote. `BATCH_VARY=1`
+samples each stream with its own seed so the streams genuinely diverge; the bench
+prints the measured amortization (`grouping: … distinct experts per MoE layer per
+step`) so the mechanism is visible rather than assumed.
+
+Every stream stays **bit-identical** to single-stream decode: each dot keeps the
+ungrouped reduction order and the per-token combine sums the selected experts in
+top-k rank order, so grouping changes *when a weight is read*, never the arithmetic.
+`LAG_NOGROUP=1` is the A/B knob and must produce identical tokens.
 
 ## Chat serving (OpenAI + Anthropic gateway)
 
@@ -96,6 +142,61 @@ python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna
 `--arch laguna` is auto-detected from `config.json` (`model_type: laguna`). The
 gateway renders Laguna's chat template and splits reasoning between
 `<think>`/`</think>`; model id `laguna-s-2.1-colibri`.
+
+### Continuous batching (`--kv-slots N`)
+
+```sh
+python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4 --kv-slots 8
+```
+
+Serve mode used to finish one request before starting the next, so the throughput
+above was unreachable through the gateway: a second client simply waited. With
+`--kv-slots N` (passed to the engine as `KV_SLOTS`) up to N requests stay in flight
+— each slot owns a KV cache and its own sampling stream, and every decode step runs
+all active slots through `forward_batch`, so they share one pass over the residents
+and one grouped read per distinct expert.
+
+Measured with 8 requests submitted at once (`tools/`-free driver over the raw serve
+protocol, A6000 tier, temp 0.7 / top-p 0.95):
+
+| 8 concurrent requests | serial (`KV_SLOTS=1`) | continuous (`KV_SLOTS=8`) |
+|---|---|---|
+| 48 tokens each — aggregate | 11.72 tok/s | **17.66 tok/s** (+51%) |
+| 192 tokens each — aggregate | 11.21 tok/s | **19.73 tok/s** (+76%) |
+| worst first-token latency (192) | 105.9 s | **7.3 s** (14.6× better) |
+
+The tail-latency number is the one that matters for agents: serially, the eighth
+request waits out the other seven before it emits anything.
+
+`KV_SLOTS=1` keeps the old serial loop (lowest single-request latency). A slot's
+tokens are what the serial path would produce; only the RNG stream differs, since
+each slot samples from its own seed. `CANCEL` is honored at the next step boundary.
+
+**Chunked prefill.** A newly admitted request used to prefill in one blocking call,
+so an agentic 2k-token prompt arriving mid-flight froze every stream already decoding
+for its whole prefill. The prompt is now fed `LAG_PREFILL_CHUNK` tokens per outer
+iteration, interleaved with the decode steps of the running slots. Measured with 6
+streams mid-generation when a 2139-token prompt arrives:
+
+| prefill chunk | worst decoder stall | new request's TTFT | total wall |
+|---|---|---|---|
+| one-shot (`999999`) | 70.8 s | 70.5 s | 153.4 s |
+| **128** (default) | **4.9 s** | 73.4 s | 154.0 s |
+| 32 | 1.8 s | 96.8 s | 168.1 s |
+
+128 buys a 14× smaller stall for ~4% of the newcomer's time-to-first-token and no
+change in total wall; 32 halves the stall again but starts charging the newcomer
+(+37% TTFT) because smaller chunks group worse. Chunking is **bit-identical** to
+one-shot prefill — positions are absolute, attention reads the same cached K/V, and
+every kernel reduces per row — so `LAG_PREFILL_CHUNK=999999` is an exact A/B knob for
+the old behavior (verified: 4 requests × 40 greedy tokens byte-identical at chunk 17
+vs one-shot).
+- ~~The shared sampler qsorts the whole 100k-token vocabulary per token for
+  top-p~~ **fixed**: `sample_logits` now takes a top-64 head by partial selection
+  and only widens (finally deferring to the full sort) when the nucleus needs more,
+  which is exact by construction and validated pick-for-pick in `make kernel-check`.
+  Recovered the whole 13%: 8 × 96 tokens at temp 0.7 went **19.7 → 22.4 tok/s**,
+  now level with greedy (22.7), so sampling is no longer a serving tax.
 
 ## Validation
 
@@ -112,3 +213,13 @@ gateway renders Laguna's chat template and splits reasoning between
 - The real 118B int4 model reproduces its CPU output byte-identically under the GPU
   tier and the batched path (residual float noise only in the mixed CPU/GPU expert
   case, within quant tolerance).
+- **Group-by-expert batching** is covered at three levels:
+  - the teacher-forced oracle prefills S=36 rows, so it runs *through* the grouped
+    path — 36/36 and ppl 0.00% still hold, and `LAG_NOGROUP=1` gives identical
+    output on every oracle config (f32 / int4 / `LAG_IDOT`);
+  - `LAG_CUDA_TEST=1 ./laguna` compares the grouped CUDA kernels against the
+    per-token ones on random weights: **max|abs| = 0** (bit-identical), no model
+    needed;
+  - `BATCH_AB=1` re-decodes the real 118B model both ways from a rewound KV and
+    asserts the streams are token-identical (verified at B=8/16/32, greedy and
+    sampled).

@@ -30,7 +30,10 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [x] **Per-request context-length guard** — a prompt longer than `max_t` overruns
   the KV buffer (memory corruption, not a graceful 400). ~20 min.
 - [ ] **Serial serve only** — one request at a time, no batching. Fine for personal
-  use; bad the moment two clients connect.
+  use; bad the moment two clients connect. *(Solved on laguna: `KV_SLOTS=N` keeps N
+  requests in flight and decodes them in lockstep through `forward_batch` + grouped
+  experts — see `docs/laguna.md`. Inkling still serves serially; its bottleneck is
+  expert streaming, not resident bandwidth, so the same loop needs the pager first.)*
 - [x] **Sampling lacks repetition penalty / min-p** — base-model completions loop.
   The chat template mostly hides it; still thin.
 - [ ] **CANCEL only honored between tokens** — a request stuck in a ~35 s cold

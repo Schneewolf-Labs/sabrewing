@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "../moe_quant.h"
 #include "../moe_matmul.h"
+#include "../moe_sample.h"   /* sample_logits: head path vs exhaustive sort */
 
 /* round f32 -> bf16 (round-to-nearest-even), as bf16 weights are stored */
 static uint16_t f2bf16(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7FFF + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
@@ -111,6 +112,40 @@ int main(void) {
     printf("int8 matmul_q8_k [%d->%d] vs double dequant reference:\n", I, O);
     ok &= report("MOE_Q8_F32 simd",    q8f, q8r, O, 1e-3);
     ok &= report("MOE_Q8_IDOT (int8a)", q8i, q8r, O, 3e-2);
+
+    /* ---- sampler: the top-k head path must pick EXACTLY what the full sort picks ----
+     * Same RNG state in, same token out, across distribution shapes: peaked (the head
+     * covers top_p immediately), realistic, near-uniform (forces the head to widen),
+     * and dead-flat (forces the exhaustive fallback). Also checks top_p=1 (the whole
+     * distribution is the nucleus) and that ties don't crash the selection. */
+    {
+        int V = 100352, trials = 60, bad = 0, nflat = 0;
+        float *lg = malloc((size_t)V * 4);
+        const float spread[] = {8.f, 2.f, 0.35f, 0.0f};    /* logit scale: peaked -> flat */
+        const float tps[] = {0.95f, 0.5f, 1.0f};
+        for (int t = 0; t < trials; t++) {
+            float sp = spread[t % 4], tp = tps[(t / 4) % 3], temp = 0.4f + 0.3f * (t % 3);
+            for (int i = 0; i < V; i++)
+                lg[i] = sp * ((rand() / (float)RAND_MAX) * 2.f - 1.f);
+            if (sp == 0.f) { nflat++; for (int i = 0; i < V; i++) lg[i] = 1.25f; }  /* all tied */
+            /* the two paths must consume the same RNG state, so replay it */
+            uint64_t saved = g_rng;
+            int a = sample_logits(lg, V, temp, tp);
+            g_rng = saved;
+            int best = 0; for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
+            double sum = 0;
+            for (int i = 0; i < V; i++) sum += expf((lg[i] - lg[best]) / temp);
+            double cut = (tp > 0.f && tp < 1.f) ? tp * sum : sum;
+            int b = sample_logits_full(lg, V, temp, cut, best);
+            if (a != b && !(sp == 0.f)) bad++;   /* flat = every logit tied, order is arbitrary */
+        }
+        printf("sampler sample_logits [V=%d, %d trials incl. %d flat] head-path vs full sort:\n",
+               V, trials, nflat);
+        printf("  %-22s %d/%d picks differ  %s\n", "top-k head", bad, trials - nflat,
+               bad ? "FAIL" : "OK");
+        if (bad) ok = 0;
+        free(lg);
+    }
 
     printf("%s\n", ok ? "KERNEL-CHECK PASS" : "KERNEL-CHECK FAIL");
     return !ok;
