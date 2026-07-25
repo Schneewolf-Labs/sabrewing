@@ -142,6 +142,46 @@ python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna
 gateway renders Laguna's chat template and splits reasoning between
 `<think>`/`</think>`; model id `laguna-s-2.1-colibri`.
 
+### Continuous batching (`--kv-slots N`)
+
+```sh
+python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4 --kv-slots 8
+```
+
+Serve mode used to finish one request before starting the next, so the throughput
+above was unreachable through the gateway: a second client simply waited. With
+`--kv-slots N` (passed to the engine as `KV_SLOTS`) up to N requests stay in flight
+— each slot owns a KV cache and its own sampling stream, and every decode step runs
+all active slots through `forward_batch`, so they share one pass over the residents
+and one grouped read per distinct expert.
+
+Measured with 8 requests submitted at once (`tools/`-free driver over the raw serve
+protocol, A6000 tier, temp 0.7 / top-p 0.95):
+
+| 8 concurrent requests | serial (`KV_SLOTS=1`) | continuous (`KV_SLOTS=8`) |
+|---|---|---|
+| 48 tokens each — aggregate | 11.72 tok/s | **17.66 tok/s** (+51%) |
+| 192 tokens each — aggregate | 11.21 tok/s | **19.73 tok/s** (+76%) |
+| worst first-token latency (192) | 105.9 s | **7.3 s** (14.6× better) |
+
+The tail-latency number is the one that matters for agents: serially, the eighth
+request waits out the other seven before it emits anything.
+
+`KV_SLOTS=1` keeps the old serial loop (lowest single-request latency). A slot's
+tokens are what the serial path would produce; only the RNG stream differs, since
+each slot samples from its own seed. `CANCEL` is honored at the next step boundary.
+
+**v1 limitations, both measured:**
+- Admission is blocking — a newly arriving request prefills before the next decode
+  step, so a long agentic prompt pauses the other slots for the duration of its
+  prefill. With 8 requests × 48 tokens, prefill is ~37% of the wall. Chunked prefill
+  interleaved with decode is the next step.
+- The shared sampler (`moe_sample.h`) qsorts the whole 100k-token vocabulary per
+  token for top-p, which now costs **13% of aggregate throughput** at 8 slots
+  (8 × 96 tokens: 22.8 tok/s greedy vs 19.7 tok/s at temp 0.7). A partial top-k
+  selection with an exact fallback when the nucleus is wider would recover it —
+  worth doing in the shared sampler, since every engine pays it.
+
 ## Validation
 
 - **Token-exact oracle**: `c/tools/make_tiny_laguna.py` builds a tiny random-init

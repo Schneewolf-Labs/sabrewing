@@ -59,7 +59,8 @@ make laguna CUDA=1 ARCH=native            # GPU tier (or `make laguna` for CPU)
 SNAP=~/models/laguna_i4 ./laguna -p "def is_prime(n):" -n 128
 
 # OpenAI + Anthropic API + web chat UI on http://127.0.0.1:8000
-python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4
+# --kv-slots 8 = continuous batching: 8 requests in flight, decoded in lockstep
+python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna_i4 --kv-slots 8
 ```
 
 Speed levers (all opt-in; the oracle stays exact): `RES8=1` int8 residents in VRAM
@@ -130,11 +131,10 @@ swing info                    # model / cache / hardware status
 
 ## Roadmap
 
-- Continuous batching wired into the serve loop (multi-tenant server) — the bench
-  proves the throughput; the gateway can't reach it until serve mode keeps several
-  requests in flight
 - Chunked prefill interleaved with decode (a long agentic prompt currently blocks
-  the batch while it prefills)
+  the batch while it prefills — ~37% of the wall at 8 requests × 48 tokens)
+- Partial top-k in the shared sampler (the full-vocab qsort costs 13% of aggregate
+  throughput at 8 slots)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land

@@ -502,11 +502,13 @@ static int64_t g_grp_rows = 0, g_grp_groups = 0, g_grp_calls = 0;   /* grouping 
 
 /* rows per grouping chunk: bounds the S*K scratch (a chunk allocates S*K*2I floats)
  * and keeps the packed rows cache-resident. Decode batches are one chunk; long
- * prefills are split, which costs nothing but grouping breadth across chunks. */
+ * prefills are split, which costs nothing but grouping breadth across chunks —
+ * wider chunks group better (2139-token prefill: 83.8s at 16, 76.2s at 64, 72.1s at
+ * 256), so the default sits at 128 where the scratch is still ~100 MB. */
 static int lag_group_chunk(void) {
     static int n = -1;
     if (n < 0) {
-        const char *e = getenv("LAG_GROUP_CHUNK"); n = e ? atoi(e) : 64;
+        const char *e = getenv("LAG_GROUP_CHUNK"); n = e ? atoi(e) : 128;
         if (n < 1) n = 1;
         if (n > 1024) n = 1024;      /* scratch is O(chunk*K*(2I+D)) floats — keep it sane */
     }
@@ -891,18 +893,131 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     fflush(stdout);
     free(ids); free(lg); free(Hd); kv_free(&kv, c->n_layers);
 }
-static void serve_loop(Model *m, Tok *T) {
+/* the READY sentinel + first STAT the gateway waits for */
+static void serve_banner(void) {
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
     g_rng ^= sd ? (uint64_t)strtoull(sd, NULL, 10) : (uint64_t)time(NULL) * 2654435761u;
     fputs("\x01\x01READY\x01\x01\n", stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
     fflush(stdout);
+}
+
+/* ---------- continuous batching (KV_SLOTS > 1) ----------
+ * The serial loop below finishes one request before starting the next, so a second
+ * client waits out the first — and the batched throughput the BATCH bench measures
+ * is unreachable from the gateway. Here up to KV_SLOTS requests stay in flight:
+ * each slot owns a KV cache and its own sampling state, and every decode step runs
+ * ALL active slots through forward_batch, so the residents are read once for the
+ * batch and the routed experts are grouped by expert. A slot's tokens are what the
+ * serial path would have produced (forward_batch is per-row identical to forward at
+ * S=1); only the RNG stream differs, since each slot samples from its own seed.
+ *
+ * v1 admission is blocking: a new request prefills before the next decode step, so
+ * a long prompt pauses the other slots for its prefill. Chunked prefill interleaved
+ * with decode is the next step (docs/laguna.md). */
+typedef struct {
+    int used; char id[64];
+    KVCache kv;
+    int np, gen, max_tok, cur, limited;
+    float temp, top_p;
+    uint64_t rng; double t0;
+} SSlot;
+
+static void slot_done(Model *m, SSlot *s) {
+    double dt = now_s() - s->t0;
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", s->id, s->gen, dt > 0 ? s->gen / dt : 0.0,
+           100.0, rss_gb(), s->np, s->limited);
+    printf("PROF %.3f %d %d 0.000 0.000 %.3f 0.000 0.000 %d\n", dt, s->np, s->gen, dt, s->gen + 1);
+    fflush(stdout);
+    kv_free(&s->kv, m->c.n_layers);
+    s->used = 0;
+}
+
+/* Prefill a request into a free slot and emit its first token. The slot is left
+ * active unless the request finished (EOS first token / max_tokens 0) or was
+ * rejected (an ERROR line is printed, as in the serial path). */
+static void slot_admit(Model *m, Tok *T, SSlot *s, SReq *q, uint64_t seq) {
+    Cfg *c = &m->c; int D = c->hidden;
+    int cap = q->plen + 16; int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+    if (np + q->max_tok > ctx_max) { printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+    snprintf(s->id, sizeof(s->id), "%s", q->id);
+    s->used = 1; s->np = np; s->gen = 0; s->max_tok = q->max_tok; s->limited = 1;
+    s->temp = q->temp; s->top_p = q->top_p; s->t0 = now_s();
+    s->rng = g_rng ^ (0x9E3779B97F4A7C15ull * (seq + 1));   /* per-slot stream, SEED-deterministic */
+    kv_init(&s->kv, m, np + q->max_tok + 8);
+    float *Hp = falloc((int64_t)np * D);
+    forward(m, &s->kv, ids, np, 0, Hp);                     /* grouped MoE over the prompt */
+    float *lg = falloc(c->vocab);
+    compute_logits(m, Hp + (int64_t)(np - 1) * D, lg);
+    free(Hp); free(ids);
+    if (q->max_tok <= 0) { free(lg); slot_done(m, s); return; }
+    g_rng = s->rng; int tk = sample_logits(lg, c->vocab, s->temp, s->top_p); s->rng = g_rng;
+    free(lg);
+    for (int e = 0; e < c->n_eos; e++) if (tk == c->eos[e]) { s->limited = 0; slot_done(m, s); return; }
+    char buf[512]; int nb = tok_decode(T, &tk, 1, buf, sizeof(buf) - 1);
+    printf("DATA %s %d\n", s->id, nb); fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout); fflush(stdout);
+    s->gen = 1; s->cur = tk;
+    if (s->gen >= s->max_tok) slot_done(m, s);
+}
+
+static void serve_loop_batched(Model *m, Tok *T, int nslots) {
+    Cfg *c = &m->c; int D = c->hidden, V = c->vocab;
+    SSlot *S = calloc((size_t)nslots, sizeof(SSlot));
+    float *Hd = falloc((int64_t)nslots * D), *lg = falloc((int64_t)nslots * V);
+    KVCache **kvs = malloc((size_t)nslots * sizeof(KVCache*));
+    int *ids = malloc((size_t)nslots * sizeof(int)), *of = malloc((size_t)nslots * sizeof(int));
+    uint64_t seq = 0;
+    serve_banner();
+    for (;;) {
+        int nact = 0; for (int i = 0; i < nslots; i++) nact += S[i].used;
+        if (!nact) { if (serve_read_cmd(NULL) < 0) break; }        /* idle: block for work */
+        while (stdin_readable()) if (serve_read_cmd(NULL) < 0) goto drain;
+        while (g_qn) {                                             /* admit into free slots */
+            int f = -1; for (int i = 0; i < nslots; i++) if (!S[i].used) { f = i; break; }
+            if (f < 0) break;
+            SReq q = g_q[0];
+            memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+            if (serve_take_cancel(q.id)) {                          /* cancelled before it ran */
+                printf("DONE %s STAT 0 0.000 100.0 %.2f 0 0\n", q.id, rss_gb()); fflush(stdout);
+            } else slot_admit(m, T, &S[f], &q, seq++);
+            free(q.payload);
+        }
+        int B = 0;                                                 /* one decode step, all slots */
+        for (int i = 0; i < nslots; i++) if (S[i].used) { kvs[B] = &S[i].kv; ids[B] = S[i].cur; of[B] = i; B++; }
+        if (!B) continue;
+        forward_batch(m, kvs, ids, B, Hd);
+        resmm_b(lg, Hd, m->lm_head, m->d_lm_head, B, D, V);        /* batched lm_head */
+        for (int b = 0; b < B; b++) {
+            SSlot *s = &S[of[b]];
+            if (serve_take_cancel(s->id)) { s->limited = 0; slot_done(m, s); continue; }
+            g_rng = s->rng; int tk = sample_logits(lg + (int64_t)b * V, V, s->temp, s->top_p); s->rng = g_rng;
+            int is_eos = 0; for (int e = 0; e < c->n_eos; e++) if (tk == c->eos[e]) is_eos = 1;
+            if (is_eos) { s->limited = 0; slot_done(m, s); continue; }
+            char buf[512]; int nb = tok_decode(T, &tk, 1, buf, sizeof(buf) - 1);
+            printf("DATA %s %d\n", s->id, nb); fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout); fflush(stdout);
+            s->gen++; s->cur = tk;
+            if (s->gen >= s->max_tok) { s->limited = 1; slot_done(m, s); }
+        }
+    }
+drain:
+    for (int i = 0; i < nslots; i++) if (S[i].used) kv_free(&S[i].kv, c->n_layers);
+    free(S); free(Hd); free(lg); free(kvs); free(ids); free(of);
+}
+
+static void serve_loop(Model *m, Tok *T) {
+    serve_banner();
     for (;;) {
         while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q);
+        /* a CANCEL that arrived while this one was still queued (the old loop ran it anyway) */
+        if (serve_take_cancel(q.id)) {
+            printf("DONE %s STAT 0 0.000 100.0 %.2f 0 0\n", q.id, rss_gb()); fflush(stdout);
+        } else serve_one(m, T, &q);
         free(q.payload);
     }
 }
@@ -1074,7 +1189,15 @@ int main(int argc, char **argv) {
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
-        serve_loop(&m, &T);
+        /* KV_SLOTS (the gateway's --kv-slots) = how many requests may be in flight.
+         * >1 switches to continuous batching; 1 keeps the serial loop's latency. */
+        int nslots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
+        if (nslots < 1) nslots = 1;
+        if (nslots > SRV_QMAX) nslots = SRV_QMAX;
+        printf("serve: %s (KV_SLOTS=%d)\n", nslots > 1 ? "continuous batching" : "serial", nslots);
+        fflush(stdout);
+        if (nslots > 1) serve_loop_batched(&m, &T, nslots);
+        else serve_loop(&m, &T);
         return 0;
     }
 

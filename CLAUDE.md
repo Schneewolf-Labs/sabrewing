@@ -53,6 +53,9 @@ BATCH=16 BATCH_VARY=1 SNAP=... ./laguna -f chat.txt -n 24   # divergent streams 
 Laguna is an instruct/RL model — always use the chat template (`-f`, or the
 gateway), never a raw base-completion prompt.
 
+Serve mode: `KV_SLOTS=N` (the gateway's `--kv-slots N`) enables continuous batching
+— N requests in flight, decoded in lockstep. `KV_SLOTS=1` is the old serial loop.
+
 ## Validation is the non-negotiable
 
 Every arch validates **token-exact against `transformers`**; no optimization lands
