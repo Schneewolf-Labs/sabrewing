@@ -47,12 +47,99 @@
 #include <immintrin.h>
 #endif
 
-enum { MOE_QK_F32 = 0, MOE_QK_DBL = 1, MOE_QK_SIMD = 2 };
+enum { MOE_QK_F32 = 0, MOE_QK_DBL = 1, MOE_QK_SIMD = 2, MOE_QK_ONLINE = 3 };
+
+/* Online-softmax (flash-attention-style) SDPA for generation: ONE pass over the K/V
+ * window instead of two, and no score buffer at all. Per position it keeps a running
+ * max m and sum s, rescaling the accumulator when a new max appears:
+ *     m' = max(m, x);  acc *= e^(m-m');  acc += e^(x-m')*V_t;  s = s*e^(m-m') + e^(x-m')
+ * which is algebraically the same softmax the two-pass version computes, but reads K
+ * and V together so the window is streamed once. That halves the memory traffic of the
+ * phase our profile put at 41% of a 2k-context decode step, and removes the per-(row,
+ * head) `sc` scratch.
+ *
+ * Rescaling makes the rounding differ from the two-pass form, so this is a separate
+ * mode: the exact contracts (MOE_QK_F32 / MOE_QK_DBL) keep their reduction order and
+ * their oracles, and kernel_check measures this path against MOE_QK_DBL. Callers with
+ * a per-distance bias (inkling) can use it too — bias is folded into the score before
+ * the max update. */
+static void sdpa_head_online(const float *q, const float *Kbase, const float *Vbase, int kv_stride,
+                             int hd, int t0, int qpos, float scale, float tau,
+                             const float *bias, int bias_len, float *out, int ring) {
+    int mask = ring - 1;
+    float m = -INFINITY, s = 0.f;
+    for (int d = 0; d < hd; d++) out[d] = 0.f;
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = ring ? (t & mask) : t;
+        const float *k = Kbase + slot * kv_stride;
+        const float *v = Vbase + slot * kv_stride;
+        float dot;
+#if defined(__AVX512F__)
+        {
+            __m512 acc = _mm512_setzero_ps();
+            int d = 0;
+            for (; d + 16 <= hd; d += 16)
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), _mm512_loadu_ps(k + d), acc);
+            float sd = _mm512_reduce_add_ps(acc);
+            for (; d < hd; d++) sd += q[d] * k[d];
+            dot = sd;
+        }
+#else
+        { float sd = 0; for (int d = 0; d < hd; d++) sd += q[d] * k[d]; dot = sd; }
+#endif
+        int dist = qpos - t;
+        float b = (bias && dist < bias_len) ? bias[dist] : 0.f;
+        float x = tau * (dot * scale + b);
+        /* The running max only rises, so it stops changing after the first few
+         * positions (O(log n) updates for unordered scores). Rescaling the whole
+         * accumulator on EVERY position doubles the value-accumulation work — the
+         * common branch must be a plain FMA, with the rescale paid only when the max
+         * actually moves. Same arithmetic either way. */
+        if (x > m) {
+            float rescale = (m == -INFINITY) ? 0.f : expf(m - x);
+            s = s * rescale + 1.f;                 /* w = exp(x-x) = 1 */
+#if defined(__AVX512F__)
+            {
+                __m512 vr = _mm512_set1_ps(rescale);
+                int d = 0;
+                for (; d + 16 <= hd; d += 16)
+                    _mm512_storeu_ps(out + d, _mm512_fmadd_ps(_mm512_loadu_ps(out + d), vr,
+                                                              _mm512_loadu_ps(v + d)));
+                for (; d < hd; d++) out[d] = out[d] * rescale + v[d];
+            }
+#else
+            for (int d = 0; d < hd; d++) out[d] = out[d] * rescale + v[d];
+#endif
+            m = x;
+        } else {
+            float w = expf(x - m);
+            s += w;
+#if defined(__AVX512F__)
+            {
+                __m512 vw = _mm512_set1_ps(w);
+                int d = 0;
+                for (; d + 16 <= hd; d += 16)
+                    _mm512_storeu_ps(out + d, _mm512_fmadd_ps(vw, _mm512_loadu_ps(v + d),
+                                                              _mm512_loadu_ps(out + d)));
+                for (; d < hd; d++) out[d] += w * v[d];
+            }
+#else
+            for (int d = 0; d < hd; d++) out[d] += w * v[d];
+#endif
+        }
+    }
+    float inv = s > 0.f ? 1.f / s : 0.f;
+    for (int d = 0; d < hd; d++) out[d] *= inv;
+}
 
 static void sdpa_head(const float *q, const float *Kbase, const float *Vbase, int kv_stride,
                       int hd, int t0, int qpos, float scale, float tau,
                       const float *bias, int bias_len, int qk_mode, float *out, float *sc,
                       int ring) {
+    if (qk_mode == MOE_QK_ONLINE) {   /* one pass, no score buffer (sc unused) */
+        sdpa_head_online(q, Kbase, Vbase, kv_stride, hd, t0, qpos, scale, tau, bias, bias_len, out, ring);
+        return;
+    }
     int n = qpos - t0 + 1;
     int mask = ring - 1;                     /* ring is a power of two, or 0 (unused) */
     int fast = (qk_mode == MOE_QK_SIMD);

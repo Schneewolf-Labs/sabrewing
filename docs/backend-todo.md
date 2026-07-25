@@ -79,10 +79,11 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 
 ## Laguna variants
 
-- [ ] **Laguna M.1 gate width** — `laguna.c` hardcodes the attention output gate to
-  `n_head` outputs. The M.1 shape uses a per-*element* gate (`n_head*head_dim`), which
-  we would silently mis-read rather than reject. Also read `mlp_layer_types` as a
-  fallback for `mlp_only_layers`. Both noted in `docs/llamacpp-notes.md`.
+- [x] **Laguna M.1 gate width** — the g_proj width now comes from the checkpoint
+  (`Layer.wg_out`): per-head broadcast at `n_head`, elementwise at `n_head*head_dim`,
+  loud exit otherwise (it used to silently use the first `n_head` rows). `cfg_load`
+  also falls back to `mlp_layer_types` when `mlp_only_layers` is absent. Found by
+  reading Poolside's llama.cpp fork — see `docs/llamacpp-notes.md`.
 
 ## Done
 

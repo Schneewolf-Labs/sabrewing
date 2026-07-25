@@ -84,6 +84,12 @@ typedef struct {
 typedef struct {
     float *ln1, *ln2;                 /* input / post-attn layernorm [hidden] (f32) */
     void  *wq, *wk, *wv, *wo, *wg;    /* attn projections (bf16 real / f32 tiny) */
+    /* g_proj output width, read from the checkpoint rather than assumed: Laguna S-2.1
+     * gates per HEAD (n_head values, broadcast over head_dim), Laguna M.1 gates per
+     * ELEMENT (n_head*head_dim). Hardcoding n_head would silently mis-read an M.1
+     * checkpoint — take the first n_head rows and broadcast them — instead of saying
+     * so, which is the failure mode this field exists to prevent. */
+    int    wg_out;
     float *qn, *kn;                   /* qk RMSNorm [head_dim] (f32) */
     /* MLP: dense uses gate/up/down; MoE uses router+ebias+experts+shared */
     void  *gate, *up, *down;          /* dense MLP (bf16/f32) */
@@ -177,8 +183,15 @@ static void resmm_b(float *y, const float *x, const void *W, const void *Wdev, i
 /* QK accumulation contract: double under g_exact (the oracle validates that path, as
  * with the matmuls), AVX-512 FMA otherwise. LAG_ATTN_EXACT=1 forces double everywhere
  * for A/B. Attention was 35% of a 2k-context decode step in scalar double math. */
-static int g_attn_exact = 0;
-static int lag_qk_mode(void) { return (g_exact || g_attn_exact) ? MOE_QK_DBL : MOE_QK_SIMD; }
+/* Two-pass SIMD is the default: the online (flash-style) single-pass variant measured
+ * NEUTRAL here, not better — see docs/llamacpp-notes.md. LAG_ATTN_ONLINE=1 selects it
+ * anyway, because it is the right structure once K/V is quantized (one pass = one
+ * dequant instead of two) and for a future GPU kernel. */
+static int g_attn_exact = 0, g_attn_online = 0;
+static int lag_qk_mode(void) {
+    if (g_exact || g_attn_exact) return MOE_QK_DBL;      /* oracle contract */
+    return g_attn_online ? MOE_QK_ONLINE : MOE_QK_SIMD;
+}
 static int lag_q4_mode(void) {
     static int idot = -1;
     if (idot < 0) idot = getenv("LAG_IDOT") ? 1 : 0;
@@ -254,7 +267,14 @@ static void cfg_load(Cfg *c, const char *snap) {
         c->is_sliding[i] = (lt && lt->t == J_ARR && i < lt->len && !strcmp(lt->kids[i]->str, "sliding_attention")) ? 1 : 0;
         c->is_moe[i] = 1;
     }
+    /* dense layers: `mlp_only_layers` lists them (Qwen2-MoE style, [0] on S-2.1);
+     * `mlp_layer_types` says it per layer and is the more explicit key. Laguna ships
+     * both, so honour either — a checkpoint with only the second (e.g. a variant with
+     * 3 leading dense layers) would otherwise load every layer as MoE. */
+    jval *mlt = json_get(o, "mlp_layer_types");
     if (mol && mol->t == J_ARR) for (int i = 0; i < mol->len; i++) { int li = (int)mol->kids[i]->num; if (li >= 0 && li < c->n_layers) c->is_moe[li] = 0; }
+    else if (mlt && mlt->t == J_ARR) for (int i = 0; i < mlt->len && i < c->n_layers; i++)
+        c->is_moe[i] = strcmp(mlt->kids[i]->str, "dense") ? 1 : 0;
 
     /* RoPE — full_attention (YaRN partial) drives global layers, sliding_attention (plain) the rest */
     jval *rp = json_get(o, "rope_parameters");
@@ -366,6 +386,16 @@ static void model_load(Model *m, const char *snap) {
         LDR(wq, "self_attn.q_proj.weight", D); LDR(wk, "self_attn.k_proj.weight", D);
         LDR(wv, "self_attn.v_proj.weight", D); LDR(wo, "self_attn.o_proj.weight", hix);
         LDR(wg, "self_attn.g_proj.weight", D);
+        {   /* gate width from the checkpoint: n_head (S-2.1) or n_head*head_dim (M.1) */
+            snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.g_proj.weight", i);
+            int H = c->heads[i], hd = c->head_dim;
+            L->wg_out = (int)(st_numel(&m->S, nm) / D);
+            if (L->wg_out != H && L->wg_out != H * hd) {
+                fprintf(stderr, "layer %d: g_proj has %d outputs, expected %d (per-head) "
+                        "or %d (per-element)\n", i, L->wg_out, H, H * hd);
+                exit(1);
+            }
+        }
         LD(qn, "self_attn.q_norm.weight"); LD(kn, "self_attn.k_norm.weight");
         if (!c->is_moe[i]) {
             LDR(gate, "mlp.gate_proj.weight", D); LDR(up, "mlp.up_proj.weight", D); LDR(down, "mlp.down_proj.weight", c->dense_inter);
@@ -820,14 +850,19 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
             }
             free(att);
         }
-        /* per-head softplus gate (of the layer input xn) applied before o_proj */
-        float *gate = falloc(H);
+        /* softplus attention-output gate (of the layer input xn) applied before o_proj.
+         * Per head (S-2.1) or per element (M.1) — see Layer.wg_out. */
+        int gw = L->wg_out, per_head = (gw == H);
+        float *gate = falloc(gw);
         for (int t = 0; t < S; t++) {
-            resmm(gate, xn + t * D, L->wg, L->d_wg, D, H);   /* g_proj: hidden -> num_heads */
-            for (int hh = 0; hh < H; hh++) {
+            resmm(gate, xn + t * D, L->wg, L->d_wg, D, gw);
+            if (per_head) for (int hh = 0; hh < H; hh++) {
                 float gv = softplusf(gate[hh]);
                 float *ao = AO + ((int64_t)t * H + hh) * hd;
                 for (int d = 0; d < hd; d++) ao[d] *= gv;
+            } else {
+                float *ao = AO + (int64_t)t * H * hd;
+                for (int i = 0; i < gw; i++) ao[i] *= softplusf(gate[i]);
             }
             resmm(scr, AO + (int64_t)t * H * hd, L->wo, L->d_wo, H * hd, D);
             for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
@@ -940,11 +975,15 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         }
         PROF_ADD(pr_attn, ta);
         double tg = PROF_T0();
-        float *gate = falloc((int64_t)B * H);
-        resmm_b(gate, xn, L->wg, L->d_wg, B, D, H);         /* softplus output gate */
-        for (int b = 0; b < B; b++) for (int hh = 0; hh < H; hh++) {
+        int gw = L->wg_out, per_head = (gw == H);           /* per-head (S-2.1) / per-element (M.1) */
+        float *gate = falloc((int64_t)B * gw);
+        resmm_b(gate, xn, L->wg, L->d_wg, B, D, gw);        /* softplus output gate */
+        if (per_head) for (int b = 0; b < B; b++) for (int hh = 0; hh < H; hh++) {
             float gv = softplusf(gate[(int64_t)b * H + hh]);
             float *ao = AO + ((int64_t)b * H + hh) * hd; for (int d = 0; d < hd; d++) ao[d] *= gv;
+        } else for (int b = 0; b < B; b++) {
+            float *ao = AO + (int64_t)b * H * hd, *g = gate + (int64_t)b * gw;
+            for (int i = 0; i < gw; i++) ao[i] *= softplusf(g[i]);
         }
         float *ao_out = falloc((int64_t)B * D);
         resmm_b(ao_out, AO, L->wo, L->d_wo, B, H * hd, D);  /* batched o_proj */
@@ -1317,6 +1356,7 @@ int main(int argc, char **argv) {
     if (getenv("LAG_NOGROUP")) g_group = 0;
     if (getenv("LAG_PROF")) g_prof = 1;
     if (getenv("LAG_ATTN_EXACT")) g_attn_exact = 1;
+    if (getenv("LAG_ATTN_ONLINE")) g_attn_online = 1;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
     char *pbuf = NULL;

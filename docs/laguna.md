@@ -60,7 +60,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 |---|---|
 | `CUDA=1` build | residents + expert cache on the A6000 |
 | `RES8=1` | int8 residents in VRAM (fits more experts, +bandwidth) |
-| `LAG_IDOT=1` | CPU experts via int8-VNNI (~+19% on the CPU tier; ~0.4% quant noise) |
+| `LAG_IDOT=1` | CPU experts via int8-VNNI. The old ~+19% no longer reproduces: after grouped batching it measures **neutral** end to end, so it only costs ~0.4% quant noise. Off by default. |
 | `BATCH=N` | batched-decode throughput bench (N copies of the prompt) |
 | `BATCH_VARY=1` | bench with *divergent* streams (sampled, per-stream seed) — the honest multi-tenant number |
 | `BATCH_AB=1` | bench both MoE paths in one process (+ asserts they are token-identical) |
@@ -71,6 +71,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `LAG_KVFULL=1` | store full-length KV on sliding layers too (A/B; same output, 2.9x the memory) |
 | `LAG_KV_SPAN=N` | positions per forward pass, default 128 — also sets the sliding ring size |
 | `LAG_ATTN_EXACT=1` | attention QK in scalar double (the oracle contract) instead of AVX-512 |
+| `LAG_ATTN_ONLINE=1` | single-pass online-softmax attention (measured neutral — see `docs/llamacpp-notes.md`) |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |

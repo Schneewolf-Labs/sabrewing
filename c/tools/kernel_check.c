@@ -137,8 +137,16 @@ int main(void) {
                       NULL, 0, MOE_QK_DBL, o1, sc, 0);
             sdpa_head(q, K, V, kvs_stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
                       NULL, 0, MOE_QK_SIMD, o2, sc, 0);
-            char name[64]; snprintf(name, sizeof(name), "window %d", npos);
+            char name[64]; snprintf(name, sizeof(name), "window %-5d simd", npos);
             ok &= report(name, o2, o1, hd, 1e-5);
+            /* online softmax: one pass, rescaled accumulator — same softmax, different
+             * rounding, so it gets its own (slightly looser) tolerance */
+            float *o3 = malloc((size_t)hd * 4);
+            sdpa_head(q, K, V, kvs_stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                      NULL, 0, MOE_QK_ONLINE, o3, sc, 0);
+            snprintf(name, sizeof(name), "window %-5d online", npos);
+            ok &= report(name, o3, o1, hd, 1e-4);
+            free(o3);
             free(q); free(K); free(V); free(o1); free(o2); free(sc);
         }
     }
@@ -201,14 +209,23 @@ int main(void) {
                 int S = rows[ri];
                 float *xb = malloc((size_t)S * I * 4), *yb = malloc((size_t)S * O * 4);
                 for (int64_t i = 0; i < (int64_t)S * I; i++) xb[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
-                double mac = (double)S * I * O, best[2];
+                /* MIN of several timed batches, not one batch: a single measurement
+                 * of this kernel swings ~2x with clock/thread state, which is enough
+                 * to invert the f32-vs-idot ranking run to run. The minimum is the
+                 * least-contended sample, so it is the stable comparator. */
+                double mac = (double)S * I * O, best[2] = {0, 0};
                 for (int mode = 0; mode < 2; mode++) {
                     int m = mode ? MOE_Q4_IDOT : MOE_Q4_F32;
                     matmul_q4_kb(yb, xb, pk, scl, S, I, O, m, 0);          /* warm */
-                    int reps = (int)(2e9 / mac); if (reps < 3) reps = 3;
-                    double t0 = now_s();
-                    for (int r = 0; r < reps; r++) matmul_q4_kb(yb, xb, pk, scl, S, I, O, m, 0);
-                    best[mode] = mac * reps / (now_s() - t0) / 1e9;
+                    int reps = (int)(4e9 / mac); if (reps < 5) reps = 5;
+                    double tbest = 1e30;
+                    for (int trial = 0; trial < 5; trial++) {
+                        double t0 = now_s();
+                        for (int r = 0; r < reps; r++) matmul_q4_kb(yb, xb, pk, scl, S, I, O, m, 0);
+                        double dt = now_s() - t0;
+                        if (dt < tbest) tbest = dt;
+                    }
+                    best[mode] = mac * reps / tbest / 1e9;
                 }
                 printf("  S=%-2d f32 %5.1f idot %5.1f", S, best[0], best[1]);
                 free(xb); free(yb);

@@ -7,8 +7,9 @@ review as [ggml-org/llama.cpp#25165](https://github.com/ggml-org/llama.cpp/pull/
 and the GGUF declares `general.architecture = laguna`, so mainline can't load it yet.
 
 We did not benchmark against it (the 68 GB Q4_K_M was downloaded and deleted). This is
-a code read, so nothing here is a performance claim — where it says they're faster,
-that's an argument from what the kernels do, not a measurement.
+a code read: where it says *they* are faster, that is an argument from what the kernels
+do, not a measurement. Where it reports numbers for **our** engine, those are measured
+here — including one idea taken from them that turned out not to help (2a).
 
 Their fork also doesn't build on gcc without a one-line fix (`std::isfinite` in
 `common/speculative.cpp` with no `<cmath>`), which is a fair indicator of how fresh
@@ -45,16 +46,31 @@ the *shape* of it (quantize activations to int8 per block, dp4a/tensor-core inne
 product, tile in shared memory) is a real project, not a port, and it is the highest
 kernel-level ceiling we have left on the GPU tier.
 
-**2. Flash attention + quantized KV.** They have a family of fused attention kernels
-(`fattn-*`) with online softmax and variants that read a **quantized** KV cache
-(`-ctk q8_0 -ctv q8_0`). Our attention materializes a score row per (stream, head) and
-makes two passes over the K/V window. Our own profile puts attention at **41% of a
-2k-context decode step**, so this is the most valuable idea to steal, and the cheap
-half is portable to our CPU path without any CUDA work:
-   - fold softmax into a running max/sum so the score buffer disappears and K/V is
-     read once instead of twice;
-   - store K/V as int8 with a per-row scale — 4× less KV memory *and* bandwidth,
-     stacking with the sliding-window ring we already have (1.11 GB/slot → ~0.28).
+**2a. Online-softmax attention — TRIED, measured NEUTRAL.** Implemented as
+`MOE_QK_ONLINE`: one pass over the K/V window keeping a running max/sum, no score
+buffer. The reasoning for it was *wrong*. The win was supposed to be halved memory
+traffic, but a sliding window is ~2 MB per stream per layer and stays in cache between
+the two passes, so there was no DRAM traffic to save. The first version came out 11%
+**worse** — it rescaled a 128-float accumulator on every position, doubling the
+value-accumulation work. Branching so the rescale is paid only when the running max
+actually rises (O(log n) times, not n) recovered that, and then it was a wash:
+
+| B=8 @2k ctx, interleaved A/B/A/B | attention ms/step | aggregate tok/s |
+|---|---|---|
+| two-pass SIMD | 176.1, 170.1 | 20.42, 20.48 |
+| online, branched rescale | 178.8, 164.2 | 20.23, 21.25 |
+
+Flash attention's win is about not materializing an S×N score matrix in HBM, and about
+tiling many query rows — neither applies to single-query CPU decode, where the score row
+is a few KB and cache-resident. **Two-pass stays the default.** `LAG_ATTN_ONLINE=1`
+keeps the path, because it is the right structure once K/V is quantized (one pass = one
+dequant instead of two) and for a future GPU kernel.
+
+**2b. Quantized KV — the lever that is still open.** int8 K/V with a per-row scale cuts
+the bytes the attention phase touches and stacks with the sliding-window ring:
+1.11 GB/slot → ~0.28 at 8k context. Unlike 2a this is not a guess about where the cost
+is — it reduces bytes moved, and attention is 41-45% of a 2k-context step. It is lossy,
+so it needs a perplexity gate rather than just a speed number.
 
 **3. Quant recipe by tensor role.** Their Q4_K_M is not uniform: routed experts are
 Q4_K **with an imatrix**, while the "signal path" (attention, shared experts,
@@ -98,19 +114,21 @@ output dimension:
 
 Checking `laguna.c` against each row rather than assuming:
 
-- **Gate width — a real gap.** `resmm(gate, xn, L->wg, L->d_wg, D, H)` hardcodes the
-  output dim to `n_head`, so a `[n_head*head_dim, D]` g_proj would be **silently
-  mis-read** (first `n_head` rows used, broadcast over head_dim) rather than failing
-  loudly. Fix: take the width from the loaded tensor and either broadcast per head or
-  multiply elementwise, as their loader does.
+- **Gate width — was a real gap, now FIXED.** `resmm(gate, ...)` hardcoded the output
+  dim to `n_head`, so a `[n_head*head_dim, D]` g_proj would have been **silently
+  mis-read** (first `n_head` rows, broadcast over head_dim) rather than rejected. The
+  width now comes from the checkpoint (`Layer.wg_out = st_numel/D`), with per-head
+  broadcast when it equals `n_head`, elementwise multiply when it equals
+  `n_head*head_dim`, and a loud exit for anything else.
 - **All-full attention — already fine.** `is_sliding[]` comes from `layer_types`, so a
   config with no `sliding_attention` entries yields an empty sliding schedule and the
   KV ring simply doesn't engage.
-- **Leading dense layers — fine but fragile.** We derive dense layers from
-  `mlp_only_layers` (`[0]` in S-2.1), which would presumably be `[0,1,2]` for M.1. But
-  we ignore `mlp_layer_types` (`['dense','sparse',...]`), the more explicit key that is
-  *also* present in the S-2.1 config. Reading that as a fallback would make the engine
-  robust to a checkpoint that ships only one of the two.
+- **Leading dense layers — fine, now less fragile.** We derive dense layers from
+  `mlp_only_layers` (`[0]` in S-2.1). `cfg_load` now falls back to `mlp_layer_types`
+  (`['dense','sparse',...]`) when that key is absent, so a checkpoint shipping only the
+  more explicit key no longer loads every layer as MoE.
 
-So the M.1 exposure is one hardcoded shape plus one missing config fallback — small,
-and worth closing before a bigger Laguna gets pointed at the engine.
+Both are closed. The oracle covers the per-head path; the per-element path has no
+checkpoint to test against yet, so it is written to be obviously right rather than
+validated — and anything that is neither shape now exits with a message instead of
+guessing.
