@@ -288,7 +288,7 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
 # inkling (fork): Thinking Machines 975B MoE engine — see docs/inkling.md
-inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h $(INK_CUDA_OBJ)
+inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h tier.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # laguna (fork): Poolside Laguna 118B/8B MoE coding engine — Stage-A f32 oracle
