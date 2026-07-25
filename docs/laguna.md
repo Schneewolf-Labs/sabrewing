@@ -65,7 +65,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `BATCH_VARY=1` | bench with *divergent* streams (sampled, per-stream seed) — the honest multi-tenant number |
 | `BATCH_AB=1` | bench both MoE paths in one process (+ asserts they are token-identical) |
 | `LAG_NOGROUP=1` | disable group-by-expert batching (A/B knob; output is identical either way) |
-| `LAG_GROUP_CHUNK=N` | rows per grouping chunk, default 64 (prefill is chunked; bounds scratch) |
+| `LAG_GROUP_CHUNK=N` | rows per grouping chunk, default 128 (prefill is chunked; bounds scratch) |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
@@ -176,11 +176,12 @@ each slot samples from its own seed. `CANCEL` is honored at the next step bounda
   step, so a long agentic prompt pauses the other slots for the duration of its
   prefill. With 8 requests × 48 tokens, prefill is ~37% of the wall. Chunked prefill
   interleaved with decode is the next step.
-- The shared sampler (`moe_sample.h`) qsorts the whole 100k-token vocabulary per
-  token for top-p, which now costs **13% of aggregate throughput** at 8 slots
-  (8 × 96 tokens: 22.8 tok/s greedy vs 19.7 tok/s at temp 0.7). A partial top-k
-  selection with an exact fallback when the nucleus is wider would recover it —
-  worth doing in the shared sampler, since every engine pays it.
+- ~~The shared sampler qsorts the whole 100k-token vocabulary per token for
+  top-p~~ **fixed**: `sample_logits` now takes a top-64 head by partial selection
+  and only widens (finally deferring to the full sort) when the nucleus needs more,
+  which is exact by construction and validated pick-for-pick in `make kernel-check`.
+  Recovered the whole 13%: 8 × 96 tokens at temp 0.7 went **19.7 → 22.4 tok/s**,
+  now level with greedy (22.7), so sampling is no longer a serving tax.
 
 ## Validation
 

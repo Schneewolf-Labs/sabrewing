@@ -40,9 +40,12 @@ Pre-converted int4 weights on the Hub:
   double-precision reference (`make kernel-check`). No "fast but subtly wrong."
 - **A6000 GPU tier** — bf16/int8 residents in VRAM, a per-layer int4 expert cache,
   batched GPU expert kernels.
-- **Batched serving** — decode many requests together and the resident weights are
-  read once for the whole batch: **~2.7× aggregate throughput** at batch 16, every
-  stream bit-identical to single-stream.
+- **Batched serving** — decode many requests together so the resident weights are
+  read once for the whole batch *and* each distinct expert once per step
+  (group-by-expert GEMM): **47 tok/s aggregate at batch 32 vs 16 single-stream**,
+  every stream bit-identical to single-stream. `--kv-slots N` puts it behind the API
+  as continuous batching (+76% aggregate, 14× better tail latency on 8 concurrent
+  requests).
 - **OpenAI + Anthropic APIs** (`/v1/chat/completions`, `/v1/messages`, streaming,
   temperature/top-p) with each model's chat template, plus a browser chat UI.
 
@@ -133,8 +136,6 @@ swing info                    # model / cache / hardware status
 
 - Chunked prefill interleaved with decode (a long agentic prompt currently blocks
   the batch while it prefills — ~37% of the wall at 8 requests × 48 tokens)
-- Partial top-k in the shared sampler (the full-vocab qsort costs 13% of aggregate
-  throughput at 8 slots)
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land
