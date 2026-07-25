@@ -67,6 +67,9 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `LAG_NOGROUP=1` | disable group-by-expert batching (A/B knob; output is identical either way) |
 | `LAG_GROUP_CHUNK=N` | rows per grouping chunk, default 128 (prefill is chunked; bounds scratch) |
 | `LAG_PREFILL_CHUNK=N` | serve mode: prompt tokens prefilled per step, default 128 (the decoders' worst-case stall when a long prompt arrives) |
+| `LAG_PROF=1` | phase breakdown of a decode step (where the wall time actually goes) |
+| `LAG_KVFULL=1` | store full-length KV on sliding layers too (A/B; same output, 2.9x the memory) |
+| `LAG_KV_SPAN=N` | positions per forward pass, default 128 — also sets the sliding ring size |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
@@ -223,3 +226,60 @@ vs one-shot).
   - `BATCH_AB=1` re-decodes the real 118B model both ways from a rewound KV and
     asserts the streams are token-identical (verified at B=8/16/32, greedy and
     sampled).
+
+## Where a decode step's time goes (`LAG_PROF=1`)
+
+Batched decode and grouped experts changed the shape of the problem, so the costs
+that matter now are not the ones single-stream profiling found. Divergent streams
+(`BATCH_VARY=1`), A6000 tier, `RES8=1`:
+
+| phase | B=8, 88-tok ctx | B=32, 88-tok ctx | B=8, 2187-tok ctx |
+|---|---|---|---|
+| **experts CPU** (10 of 47 MoE layers) | **38.3%** | **37.7%** | **54.5%** |
+| attention (per-sequence) | 17.7% | 11.9% | **35.0%** |
+| qkv+rope projections | 12.9% | 15.0% | 3.1% |
+| experts VRAM (37 layers) | 9.9% | 11.6% | 2.4% |
+| routing + group sort | 7.5% | 7.9% | 1.8% |
+| gate + o_proj | 7.7% | 9.2% | 1.8% |
+| shared expert | 3.7% | 3.5% | 0.9% |
+| dense MLP / lm_head / sampling | 2.4% | 3.0% | 0.5% |
+| ms per step | 269 | 825 | 1226 |
+
+Two things this says, both of which contradict a reasonable guess:
+
+1. **The capacity gap dominates.** The ~12 GB of routed experts that don't fit VRAM
+   are 10 of 47 MoE layers but 38–55% of the step: **10.3 ms per CPU layer vs 0.72 ms
+   per VRAM layer, 14×**. Every other optimization is now shaving the remaining half.
+   The levers are capacity (a per-*expert* VRAM cache instead of per-layer
+   all-or-nothing, so hot experts of the overflow layers are resident too, and
+   heat-tiered quant to shrink the 57 GB), `LAG_IDOT=1` (int8-VNNI CPU experts, an
+   existing knob never measured in this regime), and pillar 4's split-bandwidth
+   dispatch (run the CPU and VRAM experts of a layer concurrently).
+2. **Attention scales with context, not batch.** Its share *falls* as batch grows
+   (17.7% → 11.9%) but triples with context (→ 35.0% at 2k) — and it is the one part
+   of `forward_batch` still per-sequence, computing QK in scalar double precision
+   (laguna's oracle contract) parallelized only over B. A SIMD float path for
+   generation plus parallelism over (stream, head) is the obvious next fix for
+   long-context agents.
+
+## KV cache: sliding layers on a ring
+
+36 of laguna's 48 layers attend only to the last 512 positions, but the cache used to
+store the full context for every layer — and KV, not compute, is what caps how many
+agents share a box. Sliding layers now use a ring of `next_pow2(window + span)` slots:
+
+| per slot @ 8k ctx | KV |
+|---|---|
+| full-length (`LAG_KVFULL=1`) | 3.22 GB |
+| sliding layers on a 1024-slot ring | **1.11 GB** (2.9×) |
+
+The ring must hold the window *plus* one forward pass's span, because a pass writes
+every position's K/V before it attends — a ring of exactly `window` lets the pass's
+early rows overwrite the history those same rows need. The tiny oracle caught that
+instantly (36/36 → 4/36), which is why `forward()` now runs in `kv_span()`-sized
+passes; that chunking is bit-identical to one pass.
+
+Validated: oracle 36/36 + ppl 0.00% with the ring, including `LAG_KV_SPAN=4`, which
+shrinks the ring to 16 slots so a 36-token prefill **wraps it twice**; and on the real
+118B, a 2139-token prompt (wrapping the 1024-slot ring) generates identical text with
+and without trimming.

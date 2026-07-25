@@ -966,7 +966,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
                 const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
                 sdpa_head(q + (int64_t)s*qdim + h*hd, Kh, Vh, hd, hd, t0, qpos, scale, tau,
-                          rl, ext, 0, ctx + (int64_t)s*qdim + h*hd, sc);
+                          rl, ext, 0, ctx + (int64_t)s*qdim + h*hd, sc, 0);   /* full-context cache */
             }
         }
         free(rl); free(sc);

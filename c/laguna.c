@@ -424,14 +424,72 @@ static void rope_apply(float *h, int pos, const float *inv, int rdim, float scal
 /* persistent K/V cache: k[layer]/v[layer] indexed by absolute position, holding
  * post-qk-norm, post-rope K and raw V — so decode processes one token instead of
  * re-running the whole sequence (O(n) generation instead of O(n^2)). */
-typedef struct { float **k, **v; int max_pos, len; } KVCache;
+/* ring[l] = 0 for a full-context layer (indexed by absolute position); otherwise the
+ * power-of-two ring size of a sliding layer, which only ever attends to its last
+ * `window` positions and so does not need the whole context. 36 of laguna's 48 layers
+ * slide over 512, and KV — not compute — is what caps how many agents share the box.
+ * LAG_KVFULL=1 restores full-length allocation (same output, more memory) for A/B.
+ *
+ * The ring must hold `window` history PLUS the span of positions a single forward()
+ * call writes before it attends, because that call writes every position's K/V first
+ * and only then attends: a ring of exactly `window` would have the early rows of the
+ * span overwrite the history those same rows still need. (The tiny oracle caught this
+ * immediately — window 8, 36-token prefill, 4/36.) So forward() processes at most
+ * kv_span() positions per pass and the ring is next_pow2(window + span). */
+typedef struct { float **k, **v; int *ring; int max_pos, len; } KVCache;
+/* positions per forward pass. LAG_KV_SPAN shrinks it, which shrinks the ring —
+ * setting it small (e.g. 4) makes even the tiny oracle's 36-token prefill WRAP the
+ * ring several times, so the wrap-around path is covered by a token-exact test
+ * rather than only by long real-model runs. */
+static int kv_span(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("LAG_KV_SPAN"); n = e ? atoi(e) : 128; if (n < 1) n = 1; }
+    return n;
+}
+/* smallest power of two >= n */
+static int kv_pow2(int n) { int p = 1; while (p < n) p <<= 1; return p; }
+/* ring size for a sliding layer, or 0 if trimming doesn't apply / doesn't pay */
+static int kv_ring_size(Model *m, int max_pos) {
+    int win = m->c.sliding_window;
+    if (getenv("LAG_KVFULL") || win <= 0) return 0;
+    int ring = kv_pow2(win + kv_span());
+    return ring < max_pos ? ring : 0;
+}
 static void kv_init(KVCache *kv, Model *m, int max_pos) {
     int nkv = m->c.n_kv, hd = m->c.head_dim, L = m->c.n_layers;
+    int ring = kv_ring_size(m, max_pos);
     kv->k = malloc(L * sizeof(float*)); kv->v = malloc(L * sizeof(float*));
-    for (int l = 0; l < L; l++) { kv->k[l] = falloc((int64_t)max_pos * nkv * hd); kv->v[l] = falloc((int64_t)max_pos * nkv * hd); }
+    kv->ring = malloc(L * sizeof(int));
+    for (int l = 0; l < L; l++) {
+        int trimmed = ring && m->c.is_sliding[l];
+        int slots = trimmed ? ring : max_pos;
+        kv->ring[l] = trimmed ? ring : 0;
+        kv->k[l] = falloc((int64_t)slots * nkv * hd);
+        kv->v[l] = falloc((int64_t)slots * nkv * hd);
+    }
     kv->max_pos = max_pos; kv->len = 0;
 }
-static void kv_free(KVCache *kv, int L) { for (int l = 0; l < L; l++) { free(kv->k[l]); free(kv->v[l]); } free(kv->k); free(kv->v); }
+/* where position `pos` lives in layer l's cache */
+static inline int64_t kv_at(const KVCache *kv, int l, int pos) {
+    return kv->ring[l] ? (pos & (kv->ring[l] - 1)) : pos;
+}
+/* KV bytes one slot needs for max_pos positions, and how many layers get trimmed —
+ * reported at load because this, not compute, is what caps concurrent requests. */
+static int64_t kv_footprint(Model *m, int max_pos, int *trimmed, int *ring_out) {
+    int nkv = m->c.n_kv, hd = m->c.head_dim;
+    int ring = kv_ring_size(m, max_pos);
+    int64_t bytes = 0; *trimmed = 0; *ring_out = ring;
+    for (int l = 0; l < m->c.n_layers; l++) {
+        int slots = max_pos;
+        if (ring && m->c.is_sliding[l]) { slots = ring; (*trimmed)++; }
+        bytes += 2 * (int64_t)slots * nkv * hd * (int64_t)sizeof(float);
+    }
+    return bytes;
+}
+static void kv_free(KVCache *kv, int L) {
+    for (int l = 0; l < L; l++) { free(kv->k[l]); free(kv->v[l]); }
+    free(kv->k); free(kv->v); free(kv->ring);
+}
 
 /* ---------- MoE block hooks (moe_arch.h / moe_block.h) ----------
  * laguna's weight-layout-specific ops behind the shared moe_block interface.
@@ -482,6 +540,37 @@ static void lag_expert_batch(void *cx, const int *sel, const float *w, int K, co
     }
 }
 
+/* ---------- phase profile (LAG_PROF=1) ----------
+ * Where a decode step's wall time actually goes. Batched decode changed the shape of
+ * the problem — the residents are amortized and the experts are grouped, so the
+ * remaining costs are not the ones single-stream profiling found. Attention in
+ * particular is the one part of forward_batch that is still PER-SEQUENCE (each stream
+ * has its own KV cache), and it grows with context, so it needs its own number. */
+static int g_prof = 0;
+static double pr_proj, pr_attn, pr_gate, pr_route, pr_xgpu, pr_xcpu, pr_shared,
+              pr_dense, pr_lmhead, pr_sample;
+static int64_t pr_xgpu_n, pr_xcpu_n;
+#define PROF_T0() (g_prof ? now_s() : 0.0)
+#define PROF_ADD(acc, t0) do { if (g_prof) (acc) += now_s() - (t0); } while (0)
+static void prof_report(const char *what, double wall, int steps) {
+    if (!g_prof) return;
+    double tot = pr_proj + pr_attn + pr_gate + pr_route + pr_xgpu + pr_xcpu + pr_shared +
+                 pr_dense + pr_lmhead + pr_sample;
+    printf("[prof] %s: %.2fs wall over %d steps (%.1f ms/step); phases sum to %.2fs (%.0f%%)\n",
+           what, wall, steps, 1000.0 * wall / (steps ? steps : 1), tot, 100.0 * tot / wall);
+    struct { const char *n; double v; } ph[] = {
+        {"qkv+rope proj", pr_proj}, {"attention (per-seq)", pr_attn}, {"gate+o_proj", pr_gate},
+        {"routing+sort", pr_route}, {"experts VRAM", pr_xgpu}, {"experts CPU", pr_xcpu},
+        {"shared expert", pr_shared}, {"dense MLP", pr_dense}, {"lm_head", pr_lmhead},
+        {"sampling", pr_sample},
+    };
+    for (size_t i = 0; i < sizeof(ph) / sizeof(ph[0]); i++)
+        printf("[prof]   %-20s %7.2fs  %5.1f%%  %6.2f ms/step\n", ph[i].n, ph[i].v,
+               100.0 * ph[i].v / wall, 1000.0 * ph[i].v / (steps ? steps : 1));
+    printf("[prof]   MoE layer-calls: %lld on VRAM experts, %lld on CPU experts\n",
+           (long long)pr_xgpu_n, (long long)pr_xcpu_n);
+}
+
 /* ---------- grouped (Megablocks-style) batched MoE ----------
  * The per-token block reads an expert's int4 weights once PER TOKEN that routes to
  * it. With S rows in flight (B concurrent decode streams, or a prefill chunk) the
@@ -527,6 +616,7 @@ static void lag_moe_group(Model *m, Layer *L, const float *x, float *hout, int S
     int T = S * K;                                   /* (row, expert) pairs */
 
     /* --- route every row with ONE router weight read --- */
+    double t0 = PROF_T0();
     float *rl = falloc((int64_t)S * E), *w = falloc((int64_t)T);
     int *sel = malloc((size_t)T * sizeof(int));
     matmul_f32(rl, x, L->router, S, D, E, g_exact);
@@ -556,8 +646,10 @@ static void lag_moe_group(Model *m, Layer *L, const float *x, float *hout, int S
         grow[slot] = s; rowof[s * K + a] = slot;
     }
     g_grp_calls++; g_grp_rows += T; g_grp_groups += G;
+    PROF_ADD(pr_route, t0);
 
     /* --- one GEMM per distinct expert, then a rank-order combine --- */
+    double tx = PROF_T0();
     float *acc = falloc((int64_t)S * D);
     int done = 0;
 #ifdef COLI_CUDA
@@ -601,14 +693,18 @@ static void lag_moe_group(Model *m, Layer *L, const float *x, float *hout, int S
         free(slots); free(xg); free(gu); free(glu);
     }
     for (int64_t i = 0; i < (int64_t)S * D; i++) acc[i] *= c->route_scale;
+    if (g_prof) { if (done) { pr_xgpu += now_s() - tx; pr_xgpu_n++; }
+                  else      { pr_xcpu += now_s() - tx; pr_xcpu_n++; } }
 
     /* --- shared expert, batched over S (its residents are read once too) --- */
+    double ts = PROF_T0();
     float *sg = falloc((int64_t)S * SI), *su = falloc((int64_t)S * SI), *so = falloc((int64_t)S * D);
     resmm_b(sg, x, L->sg, L->d_sg, S, D, SI);
     resmm_b(su, x, L->su, L->d_su, S, D, SI);
     for (int64_t i = 0; i < (int64_t)S * SI; i++) sg[i] = siluf(sg[i]) * su[i];
     resmm_b(so, sg, L->sd, L->d_sd, S, SI, D);
     for (int64_t i = 0; i < (int64_t)S * D; i++) hout[i] += acc[i] + so[i];   /* routed*scale + shared */
+    PROF_ADD(pr_shared, ts);
 
     free(rl); free(w); free(sel); free(cnt); free(gexp); free(gbeg); free(gcnt); free(pos);
     free(grow); free(rowof); free(acc); free(sg); free(su); free(so);
@@ -652,8 +748,9 @@ static void lag_moe_rows(Model *m, Layer *L, const float *xn, float *h, int S) {
 
 /* process S tokens at absolute positions pos0..pos0+S-1, appending K/V to the
  * cache; writes each token's post-final-norm hidden state to h_out[S*D].
- * Prefill: S=np, pos0=0. Decode: S=1, pos0=current length. */
-static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, float *h_out) {
+ * Prefill: S=np, pos0=0. Decode: S=1, pos0=current length.
+ * S is bounded by kv_span() — call forward(), which chunks to it. */
+static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0, float *h_out) {
     Cfg *c = &m->c;
     int D = c->hidden, hd = c->head_dim, nkv = c->n_kv;
     float *h = falloc((int64_t)S * D);
@@ -687,7 +784,8 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
             int pos = pos0 + t;
             rmsnorm_row(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
             resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, L->d_wq, D, H * hd);
-            float *kt = Kc + (int64_t)pos * nkv * hd, *vt = Vc + (int64_t)pos * nkv * hd;
+            int64_t slot = kv_at(kv, li, pos);          /* ring slot on trimmed sliding layers */
+            float *kt = Kc + slot * nkv * hd, *vt = Vc + slot * nkv * hd;
             resmm(kt, xn + t * D, L->wk, L->d_wk, D, nkv * hd);
             resmm(vt, xn + t * D, L->wv, L->d_wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
@@ -712,7 +810,8 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
                 /* laguna's contract: scale 1/sqrt(hd), no rel-bias/tau, QK in double.
                  * cache is [pos][kv-head][hd] so this head's rows stride by nkv*hd. */
                 sdpa_head(Q + ((int64_t)t * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
-                          hd, j0, pos, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)t * H + hh) * hd, att);
+                          hd, j0, pos, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)t * H + hh) * hd, att,
+                          kv->ring[li]);
             }
             free(att);
         }
@@ -742,6 +841,19 @@ static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, floa
     for (int t = 0; t < S; t++) rmsnorm_row(h_out + t * D, h + t * D, m->final_norm, D, c->rms_eps);
     if (pos0 + S > kv->len) kv->len = pos0 + S;
     free(h); free(xn); free(scr);
+}
+
+/* Prefill/decode any number of positions, in kv_span()-sized passes. Chunking is
+ * bit-identical to one pass (positions are absolute, each pass attends over the K/V
+ * the earlier passes wrote, and every kernel reduces per row) — and it is what keeps
+ * a trimmed sliding-layer ring valid, since a pass may not write more positions than
+ * the ring has spare beyond `window`. */
+static void forward(Model *m, KVCache *kv, const int *ids, int S, int pos0, float *h_out) {
+    int D = m->c.hidden, span = kv_span();
+    for (int off = 0; off < S; off += span) {
+        int n = S - off < span ? S - off : span;
+        forward_span(m, kv, ids + off, n, pos0 + off, h_out + (int64_t)off * D);
+    }
 }
 
 /* Batched DECODE: B independent sequences, one token each, each at its own
@@ -775,6 +887,7 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         const float *inv = c->is_sliding[li] ? c->s_inv : c->g_inv;
         float rscale = c->is_sliding[li] ? c->s_scale : c->g_scale;
         int win = c->is_sliding[li] ? c->sliding_window : 0;
+        double tp = PROF_T0();
         float *Q = falloc((int64_t)B * H * hd), *Kt = falloc((int64_t)B * nkv * hd);
         float *Vt = falloc((int64_t)B * nkv * hd), *AO = falloc((int64_t)B * H * hd);
         for (int b = 0; b < B; b++) rmsnorm_row(xn + b * D, h + b * D, L->ln1, D, c->rms_eps);
@@ -784,13 +897,16 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         for (int b = 0; b < B; b++) {                       /* per-seq qk-norm + rope + store K/V */
             for (int hh = 0; hh < H; hh++) { float *q = Q + ((int64_t)b * H + hh) * hd;
                 rmsnorm_row(q, q, L->qn, hd, c->rms_eps); rope_apply(q, pos[b], inv, rdim, rscale); }
-            float *kt = kvs[b]->k[li] + (int64_t)pos[b] * nkv * hd;
-            float *vt = kvs[b]->v[li] + (int64_t)pos[b] * nkv * hd;
+            int64_t slot = kv_at(kvs[b], li, pos[b]);       /* ring slot on trimmed layers */
+            float *kt = kvs[b]->k[li] + slot * nkv * hd;
+            float *vt = kvs[b]->v[li] + slot * nkv * hd;
             memcpy(kt, Kt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
             memcpy(vt, Vt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
             for (int hh = 0; hh < nkv; hh++) { float *k = kt + hh * hd;
                 rmsnorm_row(k, k, L->kn, hd, c->rms_eps); rope_apply(k, pos[b], inv, rdim, rscale); }
         }
+        PROF_ADD(pr_proj, tp);
+        double ta = PROF_T0();
         float scaling = 1.f / sqrtf((float)hd);
         #pragma omp parallel for schedule(dynamic) if(B > 1)
         for (int b = 0; b < B; b++) {                       /* attention: each seq over its own cache */
@@ -800,10 +916,13 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
             for (int hh = 0; hh < H; hh++) {
                 int kh = hh / group;
                 sdpa_head(Q + ((int64_t)b * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
-                          hd, j0, p, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)b * H + hh) * hd, att);
+                          hd, j0, p, scaling, 1.f, NULL, 0, 1, AO + ((int64_t)b * H + hh) * hd, att,
+                          kvs[b]->ring[li]);
             }
             free(att);
         }
+        PROF_ADD(pr_attn, ta);
+        double tg = PROF_T0();
         float *gate = falloc((int64_t)B * H);
         resmm_b(gate, xn, L->wg, L->d_wg, B, D, H);         /* softplus output gate */
         for (int b = 0; b < B; b++) for (int hh = 0; hh < H; hh++) {
@@ -814,8 +933,11 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
         resmm_b(ao_out, AO, L->wo, L->d_wo, B, H * hd, D);  /* batched o_proj */
         for (int b = 0; b < B; b++) for (int i = 0; i < D; i++) h[b * D + i] += ao_out[b * D + i];
         for (int b = 0; b < B; b++) rmsnorm_row(xn + b * D, h + b * D, L->ln2, D, c->rms_eps);
+        PROF_ADD(pr_gate, tg);
         if (!c->is_moe[li]) {                               /* dense MLP (layer 0), batched */
+            double td = PROF_T0();
             lag_dense_rows(m, L, xn, h, B);
+            PROF_ADD(pr_dense, td);
         } else {                                            /* MoE: grouped by expert over B */
             lag_moe_rows(m, L, xn, h, B);
         }
@@ -1176,6 +1298,7 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("LAG_NOGROUP")) g_group = 0;
+    if (getenv("LAG_PROF")) g_prof = 1;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
     char *pbuf = NULL;
@@ -1215,6 +1338,14 @@ int main(int argc, char **argv) {
            m.c.hidden, m.c.n_layers, m.c.n_kv, m.c.head_dim, m.c.vocab, m.c.n_experts, m.c.topk,
            m.c.moe_inter, m.c.sliding_window, m.c.g_rdim, m.c.g_scale, m.c.s_rdim);
     printf("resident weights loaded | RSS %.2f GB\n", rss_gb());
+    {   /* KV footprint caps how many requests can share the box — report it */
+        int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192, trimmed = 0, ring = 0;
+        int64_t kvb = kv_footprint(&m, ctx_max, &trimmed, &ring);
+        printf("KV: %.2f GB per slot at %d ctx", kvb / 1e9, ctx_max);
+        if (trimmed) printf(" (%d/%d sliding layers on a %d-slot ring, window %d)",
+                            trimmed, m.c.n_layers, ring, m.c.sliding_window);
+        printf("\n");
+    }
 
     /* ---- serve mode: the openai_server.py gateway drives us over stdin/stdout ---- */
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
@@ -1295,9 +1426,14 @@ int main(int argc, char **argv) {
             for (int b = 0; b < B; b++) seed[b] = 0x9E3779B97F4A7C15ull + 0x1000193ull * (uint64_t)(b + 1);
             g_grp_calls = g_grp_rows = g_grp_groups = 0;   /* decode-only grouping stats */
             double t1 = now_s(); int gen = 0;
+            pr_proj = pr_attn = pr_gate = pr_route = pr_xgpu = pr_xcpu = pr_shared =
+                pr_dense = pr_lmhead = pr_sample = 0; pr_xgpu_n = pr_xcpu_n = 0;
             for (int s = 0; s < n_new; s++) {
                 forward_batch(&m, kvs, cur, B, Hd);
+                double tl = PROF_T0();
                 resmm_b(lg, Hd, m.lm_head, m.d_lm_head, B, D, V);      /* batched lm_head */
+                PROF_ADD(pr_lmhead, tl);
+                double tsm = PROF_T0();
                 for (int b = 0; b < B; b++) {
                     const float *l = lg + (int64_t)b * V;
                     int pick;
@@ -1305,6 +1441,7 @@ int main(int argc, char **argv) {
                     else { pick = 0; for (int v = 1; v < V; v++) if (l[v] > l[pick]) pick = v; }
                     cur[b] = pick; out[b][s] = pick;
                 }
+                PROF_ADD(pr_sample, tsm);
                 gen++;
             }
             double dt = now_s() - t1;
@@ -1319,6 +1456,7 @@ int main(int argc, char **argv) {
                                     " = %.2fx expert-weight-read amortization\n",
                                     (double)g_grp_groups / g_grp_calls, (double)g_grp_rows / g_grp_calls,
                                     (double)g_grp_rows / (double)g_grp_groups);
+            prof_report(ab ? (pass ? "grouped decode" : "per-token decode") : "decode", dt, gen);
             if (ab && pass == 0) { for (int b = 0; b < B; b++) memcpy(prev + (int64_t)b * n_new, out[b], (size_t)gen * sizeof(int)); }
             else if (ab) {
                 int same = 1;

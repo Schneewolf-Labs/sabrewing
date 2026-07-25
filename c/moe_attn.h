@@ -21,7 +21,15 @@
  *
  * Kbase/Vbase point at this head's position-0 K/V row; consecutive cached
  * positions are kv_stride floats apart (laguna: n_kv*hd interleaved; inkling:
- * hd, head-major). sc is caller scratch of length >= (qpos - t0 + 1). */
+ * hd, head-major). sc is caller scratch of length >= (qpos - t0 + 1).
+ *
+ *   ring — 0: the cache is indexed by absolute position (the whole context is
+ *          stored). Otherwise a POWER-OF-TWO ring size: position t lives at
+ *          t & (ring-1). A sliding-window layer only ever attends to the last
+ *          `window` positions, so it only needs `window` slots — storing the full
+ *          context for those layers is pure waste (laguna: 36 of 48 layers slide
+ *          over 512, so full-length f32 KV costs 3.4x what it needs). Wrapping is
+ *          invisible to the math: the same positions are read in the same order. */
 #ifndef MOE_ATTN_H
 #define MOE_ATTN_H
 #include <stdint.h>
@@ -29,10 +37,12 @@
 
 static void sdpa_head(const float *q, const float *Kbase, const float *Vbase, int kv_stride,
                       int hd, int t0, int qpos, float scale, float tau,
-                      const float *bias, int bias_len, int qk_accum_dbl, float *out, float *sc) {
+                      const float *bias, int bias_len, int qk_accum_dbl, float *out, float *sc,
+                      int ring) {
     int n = qpos - t0 + 1;
+    int mask = ring - 1;                     /* ring is a power of two, or 0 (unused) */
     for (int t = t0; t <= qpos; t++) {
-        const float *k = Kbase + (int64_t)t * kv_stride;
+        const float *k = Kbase + (int64_t)(ring ? (t & mask) : t) * kv_stride;
         float dot;
         if (qk_accum_dbl) { double s = 0; for (int d = 0; d < hd; d++) s += (double)q[d] * k[d]; dot = (float)s; }
         else              { float  s = 0; for (int d = 0; d < hd; d++) s += q[d] * k[d];          dot = s;        }
@@ -43,7 +53,7 @@ static void sdpa_head(const float *q, const float *Kbase, const float *Vbase, in
     softmax_row(sc, n);
     for (int d = 0; d < hd; d++) out[d] = 0.f;
     for (int t = t0; t <= qpos; t++) {
-        const float *v = Vbase + (int64_t)t * kv_stride;
+        const float *v = Vbase + (int64_t)(ring ? (t & mask) : t) * kv_stride;
         float a = sc[t - t0];
         for (int d = 0; d < hd; d++) out[d] += a * v[d];
     }
