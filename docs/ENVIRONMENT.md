@@ -193,6 +193,29 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 ---
 
+## Laguna engine (`c/laguna.c`) — the A6000 tier
+
+The Laguna 118B engine (a separate binary from `glm`/`coli`) reads its own knobs.
+See [laguna.md](laguna.md) for context. All are opt-in and leave the token-exact
+oracle unaffected (the oracle forces the exact f32 path).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SNAP` | (required) | Model snapshot directory (int4 container or f32 tiny oracle). |
+| `RES8` | unset (bf16 residents) | Store residents int8 in VRAM (~4 GB vs 8 GB) → ~2 more expert layers fit + half the resident VRAM bandwidth. ~lossless. |
+| `LAG_IDOT` | unset (f32 activations) | CPU int4 experts via the int8-VNNI path (~+19% on the CPU-resident layers; ~0.4% activation-quant noise). |
+| `BATCH` | unset | Batched-decode throughput bench: decode `N` copies of the prompt in lockstep, report aggregate tok/s (verifies streams are bit-identical). |
+| `CUDA_HEADROOM_MB` | `2048` | VRAM left free after the expert cache fills (staging headroom; squeezing to ~0 starves resident staging). |
+| `CUDA_EXPERT_GB` | unset (use all free VRAM) | Cap the expert-cache VRAM budget. |
+| `LAG_GPU_MINEL` | `0` (offload all) | Min weight element count to offload a resident matmul to the GPU (sweep showed offload-all wins on the A6000). |
+| `NOGPU` | unset | Disable the CUDA tier (CPU only) even in a `CUDA=1` build. |
+| `GPU_DEV` | `0` | CUDA device index. |
+| `SEED` | clock-seeded | RNG seed for serve-mode sampling. |
+| `CTX_MAX` | `8192` | Max context (prompt + generated) in serve mode. |
+| `SERVE` | unset | `SERVE=1` runs the gateway serve loop (SUBMIT/DATA/DONE protocol). |
+| `LAG_CUDA_TEST` | unset | `LAG_CUDA_TEST=1` runs the GPU kernel self-test (no model needed) and exits. |
+| `LAG_SIMD` | unset | Opt the oracle into the SIMD (non-exact) path for a float-noise check. |
+
 ## Worked example — the fast, reproducible Apple-Silicon config
 
 ```bash

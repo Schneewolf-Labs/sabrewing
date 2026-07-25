@@ -65,6 +65,9 @@ python3 openai_server.py --arch laguna --engine ./laguna --model ~/models/laguna
 Speed levers (all opt-in; the oracle stays exact): `RES8=1` int8 residents in VRAM
 (fits more experts), `LAG_IDOT=1` int8-VNNI CPU experts, `BATCH=N` batched-decode
 throughput bench. Build `ARCH=native` for AVX-512/VNNI; `CUDA=1` for the GPU tier.
+See [`docs/laguna.md`](docs/laguna.md) for the container format, GPU-tier knobs,
+and batched serving; [`docs/inkling.md`](docs/inkling.md) for the 975B streaming
+setup.
 
 ## The MoE-native runtime
 
