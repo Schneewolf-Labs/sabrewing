@@ -99,6 +99,39 @@ extern "C" int lag_cuda_matmul_bf16(float *y, const float *x, const void *W, int
     return 0;
 }
 
+/* Resident int8 GEMM: W is the combined [int8 O*I][f32 scale O] buffer (laguna's
+ * matmul_q8 layout). Activations stay f32; one warp per output row, f32 accumulate
+ * — matches the CPU MOE_Q8_F32 contract. Half the VRAM read/footprint of bf16. */
+__global__ void mm_q8_kernel(const signed char * __restrict__ W, const float * __restrict__ scale,
+                             const float * __restrict__ x, float * __restrict__ y, int I, int O) {
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y;
+    if (o >= O) return;
+    const signed char *w = W + (size_t)o * I;
+    const float *xs = x + (size_t)s * I;
+    float acc = 0.f;
+    for (int i = lane; i < I; i += 32) acc += xs[i] * (float)w[i];
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (!lane) y[(size_t)s * O + o] = acc * scale[o];
+}
+
+extern "C" int lag_cuda_matmul_q8(float *y, const float *x, const void *W, int S, int I, int O) {
+    if (!g_ok) return -1;
+    size_t xn = (size_t)S * I * 4, yn = (size_t)S * O * 4;
+    if (ensure_xy(xn, yn)) return -1;
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    const signed char *q8 = (const signed char *)W;
+    const float *scale = (const float *)(q8 + (size_t)I * O);   /* embedded per-row scales */
+    dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
+    mm_q8_kernel<<<grid, 128, 0, g_st>>>(q8, scale, g_dx, g_dy, I, O);
+    cudaMemcpyAsync(g_hy, g_dy, yn, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(y, g_hy, yn);
+    return 0;
+}
+
 /* Routed-expert int4 GEMM. Matches CPU matmul_q4: packed nibbles (low = even
  * col, high = odd col, value = nibble-8), per-output-row f32 scale, f32
  * accumulate. packed/scale are DEVICE pointers. One warp per output row. */
@@ -180,6 +213,68 @@ extern "C" int lag_cuda_expert_q4(float *out, const float *x,
     mm_q4_kernel<<<dim3((unsigned)((D + 3) / 4), 1), 128, 0, g_st>>>(
         (const unsigned char *)p2, (const float *)s2, e_dgg, e_dout, I, D);
     cudaMemcpyAsync(e_hout, e_dout, (size_t)D*4, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(out, e_hout, (size_t)D*4);
+    return 0;
+}
+
+/* acc[i] += w * v[i] (device weighted-accumulate) */
+__global__ void axpy_kernel(float * __restrict__ acc, float w, const float * __restrict__ v, int D) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) acc[i] += w * v[i];
+}
+__global__ void zero_kernel(float * __restrict__ p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0.f;
+}
+
+/* Batched routed experts for one VRAM-resident MoE layer (S=1 decode): computes
+ * out[D] = sum_k w[k] * expert(sel[k], x) for all K selected experts in a SINGLE
+ * GPU submission — one HtoD (x), K*(mm_q4 + silu + mm_q4 + axpy) launches queued
+ * on the stream with a device-side accumulator, one DtoH, ONE sync. Replaces K
+ * calls to lag_cuda_expert_q4 (K syncs) with one — the decode bottleneck was the
+ * per-expert sync round-trips, not the expert compute. gu_q/gu_s/dn_q/dn_s are the
+ * layer's DEVICE expert blobs; sel/w are host arrays. Each expert is numerically
+ * the fused single-expert path, so it matches lag_cuda_expert_q4. */
+static float *me_acc = nullptr; static int me_D = 0;
+extern "C" int lag_cuda_moe_experts(float *out, const float *x,
+                                    const void *gu_q, const float *gu_s,
+                                    const void *dn_q, const float *dn_s,
+                                    const int *sel, const float *w, int K, int I, int D) {
+    if (!g_ok || (D & 1) || (I & 1)) return -1;
+    size_t xn = (size_t)D * 4;
+    if (xn > g_xcap) {
+        cudaFree(g_dx); cudaFreeHost(g_hx);
+        if (cudaMalloc(&g_dx, xn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hx, xn * 2) != cudaSuccess) { g_dx = g_hx = nullptr; g_xcap = 0; return -1; }
+        g_xcap = xn * 2;
+    }
+    if (I > e_I) { cudaFree(e_dg); cudaFree(e_dgg);
+        if (cudaMalloc(&e_dg, (size_t)2*I*4) != cudaSuccess ||
+            cudaMalloc(&e_dgg, (size_t)I*4) != cudaSuccess) { e_dg = e_dgg = nullptr; e_I = 0; return -1; }
+        e_I = I; }
+    if (D > e_D) { cudaFree(e_dout); cudaFreeHost(e_hout);
+        if (cudaMalloc(&e_dout, (size_t)D*4) != cudaSuccess ||
+            cudaMallocHost(&e_hout, (size_t)D*4) != cudaSuccess) { e_dout = e_hout = nullptr; e_D = 0; return -1; }
+        e_D = D; }
+    if (D > me_D) { cudaFree(me_acc);
+        if (cudaMalloc(&me_acc, (size_t)D*4) != cudaSuccess) { me_acc = nullptr; me_D = 0; return -1; }
+        me_D = D; }
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    zero_kernel<<<(unsigned)((D + 255) / 256), 256, 0, g_st>>>(me_acc, D);
+    for (int k = 0; k < K; k++) {
+        int e = sel[k];
+        const unsigned char *p13 = (const unsigned char *)gu_q + (size_t)e * (2*I) * (D/2);
+        const float         *s13 = gu_s + (size_t)e * (2*I);
+        const unsigned char *p2  = (const unsigned char *)dn_q + (size_t)e * D * (I/2);
+        const float         *s2  = dn_s + (size_t)e * D;
+        mm_q4_kernel<<<dim3((unsigned)((2*I + 3) / 4), 1), 128, 0, g_st>>>(p13, s13, g_dx, e_dg, D, 2*I);
+        silu_glu_kernel<<<(unsigned)((I + 255) / 256), 256, 0, g_st>>>(e_dg, e_dgg, I);
+        mm_q4_kernel<<<dim3((unsigned)((D + 3) / 4), 1), 128, 0, g_st>>>(p2, s2, e_dgg, e_dout, I, D);
+        axpy_kernel<<<(unsigned)((D + 255) / 256), 256, 0, g_st>>>(me_acc, w[k], e_dout, D);
+    }
+    cudaMemcpyAsync(e_hout, me_acc, (size_t)D*4, cudaMemcpyDeviceToHost, g_st);
     if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
     memcpy(out, e_hout, (size_t)D*4);
     return 0;

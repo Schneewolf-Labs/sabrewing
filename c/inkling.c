@@ -34,6 +34,14 @@
 #include "st.h"
 #include "lora.h"
 #include "tok.h"
+#include "moe_util.h"          /* falloc, jnum, read_int_array */
+#include "moe_math.h"          /* now_s, rss_gb, bf16_f32, siluf, softplusf, rmsnorm_row */
+#include "moe_matmul.h"        /* matmul_f32 (shared batched f32 GEMM) */
+#include "moe_quant.h"         /* matmul_q4_k + i8dot_block (shared int4 GEMV) */
+#include "moe_sample.h"        /* g_rng, rng_next, sample_logits (temp/top-p) */
+#include "moe_serve.h"         /* SReq, serve queue, serve_read_cmd (gateway protocol) */
+#include "moe_arch.h"          /* moe_topk (shared top-K expert selection) */
+#include "moe_attn.h"          /* sdpa_head (shared scaled-dot-product attention) */
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -136,29 +144,14 @@ typedef struct {
 } Model;
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+/* now_s, rss_gb, siluf, bf16_f32, softplusf, rmsnorm_row are shared (moe_math.h). */
+/* falloc is shared (moe_util.h). */
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
-static float siluf(float x) { return x / (1.f + expf(-x)); }
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
+/* f32 GEMM is the shared batched matmul_f32 (moe_matmul.h). inkling's oracle uses
+ * the SIMD path (exact=0); it has no double-accumulate reference of its own. */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O) { matmul_f32(y, x, W, S, I, O, 0); }
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
@@ -168,50 +161,11 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
 #include <immintrin.h>
 #endif
 
-/* bf16-weight matmul: activations rounded to bf16 per row (matches the HF
- * bf16 reference numerics), hardware vdpbf16ps dot where available,
- * shift-to-f32 scalar otherwise. */
+/* bf16-weight matmul at inkling's contract (round_x=1): activations rounded to
+ * bf16, vdpbf16ps where available (matches the HF bf16-activations reference),
+ * shift-to-f32 scalar otherwise. Shared kernel — see moe_matmul.h. */
 static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
-#ifdef HAVE_BF16_DOT
-    if (I % 32 == 0) {
-        uint16_t *xh = malloc((size_t)S * I * sizeof(uint16_t));
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            uint16_t *xd = xh + (int64_t)s * I;
-            for (int i = 0; i < I; i += 32) {
-                __m512 a = _mm512_loadu_ps(xs + i), b = _mm512_loadu_ps(xs + i + 16);
-                _mm512_storeu_si512(xd + i, (__m512i)_mm512_cvtne2ps_pbh(b, a));
-            }
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint16_t *w = W + (int64_t)o * I;
-            for (int s = 0; s < S; s++) {
-                const uint16_t *xs = xh + (int64_t)s * I;
-                __m512 acc = _mm512_setzero_ps();
-                for (int i = 0; i < I; i += 32)
-                    acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
-                                                (__m512bh)_mm512_loadu_si512(w + i));
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
-            }
-        }
-        free(xh);
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint16_t *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) {
-                union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
-                acc += xs[i] * v.f;
-            }
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
+    matmul_bf16_k(y, x, W, S, I, O, 1, 0);
 }
 
 /* dispatch on where the weight lives */
@@ -230,116 +184,21 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
     else     matmul_h(y, x, W.h, S, I, O);
 }
 
-/* y[1,O] = x @ q^T, int8 weights + per-row scale. Fast path: activations
- * quantized Q8 per 32-block, VNNI (or maddubs) int8 dot — same family as
- * glm.c's IDOT kernels; IDOT=0 falls back to the byte-exact scalar route. */
-#if defined(__AVX2__)
-static inline __m256i i8dot_block(__m256i acc, __m256i a, __m256i b) {
-    __m256i ax = _mm256_sign_epi8(a, a);        /* |a| as u8 */
-    __m256i sy = _mm256_sign_epi8(b, a);        /* b * sign(a) */
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    return _mm256_dpbusd_epi32(acc, ax, sy);
-#else
-    __m256i p = _mm256_maddubs_epi16(ax, sy);
-    return _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_set1_epi16(1)));
-#endif
-}
-#endif
+/* int8 GEMV, int8 weights + per-row scale, at inkling's contract (activations
+ * quantized int8 per-32-block + VNNI dot by default; IDOT=0 = f32/scalar).
+ * i8dot_block and the kernel are shared — see moe_quant.h. */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__AVX2__)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 32 == 0 && I <= 8192) {
-        int nb = I / 32;
-        int8_t xi[8192]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*32;
-            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) {
-                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
-                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)),
-                                           _mm256_loadu_si256((const __m256i*)(w + b*32)));
-                __m128i lo = _mm256_castsi256_si128(vacc), hi = _mm256_extracti128_si256(vacc, 1);
-                __m128i s4 = _mm_add_epi32(lo, hi);
-                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
-                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
-            }
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
+    matmul_q8_k(y, x, q, scale, I, O, idot ? MOE_Q8_IDOT : MOE_Q8_F32, 0);
 }
 
-/* y[1,O] = x @ W^T with W kept PACKED int4 (low nibble = even column, +8
- * offset, per-row scale — the on-disk container layout, cached as-is).
- * Nibbles unpack in-register: same numeric result as unpack-to-int8 +
- * matmul_q, half the cache footprint. IDOT=0 keeps the byte-exact scalar. */
+/* int4 experts use the shared kernel at inkling's contract (int8 activation quant
+ * + VNNI dot by default; IDOT=0 selects the f32/scalar route). See moe_quant.h. */
 static void matmul_q4(float *y, const float *x, const uint8_t *p, const float *scale, int I, int O) {
-#if defined(__AVX2__)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 32 == 0 && I <= 8192) {
-        int nb = I / 32;
-        int8_t xi[8192]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*32;
-            float am = 0.f; for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 32; i++) xi[b*32+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        const __m128i m4 = _mm_set1_epi8(0x0F);
-        const __m256i b8 = _mm256_set1_epi8(8);
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *w = p + (int64_t)o * (I/2);
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) {
-                __m128i by = _mm_loadu_si128((const __m128i*)(w + b*16));  /* 16 B = 32 nibbles */
-                __m128i lo = _mm_and_si128(by, m4);                        /* even columns */
-                __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);     /* odd columns  */
-                __m256i nib = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),  /* cols 16..31 */
-                                               _mm_unpacklo_epi8(lo, hi)); /* cols  0..15 */
-                nib = _mm256_sub_epi8(nib, b8);
-                __m256i vacc = i8dot_block(_mm256_setzero_si256(),
-                                           _mm256_loadu_si256((const __m256i*)(xi + b*32)), nib);
-                __m128i l = _mm256_castsi256_si128(vacc), h = _mm256_extracti128_si256(vacc, 1);
-                __m128i s4 = _mm_add_epi32(l, h);
-                s4 = _mm_hadd_epi32(s4, s4); s4 = _mm_hadd_epi32(s4, s4);
-                acc += xs[b] * (float)_mm_cvtsi128_si32(s4);
-            }
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const uint8_t *w = p + (int64_t)o * (I/2);
-        float acc = 0.f;
-        for (int i = 0; i < I; i += 2) {
-            uint8_t byte = w[i/2];
-            acc += x[i]   * (float)((int)(byte & 0xF) - 8);
-            acc += x[i+1] * (float)((int)(byte >> 4)  - 8);
-        }
-        y[o] = acc * scale[o];
-    }
+    matmul_q4_k(y, x, p, scale, I, O, idot ? MOE_Q4_IDOT : MOE_Q4_F32, 0);
 }
 
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
@@ -360,18 +219,6 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
     }
 }
 
-/* rmsnorm computed in f64 accumulate like the f32->f32 reference */
-static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
-    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
-    float r = 1.f / sqrtf((float)(ms / D) + eps);
-    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
-}
-
-static void softmax_row(float *x, int n) {
-    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
-    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-}
 
 /* ---------- depthwise causal short conv, residual inside (fp32) ----------
  * seq[S,C] in-place: out[t] = sum_j w[c,j]*in[t+j-(K-1)] + in[t], history from
@@ -405,10 +252,7 @@ static void sconv_apply(float *seq, int S, int C, const float *w, float *state, 
 /* ---------- config loading ----------
  * Accepts both the flat text config (tiny oracle via InklingForCausalLM) and
  * the full multimodal config.json (real checkpoint, fields under text_config). */
-static double jnum(jval *o, const char *k, double dflt) {
-    jval *v = json_get(o, k);
-    return (v && v->t == J_NUM) ? v->num : dflt;
-}
+/* jnum is shared (moe_util.h). */
 
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
@@ -1116,25 +960,13 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     double en = (double)(qpos + 1) / c->log_floor;
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
-                const float *qv = q + (int64_t)s*qdim + h*hd;
+                /* inkling's contract: scale 1/hd, tau log-length factor, per-distance
+                 * relative-bias bank rl[dist<ext], QK in float. Cache is head-major
+                 * ([kv-head][pos][hd]) so this head's rows stride by hd. (shared SDPA) */
                 const float *Kh = m->K[li] + ((int64_t)(h/group)*m->max_t)*hd;
-                for (int t = t0; t <= qpos; t++) {
-                    const float *kv = Kh + (int64_t)t*hd;
-                    float acc = 0.f;
-                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
-                    int dist = qpos - t;
-                    sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
-                }
-                int n = qpos - t0 + 1;
-                softmax_row(sc, n);
-                float *cx = ctx + (int64_t)s*qdim + h*hd;
-                for (int d = 0; d < hd; d++) cx[d] = 0.f;
                 const float *Vh = m->V[li] + ((int64_t)(h/group)*m->max_t)*hd;
-                for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = Vh + (int64_t)t*hd;
-                    float a = sc[t - t0];
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
-                }
+                sdpa_head(q + (int64_t)s*qdim + h*hd, Kh, Vh, hd, hd, t0, qpos, scale, tau,
+                          rl, ext, 0, ctx + (int64_t)s*qdim + h*hd, sc);
             }
         }
         free(rl); free(sc);
@@ -1172,6 +1004,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     memset(out, 0, (int64_t)S*D*sizeof(float));
     int   *idx  = malloc((size_t)S*K*sizeof(int));
     float *wgt  = malloc((size_t)S*(K+ns)*sizeof(float));
+    float *sc   = falloc(E);                              /* routed sigmoid scores (per token) */
     Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
     int  *fl    = malloc((size_t)S*K*sizeof(int));
@@ -1180,16 +1013,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*ET;
         int *si = idx + (int64_t)s*K;
-        /* selection: sigmoid(routed) + correction bias, top-K */
-        for (int kk = 0; kk < K; kk++) {
-            int best = -1; float bv = -1e30f;
-            for (int e = 0; e < E; e++) {
-                int taken = 0; for (int j = 0; j < kk; j++) if (si[j]==e){taken=1;break;}
-                float ch = sigmoidf(lg[e]) + l->rbias[e];
-                if (!taken && ch > bv) { bv = ch; best = e; }
-            }
-            si[kk] = best;
-        }
+        /* selection: sigmoid(routed) + correction bias, top-K (shared moe_topk) */
+        for (int e = 0; e < E; e++) sc[e] = sigmoidf(lg[e]);
+        moe_topk(sc, l->rbias, 1, E, K, si);
         /* FORCE_EXPERTS=1: pin routing to a fixed expert set (0..K-1) so every
          * token hits the same cached experts — zero misses, isolates the compute
          * ceiling from disk. Output is garbage (wrong experts); timing is real. */
@@ -1309,7 +1135,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_shared += now_s() - ts;
     }
-    free(logits); free(idx); free(wgt); free(use); free(fill); free(fl);
+    free(logits); free(idx); free(wgt); free(sc); free(use); free(fill); free(fl);
     free(g); free(hh); free(lt);    /* u aliases g+I */
 }
 
@@ -1677,18 +1503,8 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
  * v1 semantics: requests run one at a time (SUBMITs arriving mid-generation
  * queue up); the KV slot argument is accepted but every request re-prefills. */
 
-static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
-static double rng_next(void) {
-    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
-    return (double)(g_rng >> 11) / 9007199254740992.0;
-}
+/* g_rng, rng_next, PI, pi_desc, sample_logits are shared (moe_sample.h). */
 
-/* temperature + top-p nucleus sampling; temp<=0 = greedy */
-typedef struct { float p; int i; } PI;
-static int pi_desc(const void *a, const void *b) {
-    float d = ((const PI*)b)->p - ((const PI*)a)->p;
-    return d > 0 ? 1 : d < 0 ? -1 : 0;
-}
 /* reject a prompt that can't be served correctly: multimodal placeholder
  * tokens (text-only engine) or a context that would overrun the KV bound.
  * Returns NULL if ok, else a short reason. */
@@ -1711,62 +1527,13 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    int best = 0;
-    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
-    if (temp <= 0.f) return best;
-    PI *c = malloc((size_t)n * sizeof(PI));
-    double sum = 0;
-    for (int i = 0; i < n; i++) {
-        c[i].p = expf((logit[i] - logit[best]) / temp);
-        c[i].i = i; sum += c[i].p;
-    }
-    qsort(c, n, sizeof(PI), pi_desc);
-    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
-    double acc = 0; int k = 0;
-    while (k < n && acc < cut) acc += c[k++].p;
-    double r = rng_next() * acc, run = 0;
-    int pick = c[0].i;
-    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
-    free(c);
-    return pick;
-}
+/* sample_logits is shared (moe_sample.h). */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
-#define SRV_QMAX 16
-static SReq g_q[SRV_QMAX]; static int g_qn = 0;
-
-static int stdin_readable(void) {
-    fd_set r; struct timeval tv = {0, 0};
-    FD_ZERO(&r); FD_SET(0, &r);
-    return select(1, &r, NULL, NULL, &tv) > 0;
-}
+/* SReq, SRV_QMAX, g_q/g_qn, stdin_readable are shared (moe_serve.h). */
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
-            plen < 0 || plen > (1<<22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        int nl = fgetc(stdin); (void)nl;
-        pl[plen] = 0;
-        if (g_qn < SRV_QMAX) {
-            SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
-    }
-    return 0;
-}
+/* serve_read_cmd is shared (moe_serve.h). */
 
 static void serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
@@ -1904,13 +1671,7 @@ static void serve_loop(Model *m, Tok *T) {
 }
 
 /* ---------- ref_inkling.json harness ---------- */
-static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
-}
+/* read_int_array is shared (moe_util.h). */
 
 int main(int argc, char **argv) {
     /* OpenMP hot-thread tuning, same trick (and rationale) as glm.c: the
