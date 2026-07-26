@@ -5,9 +5,10 @@ net* — a recurrent linear-attention mixer. Only every 4th layer is full attent
 (`full_attention_interval: 4`). That is the part of the architecture worth caring about here,
 because it attacks the constraint that actually limits this box: KV capacity.
 
-Status: the kernel is implemented in `c/moe_linattn.h` and validated against the
-`transformers` reference (`make linattn-test`). **There is no Qwen3.5 engine yet** — no
-converter, no loader, no `qwen35.c`. This is the validated primitive, not a runnable model.
+Status: **working and token-exact.** The kernel is `c/moe_linattn.h` (validated standalone by
+`make linattn-test`), the engine is `c/qwen35.c` (validated end-to-end by `make qwen35-test`),
+and `tools/convert_qwen35_int4.py` produces the 21.7 GB int4 container it runs on. Single
+stream only — no batching, no CUDA tier, MTP draft head converted but unused.
 
 ## Geometry (from the shipped `config.json`)
 
