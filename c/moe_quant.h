@@ -82,7 +82,7 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
 #endif
 #if defined(__AVX512F__)
     if (mode == MOE_Q4_F32 && !exact) {
-        #pragma omp parallel for schedule(static) if(O >= 512)
+        #pragma omp parallel for schedule(static) if(O >= 512)   /* single-row kernel: O is the whole work */
         for (int o = 0; o < O; o++) {
             const uint8_t *p = packed + (int64_t)o * (I / 2);
             __m512 acc = _mm512_setzero_ps();
@@ -111,7 +111,7 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
      * for the f32 contract when AVX-512 is absent). More accurate than a float
      * accumulate — inkling's old IDOT=0 debug path converges here, harmlessly, as
      * its real path is always MOE_Q4_IDOT. */
-    #pragma omp parallel for schedule(static) if(O >= 512)
+    #pragma omp parallel for schedule(static) if(O >= 512)   /* single-row kernel: O is the whole work */
     for (int o = 0; o < O; o++) {
         const uint8_t *p = packed + (int64_t)o * (I / 2);
         double s = 0;
@@ -253,7 +253,7 @@ static void matmul_q8_k(float *y, const float *x, const int8_t *q, const float *
 #endif
 #if defined(__AVX512F__)
     if (mode == MOE_Q8_F32 && !exact) {
-        #pragma omp parallel for schedule(static) if(O >= 512)
+        #pragma omp parallel for schedule(static) if(O >= 512)   /* single-row kernel: O is the whole work */
         for (int o = 0; o < O; o++) {
             const int8_t *w = q + (int64_t)o * I;
             __m512 acc = _mm512_setzero_ps();
@@ -268,7 +268,7 @@ static void matmul_q8_k(float *y, const float *x, const int8_t *q, const float *
         return;
     }
 #endif
-    #pragma omp parallel for schedule(static) if(O >= 512)
+    #pragma omp parallel for schedule(static) if(O >= 512)   /* single-row kernel: O is the whole work */
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
         double s = 0; for (int i = 0; i < I; i++) s += (double)x[i] * w[i];

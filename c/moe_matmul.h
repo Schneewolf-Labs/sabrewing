@@ -25,7 +25,7 @@
 static void matmul_f32(float *y, const float *x, const float *W, int S, int I, int O, int exact) {
 #if defined(__AVX512F__)
     if (!exact) {
-        #pragma omp parallel for schedule(static) if(O >= 512)
+        #pragma omp parallel for schedule(static) if(MOE_MM_PAR(S, O))
         for (int o = 0; o < O; o++) {
             const float *w = W + (int64_t)o * I;
             for (int s = 0; s < S; s++) {
@@ -43,7 +43,7 @@ static void matmul_f32(float *y, const float *x, const float *W, int S, int I, i
     }
 #endif
     /* exact double-accumulate reference (the oracle path) */
-    #pragma omp parallel for schedule(static) if(O >= 512)
+    #pragma omp parallel for schedule(static) if(MOE_MM_PAR(S, O))
     for (int o = 0; o < O; o++) {
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
@@ -91,7 +91,7 @@ static void matmul_bf16_k(float *y, const float *x, const uint16_t *W, int S, in
 #endif
 #if defined(__AVX512F__)
     if (!exact) {   /* weight bf16->f32 exact, activations f32 */
-        #pragma omp parallel for schedule(static) if(O >= 512)
+        #pragma omp parallel for schedule(static) if(MOE_MM_PAR(S, O))
         for (int o = 0; o < O; o++) {
             const uint16_t *w = W + (int64_t)o * I;
             for (int s = 0; s < S; s++) {
@@ -110,7 +110,7 @@ static void matmul_bf16_k(float *y, const float *x, const uint16_t *W, int S, in
         return;
     }
 #endif
-    #pragma omp parallel for schedule(static) if(O >= 512)
+    #pragma omp parallel for schedule(static) if(MOE_MM_PAR(S, O))
     for (int o = 0; o < O; o++) {
         const uint16_t *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {

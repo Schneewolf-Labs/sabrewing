@@ -195,21 +195,90 @@ static size_t linattn_state_bytes(int n_v_heads, int k_dim, int v_dim, int conv_
 }
 
 /* Depthwise causal conv + SiLU over S tokens, carrying `win` across calls.
- *   in:  [S][conv_dim] row-major, out: [S][conv_dim] (may alias in) */
+ *   in:  [S][conv_dim] row-major, out: [S][conv_dim] (may alias in)
+ *
+ * Two paths, and they are BIT-IDENTICAL (each output sums its `kernel` taps in ascending j
+ * with the bias added first), which linattn_check.c enforces by requiring 1-token steps,
+ * uneven spans and one shot to agree exactly -- so the fast path is validated by a test that
+ * already existed rather than by inspection.
+ *
+ * Why the fast path exists: the obvious loop is channel-outer / token-inner, because the
+ * carried window is per channel. But the data is TOKEN-major, so walking t for a fixed
+ * channel strides conv_dim floats -- 32 KB at the 35B's conv_dim of 8192 -- and every access
+ * pulls a fresh 64-byte line for 4 useful bytes. Measured, that made a 4-tap depthwise conv
+ * 17.4% of prefill at 0.45 GMAC/s, more than the 256-expert MoE cost. Going token-outer makes
+ * the channel loop contiguous; the price is a small ring of the last `kernel` INPUT rows,
+ * needed because out may alias in and each output reads `kernel` tokens back. */
 static void linattn_conv_span(float *win, const float *in, const float *w, const float *bias,
                               float *out, int S, int conv_dim, int kernel) {
+    if (S < 2) {                        /* decode: not worth the scratch, and this is the
+                                         * reference the fast path is checked against */
+        for (int c = 0; c < conv_dim; c++) {
+            float *wc = win + (size_t)c * kernel;
+            const float *kw = w + (size_t)c * kernel;
+            float b = bias ? bias[c] : 0.f;
+            for (int t = 0; t < S; t++) {
+                for (int j = 0; j < kernel - 1; j++) wc[j] = wc[j + 1];
+                wc[kernel - 1] = in[(size_t)t * conv_dim + c];
+                float s = b;
+                for (int j = 0; j < kernel; j++) s += wc[j] * kw[j];
+                out[(size_t)t * conv_dim + c] = s / (1.f + expf(-s));
+            }
+        }
+        return;
+    }
+    /* hist is a ring of the last `kernel` input rows; win0 snapshots the carried window,
+     * whose slot j holds the input at time j-kernel. */
+    float *hist = (float *)malloc((size_t)kernel * conv_dim * sizeof(float));
+    float *win0 = (float *)malloc((size_t)kernel * conv_dim * sizeof(float));
+    float *acc = (float *)malloc((size_t)conv_dim * sizeof(float));
+    if (!hist || !win0 || !acc) {       /* fall back rather than fail */
+        free(hist); free(win0); free(acc);
+        for (int c = 0; c < conv_dim; c++) {
+            float *wc = win + (size_t)c * kernel;
+            const float *kw = w + (size_t)c * kernel;
+            float b = bias ? bias[c] : 0.f;
+            for (int t = 0; t < S; t++) {
+                for (int j = 0; j < kernel - 1; j++) wc[j] = wc[j + 1];
+                wc[kernel - 1] = in[(size_t)t * conv_dim + c];
+                float s = b;
+                for (int j = 0; j < kernel; j++) s += wc[j] * kw[j];
+                out[(size_t)t * conv_dim + c] = s / (1.f + expf(-s));
+            }
+        }
+        return;
+    }
+    for (int j = 0; j < kernel; j++)                 /* transpose the window to row-major */
+        for (int c = 0; c < conv_dim; c++)
+            win0[(size_t)j * conv_dim + c] = win[(size_t)c * kernel + j];
+
+    for (int t = 0; t < S; t++) {
+        const float *src_t = in + (size_t)t * conv_dim;
+        float *h = hist + (size_t)(t % kernel) * conv_dim;
+        memcpy(h, src_t, (size_t)conv_dim * sizeof(float));   /* before out can clobber in */
+        if (bias) memcpy(acc, bias, (size_t)conv_dim * sizeof(float));
+        else memset(acc, 0, (size_t)conv_dim * sizeof(float));
+        for (int j = 0; j < kernel; j++) {
+            int i = t - kernel + 1 + j;
+            const float *src = (i >= 0) ? hist + (size_t)(i % kernel) * conv_dim
+                                        : win0 + (size_t)(i + kernel) * conv_dim;
+            /* w is [conv_dim][kernel]; for a fixed j this strides by kernel, but the whole
+             * weight is conv_dim*kernel floats (128 KB at the 35B) and stays in L2. */
+            for (int c = 0; c < conv_dim; c++) acc[c] += src[c] * w[(size_t)c * kernel + j];
+        }
+        float *o = out + (size_t)t * conv_dim;
+        for (int c = 0; c < conv_dim; c++) o[c] = acc[c] / (1.f + expf(-acc[c]));
+    }
+    /* leave win holding the last `kernel` inputs, in the same [c][j] layout as on entry */
     for (int c = 0; c < conv_dim; c++) {
         float *wc = win + (size_t)c * kernel;
-        const float *kw = w + (size_t)c * kernel;
-        float b = bias ? bias[c] : 0.f;
-        for (int t = 0; t < S; t++) {
-            for (int j = 0; j < kernel - 1; j++) wc[j] = wc[j + 1];
-            wc[kernel - 1] = in[(size_t)t * conv_dim + c];
-            float s = b;
-            for (int j = 0; j < kernel; j++) s += wc[j] * kw[j];
-            out[(size_t)t * conv_dim + c] = s / (1.f + expf(-s));
+        for (int j = 0; j < kernel; j++) {
+            int i = S - kernel + j;
+            wc[j] = (i >= 0) ? hist[(size_t)(i % kernel) * conv_dim + c]
+                             : win0[(size_t)(i + kernel) * conv_dim + c];
         }
     }
+    free(hist); free(win0); free(acc);
 }
 
 /* Gated delta rule over S tokens, all heads, carrying st->state across calls.

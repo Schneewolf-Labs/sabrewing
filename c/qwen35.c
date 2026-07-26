@@ -515,7 +515,7 @@ static int g_split_override = 0;
  * accumulation order alone moves a greedy continuation. */
 static int g_attn_dbl = 0;
 static double pr_qkv, pr_attn, pr_gate, pr_lin_proj, pr_lin_conv, pr_lin_scan, pr_lin_out,
-              pr_route, pr_experts, pr_shared, pr_lmhead, pr_sample;
+              pr_route, pr_rgemm, pr_experts, pr_shared, pr_lmhead, pr_sample;
 #define PROF_T0() (g_prof ? now_s() : 0.0)
 #define PROF_ADD(acc, t0) do { if (g_prof) (acc) += now_s() - (t0); } while (0)
 
@@ -525,7 +525,7 @@ static void prof_report(const char *what, double wall, int steps) {
         {"qkv+rope proj", pr_qkv}, {"attention (SDPA)", pr_attn}, {"gate+o_proj", pr_gate},
         {"linattn proj", pr_lin_proj}, {"linattn conv", pr_lin_conv},
         {"linattn recurrence", pr_lin_scan}, {"linattn norm+out", pr_lin_out},
-        {"routing", pr_route}, {"experts", pr_experts}, {"shared expert", pr_shared},
+        {"router GEMM (cpu)", pr_rgemm}, {"routing top-k+sort", pr_route}, {"experts", pr_experts}, {"shared expert", pr_shared},
         {"lm_head", pr_lmhead}, {"sampling", pr_sample},
     };
     double tot = 0;
@@ -539,34 +539,53 @@ static void prof_report(const char *what, double wall, int steps) {
 }
 static void prof_reset(void) {
     pr_qkv = pr_attn = pr_gate = pr_lin_proj = pr_lin_conv = pr_lin_scan = pr_lin_out =
-        pr_route = pr_experts = pr_shared = pr_lmhead = pr_sample = 0;
+        pr_route = pr_rgemm = pr_experts = pr_shared = pr_lmhead = pr_sample = 0;
 }
 
 /* ---------- MoE ---------- */
 /* softmax over ALL experts, then top-k, then renormalize by the top-k sum. Order matters:
  * top-k-then-softmax gives different weights and is the common way to get this wrong. */
+/* softmax over ALL experts, then top-k, then renormalize by the top-k sum. Order matters:
+ * top-k-then-softmax gives different weights and is the common way to get this wrong.
+ *
+ * Called once per (row, layer) -- 133k times for a 3321-token prefill at 40 layers -- so the
+ * constants matter. The first version scanned `sel` to test "already taken", making selection
+ * O(K^2 E) (16k comparisons per row at E=256, K=8), and malloc'd the probability buffer per
+ * call. Both showed up: routing measured 11% of prefill, more than the 256-expert MoE itself.
+ * A used-mask makes it O(K E) and the buffers come off the stack. Bit-identical: the scan is
+ * still ascending with a strict >, so ties still resolve to the lower index like torch.topk. */
+#define MOE_ROUTE_STACK_E 1024
 static void moe_route(const float *logit, int E, int K, int *sel, float *w) {
+    float ps[MOE_ROUTE_STACK_E];
+    unsigned char us[MOE_ROUTE_STACK_E];
+    float *p = ps;
+    unsigned char *used = us;
+    void *heap = NULL;
+    if (E > MOE_ROUTE_STACK_E) {
+        heap = malloc((size_t)E * (sizeof(float) + 1));
+        if (!heap) { fprintf(stderr, "OOM routing E=%d\n", E); exit(1); }
+        p = (float *)heap;
+        used = (unsigned char *)(p + E);
+    }
     float mx = -INFINITY;
     for (int e = 0; e < E; e++) if (logit[e] > mx) mx = logit[e];
     double sum = 0;
-    float *p = falloc(E);
     for (int e = 0; e < E; e++) { p[e] = expf(logit[e] - mx); sum += p[e]; }
     for (int e = 0; e < E; e++) p[e] = (float)(p[e] / sum);
-    /* top-k by value; ties broken by lower index, matching torch.topk */
+    memset(used, 0, (size_t)E);
     for (int a = 0; a < K; a++) {
         int best = -1;
         for (int e = 0; e < E; e++) {
-            int taken = 0;
-            for (int b = 0; b < a; b++) if (sel[b] == e) { taken = 1; break; }
-            if (taken) continue;
+            if (used[e]) continue;
             if (best < 0 || p[e] > p[best]) best = e;
         }
+        used[best] = 1;
         sel[a] = best; w[a] = p[best];
     }
     double tot = 0;
     for (int a = 0; a < K; a++) tot += w[a];
     for (int a = 0; a < K; a++) w[a] = (float)(w[a] / tot);
-    free(p);
+    free(heap);
 }
 
 /* Routed MoE + shared expert over S token rows.
@@ -584,9 +603,11 @@ static void moe_forward_rows(Model *m, Layer *L, const float *x, int S, float *o
     int D = c->D, I = c->moe_I, E = c->E, K = c->K, SI = c->shared_I;
     int64_t T = (int64_t)S * K;
 
-    double tr = PROF_T0();
+    double trg = PROF_T0();
     float *logit = falloc((int64_t)S * E);
     matmul_f32(logit, x, L->router, S, D, E, g_exact);
+    PROF_ADD(pr_rgemm, trg);
+    double tr = PROF_T0();
     int *sel = malloc(sizeof(int) * T);
     float *w = falloc(T);
     for (int s = 0; s < S; s++)

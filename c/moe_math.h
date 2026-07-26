@@ -20,6 +20,19 @@
 #include <stdint.h>
 #include <sys/resource.h>
 
+/* Worth opening an OpenMP region for a GEMM? (used by moe_matmul.h and moe_quant.h)
+ *
+ * Those kernels are shaped `for o in O { for s in S }`, so the work is S*O*I -- but the
+ * guard used to test O alone. That silently serialized any BATCHED gemm with a narrow output:
+ * the 256-expert MoE router (O = num_experts = 256 < 512) ran single-threaded over thousands
+ * of prefill rows, measured at 10% of qwen35's prefill. Laguna's router has the same width, so
+ * this was costing every MoE engine here.
+ *
+ * Threading is numerically free: each (s, o) output is an independent reduction computed by
+ * the same instruction sequence regardless of which thread runs it, so results stay
+ * bit-identical -- including on the exact double-accumulate paths the oracles validate. */
+#define MOE_MM_PAR(S, O) ((int64_t)(S) * (O) >= 512)
+
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 /* Peak RSS in GB. ru_maxrss is KB on Linux/BSD, bytes on macOS — the per-engine
