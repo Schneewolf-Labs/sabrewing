@@ -302,6 +302,17 @@ kernel-check$(EXE): tools/kernel_check.c moe_quant.h
 	$(CC) $(CFLAGS) tools/kernel_check.c -o kernel-check$(EXE) $(LDFLAGS)
 	./kernel-check$(EXE)
 
+# Gated-delta-net (Qwen3.5 linear attention) harness. Unlike kernel-check this
+# needs a fixture from the transformers reference, so it is not in `test` — it
+# builds unconditionally and runs only once the fixture exists. Regenerate with
+# `make linattn-test` on a box that has torch + transformers. See docs/linear-attention.md.
+linattn-check$(EXE): tools/linattn_check.c moe_linattn.h
+	$(CC) $(CFLAGS) tools/linattn_check.c -o linattn-check$(EXE) $(LDFLAGS)
+
+linattn-test: linattn-check$(EXE)
+	@if [ ! -f gdn_ref.npz ]; then $(PYTHON) tools/gdn_ref.py gdn_ref.npz; fi
+	./linattn-check$(EXE) gdn_ref.npz
+
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
 # Apple Silicon. Unknown targets use native rather than an invalid x86 flag.
@@ -463,4 +474,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test

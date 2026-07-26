@@ -1,0 +1,158 @@
+# Linear attention (Qwen3.5's gated delta net)
+
+Qwen3.5-35B-A3B replaces softmax attention in **30 of its 40 layers** with a *gated delta
+net* — a recurrent linear-attention mixer. Only every 4th layer is full attention
+(`full_attention_interval: 4`). That is the part of the architecture worth caring about here,
+because it attacks the constraint that actually limits this box: KV capacity.
+
+Status: the kernel is implemented in `c/moe_linattn.h` and validated against the
+`transformers` reference (`make linattn-test`). **There is no Qwen3.5 engine yet** — no
+converter, no loader, no `qwen35.c`. This is the validated primitive, not a runnable model.
+
+## Geometry (from the shipped `config.json`)
+
+| | |
+|---|---|
+| hidden | 2048 |
+| layers | 40 — 30 `linear_attention`, 10 `full_attention` |
+| linear heads | 16 key / **32 value**, `k_dim = v_dim = 128`, conv kernel 4 |
+| full-attn heads | 16 query / 2 KV, `head_dim` **256**, `attn_output_gate: true` |
+| MoE | 256 experts, top-8, `moe_intermediate_size` 512, shared expert 512 |
+| vocab | 248320 · max positions 262144 |
+
+Parameter split: the MoE is ~32 B of the 35 B (256 experts × 3 × 512 × 2048 × 40 layers), the
+linear-attention projections are ~1.0 B, full attention ~0.27 B. So the mixer is cheap in
+weights — its cost is state traffic, not GEMM.
+
+## The recurrence
+
+Per head, per token. `q` and `k` are L2-normalized (eps added to the *sum*, not the mean), `q`
+pre-scaled by `1/sqrt(k_dim)`, `beta = sigmoid(b)`, `g = -exp(A_log) * softplus(a + dt_bias)`:
+
+```
+S   <- S * exp(g)          decay (g < 0), a scalar per (head, token)
+mem <- k^T S               [v_dim]
+d   <- (v - mem) * beta
+S   <- S + k (x) d         rank-1 update
+out <- q^T S               read the UPDATED state
+```
+
+Two orderings here are easy to get wrong and both produce plausible activations rather than
+obvious garbage: the decay applies **before** the memory read, and the output reads the state
+**after** the update. `tools/linattn_check.c` pins both — inverting the first moves relative
+L2 error from `3e-7` to `1.2e-1`, so the test discriminates rather than merely passing.
+
+Around it: `in_proj_qkv` → depthwise **causal** conv1d (kernel 4, per-channel) → SiLU → split
+q/k/v → recurrence → `RMSNormGated(core, z)` = `x * rsqrt(mean(x²)+eps) * weight * silu(z)` →
+`out_proj`. Value heads share key heads 2:1 (`repeat_interleave`).
+
+## Why this matters for serving: O(1) state
+
+The per-sequence state is one `[k_dim × v_dim]` matrix per head — **2.1 MB per layer,
+independent of context length** — plus a 128 KB conv window. Against the full-attention layers
+at f32:
+
+| context | 30 linear layers (state) | 10 full-attn layers (KV) | total |
+|---|---|---|---|
+| 2 k | 67 MB | 84 MB | 151 MB |
+| 8 k | 67 MB | 336 MB | 403 MB |
+| 32 k | 67 MB | 1.34 GB | **1.41 GB** |
+| 256 k | 67 MB | 10.7 GB | 10.8 GB |
+
+For comparison, one Laguna slot at 32 k reserves **3.52 GB** (see `kv-cache-design.md`), and a
+hypothetical all-softmax version of this model would need 5.37 GB.
+
+Read the table honestly in both directions. The linear state is a **fixed 67 MB tax**: full
+attention across 10 layers costs 40 KB/token, so below roughly **1700 tokens the state costs
+more memory than the attention layers do**. It only wins past that — and then it wins
+enormously, because it never grows. At 32 k it is 20× smaller than the attention KV; at 256 k,
+160×. For the agent-fleet workload (long-lived conversations, 187 GB of RAM) that is the
+difference between ~34 concurrent 32k sessions and ~130.
+
+## Measured cost
+
+`make linattn-test` benches the recurrence at the real shapes (30 layers, 32 heads, 128×128),
+min-of-5, rotating through 30 separate states so each step touches a different layer's memory
+the way the real model does. Ryzen 9 7900, 12 cores, head-parallel via OpenMP:
+
+| kernel | decode (S=1) | prefill (S=128) |
+|---|---|---|
+| naive, 3 sweeps | 1.34–1.53 ms/tok | 0.428–0.444 ms/tok (~2270 tok/s) |
+| **fused, 2 sweeps** | **0.98–1.00 ms/tok** | **0.333–0.355 ms/tok (~2900 tok/s)** |
+
+### The fused kernel
+
+The naive form walks the state three times (decay, update, output) and writes it twice. Two
+identities collapse that to two sweeps, one of them read-only:
+
+1. **decay is a scalar**, so it factors out of the read: `k^T (decay·S) == decay · (k^T S)`.
+   No decay pass is needed — fold it into the update sweep as `S = decay·S + k⊗d`.
+2. **the output expands**: `q^T (decay·S + k⊗d) == decay·(q^T S) + (q·k)·d`, so `out` can be
+   accumulated in the same read-only sweep as `mem`, from the *old* state, then corrected with
+   one dot product.
+
+`2R + 1W` instead of `3R + 2W` — 40% less state traffic, and measured 1.4× on decode, 1.25× on
+prefill. It is not bit-identical to the naive form (different summation order for `out`), so
+both are checked against `transformers` separately rather than against each other; the naive
+form is kept as the literal reference, same as the `MOE_QK_*` modes in `moe_attn.h`.
+
+### Where the remaining cost sits, and the caveat
+
+Arithmetic intensity is ~3 flops per state element touched, so this is a bandwidth problem,
+not a FLOP problem. The prefill number works out to ~275 GFLOP/s, about 15% of this CPU's
+AVX-512 peak — and a per-core estimate puts it almost exactly at the L2 bandwidth/compute
+crossover (~3072 cycles of L2 traffic against ~3072 cycles of FMA per head-token). So the
+naive-scan shape is close to its own ceiling, and the way past it is the **chunked/WY form**,
+which turns per-token rank-1 updates into blocked GEMMs and raises intensity. That is real
+work and is not needed yet.
+
+**The decode number is optimistic and should be read as a floor.** 63 MB of state against this
+CPU's 64 MB of L3 means the bench is largely cache-resident: 189 MB of traffic in 1.00 ms
+implies 189 GB/s, well above the ~83 GB/s this DDR5 config can actually deliver. In the real
+model, streaming ~500 MB of expert weights per decode step evicts all of it, which puts true
+decode cost somewhere in **1.0–3.2 ms/token**. Even at the pessimistic end that is a few
+percent of a decode step, so decode is not where this hurts.
+
+**Prefill is where it hurts, relatively.** 0.34 ms/token does not amortize — it is per token,
+whereas prefill amortizes the MoE weight reads across the whole batch. Against our best
+measured prefill on Qwen-27B (1083 tok/s ≈ 0.92 ms/token) the recurrence would add ~27% on
+top. That is the argument for the chunked kernel, and it is a prefill argument only.
+
+## What this changes about prefix caching
+
+Our reuse machinery (`psnap_*`, the longest-common-prefix walk in `slot_admit`) assumes
+positions are **independent**: a KV cache can be truncated to any position, because position
+*p*'s K/V does not depend on what came after it. A recurrent state has no such property.
+`S` after *n* tokens does not contain `S` after *n−k*, and there is no inverse — the decay
+multiplied information away.
+
+Consequences, and they are not symmetric:
+
+- **Extending a cached prefix is cheaper and simpler than it is today.** A snapshot is a
+  fixed 67 MB blob with no per-position bookkeeping, no ring, no `next_pow2(window + span)`
+  rule. `linattn_check.c` already pins the property that makes this safe: feeding a sequence
+  as 1-token steps, as one span, and as uneven spans `{5, 1, rest}` gives **bit-identical**
+  output, so state and conv window carry correctly across a chunk boundary.
+- **Rewinding is impossible.** When a conversation diverges from its cached prefix — which
+  `kv_reuse_floor` handles today by keeping the common prefix and dropping the tail — the
+  recurrent layers must replay from the newest snapshot at or *before* the divergence point.
+  So snapshot granularity stops being a memory/latency tradeoff and becomes a **correctness-
+  adjacent cost floor**: with `PSNAP_GRAN 256`, a divergence at token 5000 costs up to 255
+  tokens of replay through the linear layers that attention would have paid nothing for.
+  The full-attention layers can still be truncated normally, so a Qwen3.5 cache is genuinely
+  two different data structures with two different reuse rules.
+- **Do not quantize the state.** int8 KV already flips 6.4% of predictions on confident text
+  and stays off. The state is worse in kind: KV error is read-only per position, while state
+  error **compounds through every subsequent step** of the recurrence. This should be treated
+  as f32-only until there is evidence otherwise, not as the next obvious win.
+
+## To actually run the model
+
+Remaining, roughly in order: an int4 converter for the new tensor names; a `MoeSharedMode`
+variant for the sigmoid-gated shared expert (`sigmoid(shared_expert_gate(x))`, no correction
+bias and no route scale — softmax → top-8 → renormalize); the full-attention layers, which
+need a per-element output gate (`q_proj` emits `n_heads*head_dim*2`, chunked into query and
+gate — the same M.1 gate-width trap that already bit us on Laguna, so read the width from the
+checkpoint and fail loudly); a tiny random-init oracle (`make_tiny_qwen35.py`) checked
+token-exact against `transformers`; then the engine. Weights are not downloaded — only
+`config.json` is in the HF cache.
