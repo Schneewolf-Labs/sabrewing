@@ -72,6 +72,7 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `LAG_KV_SPAN=N` | positions per forward pass, default 128 — also sets the sliding ring size |
 | `LAG_ATTN_EXACT=1` | attention QK in scalar double (the oracle contract) instead of AVX-512 |
 | `LAG_ATTN_ONLINE=1` | single-pass online-softmax attention (measured neutral — see `docs/llamacpp-notes.md`) |
+| `LAG_ATTN_GROUPED=0/1` | force GQA-grouped attention off/on (default: on when there are ≥24 work items) |
 | `KV8=1` | int8 KV cache (1.11 → 0.29 GB/slot at 8k). **Lossy and not yet validated on the real model** — see below |
 | `LAG_NOREUSE=1` | serve mode: disable KV prefix reuse across requests (it is ON by default) |
 | `LAG_PREFIX_SNAPS=N` | shared prefix snapshots to keep (default 4 when reuse is on); each costs one slot's worth of KV |
@@ -386,26 +387,33 @@ than being invisible.
 Two things in this document are implemented but **not** yet backed by a measurement, and
 are off by default for that reason:
 
-- **int8 KV (`KV8=1`).** Per-ROW scales failed the real gate: **706/1024** teacher-forced
-  predictions matched f32, i.e. a third of next-token predictions changed. Perplexity had
-  hidden this completely — it *improved* (210.5 → 173.9), because the path was altering
-  the model rather than approximating it, so the score was free to move either way. The
-  f32-vs-itself control is 1024/1024, so the instrument is sound.
+- **int8 KV (`KV8=1`) — measured, modest damage, stays opt-in.**
 
-  Diagnosis, and it is asymmetric: **K is normalized before caching, V is not.** K passes
-  through qk-RMSNorm and RoPE; V is stored raw from `v_proj`, where LLM activations carry
-  outlier channels. One outlier fixes the scale for all 128 values in a row and collapses
-  the rest into a couple of levels.
+  | on text the model is confident about (ppl 1.91) | prediction agreement |
+  |---|---|
+  | f32 vs itself | 1024/1024 |
+  | benign change (exact double QK vs SIMD QK) | 1024/1024 |
+  | **int8 KV, 32-element block scales** | **958/1024 — 66 flips (6.4%)** |
 
-  Fixed by scaling per **32-element block** (what llama.cpp's `q8_0` KV does), costing
-  4 bytes per 32 values — 1.125 B/value instead of 1.03, still ~3.5× smaller than f32.
-  `make kernel-check` now includes an outlier stress case (one 60× channel per V row),
-  which is the case per-row scales died on: L2rel 1.2-1.35e-2, bounded across window
-  sizes. Tiny oracle with block scales: 36/36, 24/24, ppl +0.06%.
+  The benign control is what makes this readable: pure float-rounding differences flip
+  *nothing* on confident text, so all 66 flips are attributable to int8. Perplexity is
+  blind to it — it moved 1.91 → 1.81, i.e. "improved" — which is why the gate scores
+  prediction agreement instead.
 
-  **Still off by default:** the real-model prediction-agreement gate has not been re-run
-  with block scales (the GPU was committed to an agent workload). Nothing here should be
-  believed about the real model until that number replaces 706/1024.
+  Two earlier claims here were wrong and are worth recording. First, an initial gate on
+  hard out-of-distribution prose reported 706/1024 and I called int8 broken; on that text
+  a *benign* change scores 931/1024, because the model is near-tied everywhere and 1024
+  was never reachable. Judge a perturbation against a benign control, not against 100%.
+  Second, I attributed the damage to outlier channels in V (unnormalized, unlike K which
+  passes qk-RMSNorm) and predicted 32-element block scales would largely fix it: they
+  moved the hard-text score 706 → 733. The blocks are still the right call on principle
+  (1.125 B/value vs 1.03, and kernel-check carries an outlier stress case), but they were
+  not the explanation.
+
+  So: 3.8× less KV memory (1.11 → 0.29 GB/slot at 8k) for ~6% of next-token predictions
+  changing. Worth it when memory is the binding constraint, not a free win, and off by
+  default.
+
 Prefix reuse is no longer in that category — it is measured and on by default:
 
 | 3-turn agent conversation (~2.3k-token transcript, greedy) | turn 0 | turn 1 | turn 2 |
@@ -421,3 +429,48 @@ permanently one token ahead of the cache, so the next turn's prefix match claime
 position whose K/V was never computed — stale buffer bytes read as context. No crash,
 coherent output, different wording. The invariant is now explicit: **`hist_len ==
 kv.len`**, maintained in the prefill step and after `forward_batch`, never on emit.
+
+## Where prefill time goes
+
+Prefill is 70-85% of an agent turn, so it got its own profile (`LAG_PROF=1` now reports a
+prefill breakdown, not just decode). 2139-token prompt, one stream, 99% of wall accounted:
+
+| phase | share | ms per 128-token chunk |
+|---|---|---|
+| **experts CPU** (10 of 47 layers) | **27.7%** | 935 |
+| **qkv+rope projections** | **22.0%** | 742 |
+| gate + o_proj | 15.2% | 514 |
+| attention | 13.5% | 456 |
+| experts VRAM (37 layers) | 10.7% | 360 |
+| routing + group sort | 6.3% | 214 |
+| shared expert | 3.3% | 110 |
+
+There is no single lever here, and the obvious suspects are not it:
+
+- **Chunk size does nothing.** 128 vs 512 rows: 57.2s vs 57.6s. (An earlier sweep that
+  showed 83.8/76.2/72.1s was measured under contention and is retired.)
+- **Attention is only 13.5%**, so GQA-grouped attention — which cuts that phase ~20% —
+  moves total prefill ~2%.
+- **Caching is already maxed.** A continuation turn reuses the whole prior transcript;
+  only the new delta prefills, which is why turn 2 of an agent conversation costs *less*
+  wall time than turn 1 despite a larger context.
+
+The cost is arithmetic spread across everything, and the *resident* matmuls (qkv/rope +
+gate/o_proj = 37%) outweigh the experts. Those already run on the GPU, so they are limited
+by our kernels rather than by placement — the same MMQ-style tensor-core ceiling described
+in `llamacpp-notes.md`, and the same ceiling for batched decode. Clean prefill is currently
+**37.4 tok/s** (2139 tokens in 57.3s).
+
+## GQA-grouped attention
+
+Laguna has 8 KV heads serving 48-72 query heads, so a per-head loop reads each KV head's K
+and V 6-9 times per layer. `sdpa_group` attends a whole query group in ONE pass over the
+window, using the online-softmax form (running max/sum, no score buffer) — the same form
+that measured a wash for a single query row, because with 6-9 rows sharing the stream there
+is finally something to save.
+
+Measured on prefill (interleaved A/B/A/B, one engine): attention phase 8.9 → 6.8s and
+8.2 → 7.9s; total prefill 58.2 → 55.9s and 57.7 → 57.1s. Validated against the per-head
+double-accumulate reference at L2rel 1.3e-6 in `make kernel-check`. Parallelism drops from
+B·heads to B·kv_heads work items, so it engages only when that still fills the cores
+(≥24 items) — `LAG_ATTN_GROUPED` forces either way.

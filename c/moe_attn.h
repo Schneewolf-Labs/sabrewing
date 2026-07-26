@@ -133,6 +133,98 @@ static void sdpa_head_online(const float *q, const float *Kbase, const float *Vb
     for (int d = 0; d < hd; d++) out[d] *= inv;
 }
 
+/* GQA-grouped attention: attend `nq` query heads that share one KV head in a SINGLE pass
+ * over the K/V window.
+ *
+ * Laguna has 8 KV heads serving 48-72 query heads, so a per-head loop reads each KV head's
+ * K and V 6-9 TIMES per layer — the same bytes, once per query head in the group. At 2k
+ * context attention was 41-45% of a decode step, and this is where those bytes go.
+ *
+ * The online-softmax form is what makes one pass possible (no score buffer to keep per
+ * head, running max/sum instead). For a single query row that form measured a wash — the
+ * score row was already cache-resident, so there was nothing to save. With 6-9 rows sharing
+ * the stream it is the whole point: K_t and V_t are loaded once and used nq times.
+ *
+ * Queries and outputs for a group are contiguous (head hh belongs to kv head hh/group), so
+ * the caller passes the first head of the group and a stride of hd.
+ *
+ * Rescaling makes the arithmetic differ from the two-pass path, so this is generation-only;
+ * exact callers keep sdpa_head and their oracles. */
+#define SDPA_MAX_GROUP 16
+
+static void sdpa_group(const float *q, int q_stride,
+                       const float *Kbase, const float *Vbase, int kv_stride,
+                       int hd, int t0, int qpos, float scale, float tau,
+                       float *out, int out_stride, int nq, int ring) {
+    float m[SDPA_MAX_GROUP], sum[SDPA_MAX_GROUP];
+    int mask = ring - 1;
+    for (int j = 0; j < nq; j++) {
+        m[j] = -INFINITY;
+        sum[j] = 0.f;
+        float *o = out + (int64_t)j * out_stride;
+        for (int d = 0; d < hd; d++) o[d] = 0.f;
+    }
+
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = ring ? (t & mask) : t;
+        const float *k = Kbase + slot * kv_stride;
+        const float *v = Vbase + slot * kv_stride;
+        for (int j = 0; j < nq; j++) {
+            const float *qj = q + (int64_t)j * q_stride;
+            float dot;
+#if defined(__AVX512F__)
+            {
+                __m512 acc = _mm512_setzero_ps();
+                int d = 0;
+                for (; d + 16 <= hd; d += 16)
+                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(qj + d), _mm512_loadu_ps(k + d), acc);
+                float sd = _mm512_reduce_add_ps(acc);
+                for (; d < hd; d++) sd += qj[d] * k[d];
+                dot = sd;
+            }
+#else
+            { float sd = 0; for (int d = 0; d < hd; d++) sd += qj[d] * k[d]; dot = sd; }
+#endif
+            float x = tau * (dot * scale);
+            float *o = out + (int64_t)j * out_stride;
+            if (x > m[j]) {          /* running max rises O(log n) times, not n */
+                float rescale = (m[j] == -INFINITY) ? 0.f : expf(m[j] - x);
+                sum[j] = sum[j] * rescale + 1.f;
+#if defined(__AVX512F__)
+                __m512 vr = _mm512_set1_ps(rescale);
+                int d = 0;
+                for (; d + 16 <= hd; d += 16)
+                    _mm512_storeu_ps(o + d, _mm512_fmadd_ps(_mm512_loadu_ps(o + d), vr,
+                                                            _mm512_loadu_ps(v + d)));
+                for (; d < hd; d++) o[d] = o[d] * rescale + v[d];
+#else
+                for (int d = 0; d < hd; d++) o[d] = o[d] * rescale + v[d];
+#endif
+                m[j] = x;
+            } else {
+                float w = expf(x - m[j]);
+                sum[j] += w;
+#if defined(__AVX512F__)
+                __m512 vw = _mm512_set1_ps(w);
+                int d = 0;
+                for (; d + 16 <= hd; d += 16)
+                    _mm512_storeu_ps(o + d, _mm512_fmadd_ps(vw, _mm512_loadu_ps(v + d),
+                                                            _mm512_loadu_ps(o + d)));
+                for (; d < hd; d++) o[d] += w * v[d];
+#else
+                for (int d = 0; d < hd; d++) o[d] += w * v[d];
+#endif
+            }
+        }
+    }
+
+    for (int j = 0; j < nq; j++) {
+        float inv = sum[j] > 0.f ? 1.f / sum[j] : 0.f;
+        float *o = out + (int64_t)j * out_stride;
+        for (int d = 0; d < hd; d++) o[d] *= inv;
+    }
+}
+
 /* SDPA over an int8 K/V cache.
  *
  * Scales are per BLOCK of KV_Q8_BLOCK elements, not per row. One scale per 128-element row

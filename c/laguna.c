@@ -187,7 +187,16 @@ static void resmm_b(float *y, const float *x, const void *W, const void *Wdev, i
  * NEUTRAL here, not better — see docs/llamacpp-notes.md. LAG_ATTN_ONLINE=1 selects it
  * anyway, because it is the right structure once K/V is quantized (one pass = one
  * dequant instead of two) and for a future GPU kernel. */
-static int g_attn_exact = 0, g_attn_online = 0;
+static int g_attn_exact = 0, g_attn_online = 0, g_attn_grouped = -1;
+/* GQA-grouped attention: one pass over a KV head's window serving all its query heads
+ * (laguna: 6-9 of them). Parallelism drops from B*heads to B*kv_heads work items, so it
+ * only pays when that still fills the cores — hence the work-item floor, and the env
+ * override so the default can be chosen from measurement rather than intuition. */
+static int lag_use_grouped_attn(int items) {
+    if (g_attn_exact || g_exact || g_attn_online) return 0;
+    if (g_attn_grouped >= 0) return g_attn_grouped;
+    return items >= 24;
+}
 static int lag_qk_mode(void) {
     if (g_exact || g_attn_exact) return MOE_QK_DBL;      /* oracle contract */
     return g_attn_online ? MOE_QK_ONLINE : MOE_QK_SIMD;
@@ -845,6 +854,7 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
         float *Kc = kv->q8 ? NULL : kv->k[li], *Vc = kv->q8 ? NULL : kv->v[li];
 
         /* --- project + qk-norm + rope; store K/V into the cache at abs position --- */
+        double tp = PROF_T0();
         float *Q = falloc((int64_t)S * H * hd);
         float *AO = falloc((int64_t)S * H * hd);
         /* int8 cache: norm+rope have to happen before quantization, so K/V land in a
@@ -880,7 +890,26 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
             }
         }
         free(kst); free(vst);
+        PROF_ADD(pr_proj, tp);
+        double ta = PROF_T0();
         float scaling = 1.f / sqrtf((float)hd);
+        /* Grouped attention here too: prefill has S*nkv work items (plenty of parallelism)
+         * and the same 6-9x redundant K/V reads a per-head loop causes. */
+        if (lag_use_grouped_attn(S * nkv) && group <= SDPA_MAX_GROUP && !kv->q8) {
+            #pragma omp parallel for schedule(dynamic) collapse(2) if(S * nkv > 1)
+            for (int t = 0; t < S; t++) {
+                for (int kh = 0; kh < nkv; kh++) {
+                    int pos = pos0 + t;
+                    int j0 = (win > 0 && pos - win + 1 > 0) ? pos - win + 1 : 0;
+                    sdpa_group(Q + ((int64_t)t * H + kh * group) * hd, hd,
+                               Kc + kh * hd, Vc + kh * hd, nkv * hd,
+                               hd, j0, pos, scaling, 1.f,
+                               AO + ((int64_t)t * H + kh * group) * hd, hd, group, kv->ring[li]);
+                }
+            }
+            PROF_ADD(pr_attn, ta);
+            goto span_attn_done;
+        }
         #pragma omp parallel for schedule(dynamic) if(S > 1)
         for (int t = 0; t < S; t++) {
             int pos = pos0 + t;
@@ -906,6 +935,10 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
             }
             free(att);
         }
+        PROF_ADD(pr_attn, ta);
+span_attn_done:
+        ;
+        double tg = PROF_T0();
         /* softplus attention-output gate (of the layer input xn) applied before o_proj.
          * Per head (S-2.1) or per element (M.1) — see Layer.wg_out. */
         int gw = L->wg_out, per_head = (gw == H);
@@ -923,6 +956,7 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
             resmm(scr, AO + (int64_t)t * H * hd, L->wo, L->d_wo, H * hd, D);
             for (int i = 0; i < D; i++) h[t * D + i] += scr[i];
         }
+        PROF_ADD(pr_gate, tg);
         free(gate); free(Q); free(AO);
 
         /* --- MLP / MoE over the S rows (batched dense; MoE grouped by expert) --- */
@@ -1027,6 +1061,23 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
             int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
             if (p - j0 + 1 > span) span = p - j0 + 1;
         }
+        if (lag_use_grouped_attn(B * nkv) && group <= SDPA_MAX_GROUP) {
+            /* one pass over each KV head's window, serving its whole query group */
+            #pragma omp parallel for schedule(dynamic) collapse(2) if(B * nkv > 1)
+            for (int b = 0; b < B; b++) {
+                for (int kh = 0; kh < nkv; kh++) {
+                    int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
+                    KVCache *kc = kvs[b];
+                    if (kc->q8) continue;                   /* int8 cache: per-head path below */
+                    sdpa_group(Q + ((int64_t)b * H + kh * group) * hd, hd,
+                               kc->k[li] + kh * hd, kc->v[li] + kh * hd, nkv * hd,
+                               hd, j0, p, scaling, 1.f,
+                               AO + ((int64_t)b * H + kh * group) * hd, hd, group, kc->ring[li]);
+                }
+            }
+            PROF_ADD(pr_attn, ta);
+            goto attn_done;
+        }
         #pragma omp parallel for schedule(dynamic) collapse(2) if(B * H > 1)
         for (int b = 0; b < B; b++) {                       /* each seq over its own cache */
             for (int hh = 0; hh < H; hh++) {
@@ -1049,6 +1100,8 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
             }
         }
         PROF_ADD(pr_attn, ta);
+attn_done:
+        ;
         double tg = PROF_T0();
         int gw = L->wg_out, per_head = (gw == H);           /* per-head (S-2.1) / per-element (M.1) */
         float *gate = falloc((int64_t)B * gw);
@@ -1622,6 +1675,7 @@ int main(int argc, char **argv) {
     if (getenv("LAG_PROF")) g_prof = 1;
     if (getenv("LAG_ATTN_EXACT")) g_attn_exact = 1;
     if (getenv("LAG_ATTN_ONLINE")) g_attn_online = 1;
+    if (getenv("LAG_ATTN_GROUPED")) g_attn_grouped = atoi(getenv("LAG_ATTN_GROUPED")) ? 1 : 0;
     if (getenv("KV8")) g_kv8 = atoi(getenv("KV8")) != 0;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
@@ -1747,8 +1801,12 @@ int main(int argc, char **argv) {
             cur[b] = argmax_logits(&m, Hp + (int64_t)(np - 1) * D, NULL);
         }
         free(Hp);
+        double prefill_s = now_s() - tp;
         printf("[BATCH=%d%s, %d prompt tok, prefill %.1fs] decoding...\n",
-               B, vary ? " VARY" : "", np, now_s() - tp); fflush(stdout);
+               B, vary ? " VARY" : "", np, prefill_s); fflush(stdout);
+        /* Prefill is 70-85% of an agent turn, so it needs its own breakdown — the decode
+         * profile below resets these counters and would otherwise hide it entirely. */
+        prof_report("prefill", prefill_s, B * ((np + lag_group_chunk() - 1) / lag_group_chunk()));
         float *Hd = falloc((int64_t)B * D), *lg = falloc((int64_t)B * V);
         int **out = malloc((size_t)B * sizeof(int*)); for (int b = 0; b < B; b++) out[b] = malloc((size_t)n_new * sizeof(int));
         int *first = malloc((size_t)B * sizeof(int));   /* each stream's post-prefill token */

@@ -151,6 +151,34 @@ int main(void) {
         }
     }
 
+    /* ---- GQA-grouped attention vs per-head, same math one pass instead of `group` ---- */
+    {
+        int hd = 128, nkvh = 8, stride = nkvh * hd, group = 6;
+        int wins[] = {17, 512, 2187};
+        printf("attention sdpa_group [hd=%d, group=%d] vs per-head MOE_QK_DBL:\n", hd, group);
+        for (size_t wi = 0; wi < sizeof(wins) / sizeof(wins[0]); wi++) {
+            int npos = wins[wi];
+            float *q = malloc((size_t)group * hd * 4);
+            float *K = malloc((size_t)npos * stride * 4), *V = malloc((size_t)npos * stride * 4);
+            float *o1 = malloc((size_t)group * hd * 4), *o2 = malloc((size_t)group * hd * 4);
+            float *sc = malloc((size_t)npos * 4);
+            for (int i = 0; i < group * hd; i++) q[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            for (int64_t i = 0; i < (int64_t)npos * stride; i++) {
+                K[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+                V[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            }
+            for (int j = 0; j < group; j++)      /* reference: one head at a time */
+                sdpa_head(q + (size_t)j * hd, K, V, stride, hd, 0, npos - 1,
+                          1.f / sqrtf((float)hd), 1.f, NULL, 0, MOE_QK_DBL,
+                          o1 + (size_t)j * hd, sc, 0);
+            sdpa_group(q, hd, K, V, stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                       o2, hd, group, 0);
+            char name[64]; snprintf(name, sizeof(name), "window %-5d grouped", npos);
+            ok &= report(name, o2, o1, group * hd, 1e-4);
+            free(q); free(K); free(V); free(o1); free(o2); free(sc);
+        }
+    }
+
     /* ---- int8 KV cache: quantization error of the whole attention output ----
      * Storing K/V at 1.03 bytes/value instead of 4 is lossy, so bound the damage: the
      * attention output from an int8 cache vs the same data in f32 with the exact
