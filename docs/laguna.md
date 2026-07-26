@@ -72,6 +72,11 @@ stay on the CPU. That capacity gap is the single-stream bottleneck.
 | `LAG_KV_SPAN=N` | positions per forward pass, default 128 — also sets the sliding ring size |
 | `LAG_ATTN_EXACT=1` | attention QK in scalar double (the oracle contract) instead of AVX-512 |
 | `LAG_ATTN_ONLINE=1` | single-pass online-softmax attention (measured neutral — see `docs/llamacpp-notes.md`) |
+| `KV8=1` | int8 KV cache (1.11 → 0.29 GB/slot at 8k). **Lossy and not yet validated on the real model** — see below |
+| `LAG_NOREUSE=1` | serve mode: disable KV prefix reuse across requests (it is ON by default) |
+| `LAG_PREFIX_SNAPS=N` | shared prefix snapshots to keep (default 4 when reuse is on); each costs one slot's worth of KV |
+| `TOKENIZE=1` | print the engine's own token ids for `-p`/`-f` and exit (build a trustworthy reference) |
+| `TF_DUMP=<file>` | oracle harness: dump this run's teacher-forced argmax stream, to score another config against it |
 | `CUDA_HEADROOM_MB`, `CUDA_EXPERT_GB` | tune the expert-cache VRAM budget |
 | `LAG_GPU_MINEL` | min weight size to offload a resident matmul (default 0 = all) |
 | `NOGPU=1`, `GPU_DEV=n` | disable GPU / pick device |
@@ -333,3 +338,74 @@ Validated: oracle 36/36 + ppl 0.00% with the ring, including `LAG_KV_SPAN=4`, wh
 shrinks the ring to 16 slots so a 36-token prefill **wraps it twice**; and on the real
 118B, a 2139-token prompt (wrapping the 1024-slot ring) generates identical text with
 and without trimming.
+
+## Prefix caching for agent loops (`LAG_KV_REUSE=1`)
+
+Decode throughput is not what limits an agent loop — **re-prefill** is. An agent
+re-sends its whole transcript every turn, so at ~29 tok/s prefill a 20k-token context
+costs roughly **12 minutes per turn** against ~12 s of decode for 200 output tokens.
+Essentially the entire turn is spent recomputing a context that barely changed.
+
+Two mechanisms, both **on by default** (`LAG_NOREUSE=1` disables):
+
+1. **Per-slot reuse.** Each slot's KV cache is now persistent and carries the token ids
+   it represents. On admission the engine takes the longest common prefix with the new
+   prompt and prefills only the tail. Zero copying — the cache is already right.
+2. **Shared prefix snapshots.** Per-slot reuse only helps if a request returns to *its*
+   slot. An agent fleet shares a preamble (system prompt, tool definitions, repo
+   context) across many conversations, so snapshots of that preamble are pooled and any
+   slot can restore one with a `memcpy`. Lengths round down to a 256-token granule so
+   requests sharing a preamble hit the same snapshot.
+
+This is what the spare RAM is for. The weights are already fully resident (57 GB of
+187), so there is nothing left to promote to RAM; **KV is the thing worth hoarding**, and
+at int8/8k a cache is 0.29 GB, so ~100 GB of headroom holds hundreds of contexts.
+
+### Pin `cache_slot` per conversation
+
+The gateway assigns `min(free_slots)` when a request does not name one, so a
+conversation's turns can land on **different** slots and per-slot reuse never fires
+(the shared pool still catches the preamble). An agent harness should send a stable
+slot per conversation:
+
+```json
+{"model": "laguna-s-2.1-colibri", "messages": [...], "cache_slot": 3}
+```
+
+### The sliding-ring constraint on rewinding
+
+Reuse is refused when the divergence point is more than `ring - window` (~512) tokens
+back, because the sliding layers' ring no longer holds that history — reusing it would
+silently attend to K/V that later positions overwrote. Normal agent turns diverge at the
+end of the transcript and always qualify; a client that *edits* earlier history falls
+back to a full prefill. Refusals are counted in the `[kv-reuse]` line on exit rather
+than being invisible.
+
+## Status of the unvalidated pieces
+
+Two things in this document are implemented but **not** yet backed by a measurement, and
+are off by default for that reason:
+
+- **int8 KV (`KV8=1`).** Memory is verified (1.11 → 0.29 GB/slot) and the kernel agrees
+  with the f32+double contract to L2rel 4.2e-3, flat across window sizes. The tiny
+  oracle behaves exactly as a lossy cache should: 36/36 teacher-forced, 24/24 greedy,
+  ppl +0.06%. But on the real model int8 appeared to *improve* perplexity (210.5 → 173.9
+  on hard text, 1.91 → 1.81 on easy text), which a lossy cache cannot legitimately do.
+  Tokenization was ruled out as the cause (the engine's ids are byte-identical to the
+  reference tokenizer). Perplexity is the wrong instrument here, so the open gate scores
+  it as "how many of 1024 next-token predictions change versus f32" instead.
+Prefix reuse is no longer in that category — it is measured and on by default:
+
+| 3-turn agent conversation (~2.3k-token transcript, greedy) | turn 0 | turn 1 | turn 2 |
+|---|---|---|---|
+| no reuse — TTFT | 58.6 s | 60.7 s | 61.1 s |
+| with reuse — TTFT | 59.1 s | **0.66 s** | **0.63 s** |
+
+Byte-identical output across all three turns, so the 92× on continuation turns costs
+nothing in fidelity. Getting there required fixing a bug worth recording: the slot's
+token history was appended on token *emit*, but a token only enters the KV cache when it
+is later *fed* to a forward pass, and the last token of a turn never is. History sat
+permanently one token ahead of the cache, so the next turn's prefix match claimed a
+position whose K/V was never computed — stale buffer bytes read as context. No crash,
+coherent output, different wording. The invariant is now explicit: **`hist_len ==
+kv.len`**, maintained in the prefill step and after `forward_batch`, never on emit.

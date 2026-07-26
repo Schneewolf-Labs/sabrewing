@@ -471,7 +471,18 @@ static void rope_apply(float *h, int pos, const float *inv, int rdim, float scal
  * span overwrite the history those same rows still need. (The tiny oracle caught this
  * immediately — window 8, 36-token prefill, 4/36.) So forward() processes at most
  * kv_span() positions per pass and the ring is next_pow2(window + span). */
-typedef struct { float **k, **v; int *ring; int max_pos, len; } KVCache;
+/* KV8=1 stores the cache as int8 rows (hd values) + one f32 scale per (position,
+ * kv-head) — 1.03 bytes per value instead of 4. Attention is bytes-bound and 41-45% of
+ * a 2k-context step, so this is the one lever that removes work rather than moving it.
+ * Lossy, hence opt-in and perplexity-gated. When on, k/v are NULL and kq/ks/vq/vs hold
+ * the cache. */
+typedef struct {
+    float **k, **v;                   /* f32 cache (KV8 off) */
+    int8_t **kq, **vq; float **ks, **vs;   /* int8 cache + per-row scales (KV8 on) */
+    int q8;
+    int *ring; int max_pos, len;
+} KVCache;
+static int g_kv8 = 0;
 /* positions per forward pass. LAG_KV_SPAN shrinks it, which shrinks the ring —
  * setting it small (e.g. 4) makes even the tiny oracle's 36-token prefill WRAP the
  * ring several times, so the wrap-around path is covered by a token-exact test
@@ -493,14 +504,27 @@ static int kv_ring_size(Model *m, int max_pos) {
 static void kv_init(KVCache *kv, Model *m, int max_pos) {
     int nkv = m->c.n_kv, hd = m->c.head_dim, L = m->c.n_layers;
     int ring = kv_ring_size(m, max_pos);
-    kv->k = malloc(L * sizeof(float*)); kv->v = malloc(L * sizeof(float*));
+    kv->q8 = g_kv8;
     kv->ring = malloc(L * sizeof(int));
+    kv->k = kv->v = NULL; kv->kq = kv->vq = NULL; kv->ks = kv->vs = NULL;
+    if (kv->q8) {
+        kv->kq = malloc(L * sizeof(int8_t*)); kv->vq = malloc(L * sizeof(int8_t*));
+        kv->ks = malloc(L * sizeof(float*));  kv->vs = malloc(L * sizeof(float*));
+    } else {
+        kv->k = malloc(L * sizeof(float*)); kv->v = malloc(L * sizeof(float*));
+    }
     for (int l = 0; l < L; l++) {
         int trimmed = ring && m->c.is_sliding[l];
         int slots = trimmed ? ring : max_pos;
         kv->ring[l] = trimmed ? ring : 0;
-        kv->k[l] = falloc((int64_t)slots * nkv * hd);
-        kv->v[l] = falloc((int64_t)slots * nkv * hd);
+        if (kv->q8) {
+            kv->kq[l] = malloc((size_t)slots * nkv * hd); kv->vq[l] = malloc((size_t)slots * nkv * hd);
+            kv->ks[l] = falloc((int64_t)slots * nkv);      kv->vs[l] = falloc((int64_t)slots * nkv);
+            if (!kv->kq[l] || !kv->vq[l]) { fprintf(stderr, "OOM int8 KV layer %d\n", l); exit(1); }
+        } else {
+            kv->k[l] = falloc((int64_t)slots * nkv * hd);
+            kv->v[l] = falloc((int64_t)slots * nkv * hd);
+        }
     }
     kv->max_pos = max_pos; kv->len = 0;
 }
@@ -514,16 +538,22 @@ static int64_t kv_footprint(Model *m, int max_pos, int *trimmed, int *ring_out) 
     int nkv = m->c.n_kv, hd = m->c.head_dim;
     int ring = kv_ring_size(m, max_pos);
     int64_t bytes = 0; *trimmed = 0; *ring_out = ring;
+    /* per value: 4 B f32, or 1 B int8 + 4 B per hd-row of scales */
+    int64_t per_row = g_kv8 ? (hd + 4) : (int64_t)hd * 4;
     for (int l = 0; l < m->c.n_layers; l++) {
         int slots = max_pos;
         if (ring && m->c.is_sliding[l]) { slots = ring; (*trimmed)++; }
-        bytes += 2 * (int64_t)slots * nkv * hd * (int64_t)sizeof(float);
+        bytes += 2 * (int64_t)slots * nkv * per_row;
     }
     return bytes;
 }
 static void kv_free(KVCache *kv, int L) {
-    for (int l = 0; l < L; l++) { free(kv->k[l]); free(kv->v[l]); }
-    free(kv->k); free(kv->v); free(kv->ring);
+    for (int l = 0; l < L; l++) {
+        if (kv->q8) { free(kv->kq[l]); free(kv->vq[l]); free(kv->ks[l]); free(kv->vs[l]); }
+        else        { free(kv->k[l]);  free(kv->v[l]); }
+    }
+    free(kv->k); free(kv->v); free(kv->kq); free(kv->vq); free(kv->ks); free(kv->vs);
+    free(kv->ring);
 }
 
 /* ---------- MoE block hooks (moe_arch.h / moe_block.h) ----------
@@ -810,17 +840,22 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
         float rscale = c->is_sliding[li] ? c->s_scale : c->g_scale;
         int win = c->is_sliding[li] ? c->sliding_window : 0;   /* 0 = global (unbounded) */
         int group = H / nkv;
-        float *Kc = kv->k[li], *Vc = kv->v[li];
+        float *Kc = kv->q8 ? NULL : kv->k[li], *Vc = kv->q8 ? NULL : kv->v[li];
 
         /* --- project + qk-norm + rope; store K/V into the cache at abs position --- */
         float *Q = falloc((int64_t)S * H * hd);
         float *AO = falloc((int64_t)S * H * hd);
+        /* int8 cache: norm+rope have to happen before quantization, so K/V land in a
+         * staging row first instead of being edited in place in the cache */
+        float *kst = kv->q8 ? falloc((int64_t)nkv * hd) : NULL;
+        float *vst = kv->q8 ? falloc((int64_t)nkv * hd) : NULL;
         for (int t = 0; t < S; t++) {
             int pos = pos0 + t;
             rmsnorm_row(xn + t * D, h + t * D, L->ln1, D, c->rms_eps);
             resmm(Q + (int64_t)t * H * hd, xn + t * D, L->wq, L->d_wq, D, H * hd);
             int64_t slot = kv_at(kv, li, pos);          /* ring slot on trimmed sliding layers */
-            float *kt = Kc + slot * nkv * hd, *vt = Vc + slot * nkv * hd;
+            float *kt = kv->q8 ? kst : Kc + slot * nkv * hd;
+            float *vt = kv->q8 ? vst : Vc + slot * nkv * hd;
             resmm(kt, xn + t * D, L->wk, L->d_wk, D, nkv * hd);
             resmm(vt, xn + t * D, L->wv, L->d_wv, D, nkv * hd);
             for (int hh = 0; hh < H; hh++) {   /* q_norm + rope per head */
@@ -828,12 +863,18 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
                 rmsnorm_row(q, q, L->qn, hd, c->rms_eps);
                 rope_apply(q, pos, inv, rdim, rscale);
             }
-            for (int hh = 0; hh < nkv; hh++) {  /* k_norm + rope, in place in the cache */
+            for (int hh = 0; hh < nkv; hh++) {  /* k_norm + rope */
                 float *k = kt + hh * hd;
                 rmsnorm_row(k, k, L->kn, hd, c->rms_eps);
                 rope_apply(k, pos, inv, rdim, rscale);
             }
+            if (kv->q8) for (int hh = 0; hh < nkv; hh++) {   /* quantize into the cache */
+                int64_t off = slot * nkv + hh;
+                kv_quant_row(kt + hh * hd, hd, kv->kq[li] + off * hd, kv->ks[li] + off);
+                kv_quant_row(vt + hh * hd, hd, kv->vq[li] + off * hd, kv->vs[li] + off);
+            }
         }
+        free(kst); free(vst);
         float scaling = 1.f / sqrtf((float)hd);
         #pragma omp parallel for schedule(dynamic) if(S > 1)
         for (int t = 0; t < S; t++) {
@@ -844,9 +885,16 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
                 int kh = hh / group;                       /* GQA: this head's KV head */
                 /* laguna's contract: scale 1/sqrt(hd), no rel-bias/tau, QK in double.
                  * cache is [pos][kv-head][hd] so this head's rows stride by nkv*hd. */
-                sdpa_head(Q + ((int64_t)t * H + hh) * hd, Kc + kh * hd, Vc + kh * hd, nkv * hd,
-                          hd, j0, pos, scaling, 1.f, NULL, 0, lag_qk_mode(),
-                          AO + ((int64_t)t * H + hh) * hd, att, kv->ring[li]);
+                float *o = AO + ((int64_t)t * H + hh) * hd;
+                const float *qq = Q + ((int64_t)t * H + hh) * hd;
+                if (kv->q8)
+                    sdpa_head_q8(qq, kv->kq[li] + kh * hd, kv->ks[li] + kh,
+                                 kv->vq[li] + kh * hd, kv->vs[li] + kh, nkv * hd, nkv,
+                                 hd, j0, pos, scaling, 1.f, o, att, kv->ring[li]);
+                else
+                    sdpa_head(qq, Kc + kh * hd, Vc + kh * hd, nkv * hd,
+                              hd, j0, pos, scaling, 1.f, NULL, 0, lag_qk_mode(),
+                              o, att, kv->ring[li]);
             }
             free(att);
         }
@@ -943,12 +991,20 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
             for (int hh = 0; hh < H; hh++) { float *q = Q + ((int64_t)b * H + hh) * hd;
                 rmsnorm_row(q, q, L->qn, hd, c->rms_eps); rope_apply(q, pos[b], inv, rdim, rscale); }
             int64_t slot = kv_at(kvs[b], li, pos[b]);       /* ring slot on trimmed layers */
-            float *kt = kvs[b]->k[li] + slot * nkv * hd;
-            float *vt = kvs[b]->v[li] + slot * nkv * hd;
-            memcpy(kt, Kt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
-            memcpy(vt, Vt + (int64_t)b * nkv * hd, (size_t)nkv * hd * sizeof(float));
+            /* norm+rope in the staging rows (Kt/Vt), then either copy or quantize in */
+            float *kt = Kt + (int64_t)b * nkv * hd, *vt = Vt + (int64_t)b * nkv * hd;
             for (int hh = 0; hh < nkv; hh++) { float *k = kt + hh * hd;
                 rmsnorm_row(k, k, L->kn, hd, c->rms_eps); rope_apply(k, pos[b], inv, rdim, rscale); }
+            if (kvs[b]->q8) {
+                for (int hh = 0; hh < nkv; hh++) {
+                    int64_t off = slot * nkv + hh;
+                    kv_quant_row(kt + hh * hd, hd, kvs[b]->kq[li] + off * hd, kvs[b]->ks[li] + off);
+                    kv_quant_row(vt + hh * hd, hd, kvs[b]->vq[li] + off * hd, kvs[b]->vs[li] + off);
+                }
+            } else {
+                memcpy(kvs[b]->k[li] + slot * nkv * hd, kt, (size_t)nkv * hd * sizeof(float));
+                memcpy(kvs[b]->v[li] + slot * nkv * hd, vt, (size_t)nkv * hd * sizeof(float));
+            }
         }
         PROF_ADD(pr_proj, tp);
         double ta = PROF_T0();
@@ -968,9 +1024,16 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
                 int p = pos[b], j0 = (win > 0 && p - win + 1 > 0) ? p - win + 1 : 0;
                 float *att = att_all + ((int64_t)b * H + hh) * span;
                 int kh = hh / group;                        /* GQA: this head's KV head */
-                sdpa_head(Q + ((int64_t)b * H + hh) * hd, kvs[b]->k[li] + kh * hd,
-                          kvs[b]->v[li] + kh * hd, nkv * hd, hd, j0, p, scaling, 1.f, NULL, 0,
-                          lag_qk_mode(), AO + ((int64_t)b * H + hh) * hd, att, kvs[b]->ring[li]);
+                const float *qq = Q + ((int64_t)b * H + hh) * hd;
+                float *o = AO + ((int64_t)b * H + hh) * hd;
+                KVCache *kc = kvs[b];
+                if (kc->q8)
+                    sdpa_head_q8(qq, kc->kq[li] + kh * hd, kc->ks[li] + kh,
+                                 kc->vq[li] + kh * hd, kc->vs[li] + kh, nkv * hd, nkv,
+                                 hd, j0, p, scaling, 1.f, o, att, kc->ring[li]);
+                else
+                    sdpa_head(qq, kc->k[li] + kh * hd, kc->v[li] + kh * hd, nkv * hd,
+                              hd, j0, p, scaling, 1.f, NULL, 0, lag_qk_mode(), o, att, kc->ring[li]);
             }
         }
         PROF_ADD(pr_attn, ta);
@@ -1098,14 +1161,122 @@ static void serve_banner(void) {
  * (positions are absolute, attention reads the same cached K/V, and every kernel
  * reduces per row), so `LAG_PREFILL_CHUNK=999999` is a same-output A/B knob for the
  * old blocking behavior. */
+/* A slot's KV cache is PERSISTENT across requests, keyed by the gateway's cache_slot.
+ * An agent re-sends a growing transcript every turn, so without reuse each turn
+ * re-prefills the whole context: at ~29 tok/s prefill, a 20k-token context costs ~12
+ * minutes per turn against ~12 s of decode — i.e. essentially all of the turn spent
+ * recomputing a context that barely changed. Keeping the cache and prefilling only the
+ * new tail is worth more for agentic serving than every decode optimization combined.
+ *
+ * `hist` holds the token ids currently represented in the cache, so admission can find
+ * the longest common prefix with the new prompt.
+ *
+ * SAFETY (subtle): sliding layers live on a `ring`-slot ring holding only the most
+ * recent positions. Rewinding to a prefix P' is only sound while the sliding history
+ * P'-window..P'-1 is still in the ring, i.e. P' >= hist_len - (ring - window). A client
+ * that edits earlier history would otherwise read K/V that later positions overwrote —
+ * silently. kv_reuse_ok() refuses those and the request re-prefills from scratch. */
 typedef struct {
     int used; char id[64];
-    KVCache kv;
-    int *ids; int np, np_done;      /* prompt tokens, length, how much is in the KV */
+    KVCache kv; int kv_ready;      /* cache allocated (persists across requests) */
+    int *hist; int hist_len;       /* tokens currently in the cache */
+    int *ids; int np, np_done;     /* prompt tokens, length, how much is in the KV */
     int gen, max_tok, cur, limited;
     float temp, top_p;
     uint64_t rng; double t0;
 } SSlot;
+static int64_t g_reuse_hit = 0, g_reuse_tok = 0, g_reuse_miss = 0;   /* prefix-reuse stats */
+
+/* how far back a rewind may go and still have sliding history intact */
+/* ---------- shared prefix cache (the RAM the box has spare) ----------
+ * Per-slot reuse only pays when a request lands back on its own slot. An agent FLEET
+ * sends the same preamble — system prompt, tool definitions, repo context — on nearly
+ * every call from many different conversations, so the preamble is worth prefilling
+ * ONCE for the whole machine. A snapshot pool keyed by token prefix lets any slot start
+ * from it: restore is a memcpy of the cache buffers, milliseconds against the tens of
+ * seconds the same prefill costs.
+ *
+ * This is what the spare RAM is actually for. The weights are already fully resident
+ * (57 GB of 187), so there is nothing left to promote; KV is the thing worth hoarding,
+ * and at int8/8k a snapshot is ~0.29 GB, so ~100 GB of headroom holds hundreds.
+ *
+ * Snapshots share the slots' geometry (same ctx_max, hence the same ring sizes), which
+ * makes restore a straight per-layer copy with no index translation — the kind of thing
+ * that is easy to get subtly wrong when the sliding ring wraps. */
+#define PSNAP_GRAN 256          /* snapshot lengths are rounded down to this, so two
+                                 * requests sharing a preamble land on the same key */
+#define PSNAP_MIN  256          /* below this the prefill is not worth a snapshot */
+static struct { int *ids; int n; KVCache kv; int ready; int64_t stamp; } *g_psnap;
+static int g_psnap_max = 0;
+static int64_t g_psnap_clock = 0, g_psnap_hit = 0, g_psnap_tok = 0, g_psnap_store = 0;
+
+/* per-layer allocated slot count (ring layers hold only their window+span) */
+static int kv_layer_slots(const KVCache *kv, int l) {
+    return kv->ring[l] ? kv->ring[l] : kv->max_pos;
+}
+/* copy a whole cache (same geometry) — the restore path */
+static void kv_copy(KVCache *dst, const KVCache *src, Model *m, int len) {
+    int nkv = m->c.n_kv, hd = m->c.head_dim;
+    for (int l = 0; l < m->c.n_layers; l++) {
+        int64_t slots = kv_layer_slots(src, l);
+        if (src->q8) {
+            memcpy(dst->kq[l], src->kq[l], (size_t)slots * nkv * hd);
+            memcpy(dst->vq[l], src->vq[l], (size_t)slots * nkv * hd);
+            memcpy(dst->ks[l], src->ks[l], (size_t)slots * nkv * sizeof(float));
+            memcpy(dst->vs[l], src->vs[l], (size_t)slots * nkv * sizeof(float));
+        } else {
+            memcpy(dst->k[l], src->k[l], (size_t)slots * nkv * hd * sizeof(float));
+            memcpy(dst->v[l], src->v[l], (size_t)slots * nkv * hd * sizeof(float));
+        }
+    }
+    dst->len = len;
+}
+/* longest n such that snap->ids[0..n) == ids[0..n) and n == snap->n (the whole
+ * snapshot must be a prefix of this prompt for its KV to be valid here) */
+static int psnap_match(int idx, const int *ids, int np) {
+    if (!g_psnap[idx].ready || g_psnap[idx].n > np) return 0;
+    return memcmp(g_psnap[idx].ids, ids, (size_t)g_psnap[idx].n * sizeof(int)) ? 0 : g_psnap[idx].n;
+}
+static int psnap_lookup(const int *ids, int np) {
+    int best = -1, bestn = 0;
+    for (int i = 0; i < g_psnap_max; i++) {
+        int n = psnap_match(i, ids, np);
+        if (n > bestn) { bestn = n; best = i; }
+    }
+    if (best >= 0) g_psnap[best].stamp = ++g_psnap_clock;
+    return best;
+}
+/* store the first `n` tokens of a just-prefilled cache. Safe only while the cache has
+ * not advanced more than (ring - window) past n, or the sliding history for position n
+ * would already be overwritten — callers snapshot right after prefill, where the gap is
+ * under one granule. */
+static void psnap_store(Model *m, KVCache *src, const int *ids, int n, int ctx_max) {
+    if (n < PSNAP_MIN || g_psnap_max <= 0) return;
+    for (int i = 0; i < g_psnap_max; i++)                  /* already have it? */
+        if (g_psnap[i].ready && g_psnap[i].n == n && !memcmp(g_psnap[i].ids, ids, (size_t)n * sizeof(int))) return;
+    int victim = 0;                                        /* free slot, else LRU */
+    for (int i = 0; i < g_psnap_max; i++) {
+        if (!g_psnap[i].ready) { victim = i; break; }
+        if (g_psnap[i].stamp < g_psnap[victim].stamp) victim = i;
+    }
+    if (!g_psnap[victim].ready) kv_init(&g_psnap[victim].kv, m, ctx_max + 8);
+    free(g_psnap[victim].ids);
+    g_psnap[victim].ids = malloc((size_t)n * sizeof(int));
+    memcpy(g_psnap[victim].ids, ids, (size_t)n * sizeof(int));
+    g_psnap[victim].n = n;
+    kv_copy(&g_psnap[victim].kv, src, m, n);
+    g_psnap[victim].ready = 1; g_psnap[victim].stamp = ++g_psnap_clock;
+    g_psnap_store++;
+}
+
+static int kv_reuse_floor(Model *m, KVCache *kv, int hist_len) {
+    int win = m->c.sliding_window, ring = 0;
+    for (int l = 0; l < m->c.n_layers; l++) if (kv->ring[l]) { ring = kv->ring[l]; break; }
+    if (!ring) return 0;                       /* no trimmed layer: full history retained */
+    int slack = ring - win;                    /* positions of history the ring still holds */
+    int floor = hist_len - slack;
+    return floor < 0 ? 0 : floor;
+}
 
 static void slot_done(Model *m, SSlot *s) {
     double dt = now_s() - s->t0;
@@ -1113,7 +1284,10 @@ static void slot_done(Model *m, SSlot *s) {
            100.0, rss_gb(), s->np, s->limited);
     printf("PROF %.3f %d %d 0.000 0.000 %.3f 0.000 0.000 %d\n", dt, s->np, s->gen, dt, s->gen + 1);
     fflush(stdout);
-    kv_free(&s->kv, m->c.n_layers);
+    /* the KV cache and its history STAY: they belong to the slot, so the next turn of
+     * this conversation can reuse the prefix it just paid for. Only the request state
+     * is released. */
+    (void)m;
     free(s->ids); s->ids = NULL;
     s->used = 0;
 }
@@ -1124,6 +1298,11 @@ static void slot_emit(Model *m, Tok *T, SSlot *s, int tk) {
     printf("DATA %s %d\n", s->id, nb); fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout);
     fflush(stdout);
     s->gen++; s->cur = tk;
+    /* NOT appended to hist here: a token enters the KV cache only when it is later fed
+     * to forward_batch, and the final emitted token of a turn never is. Appending on
+     * emit left hist one token ahead of the cache, so the next turn's prefix match
+     * claimed a position whose K/V was never computed — a silently wrong context.
+     * The invariant is hist_len == kv.len; see the decode step. */
     if (s->gen >= s->max_tok) { s->limited = 1; slot_done(m, s); }
 }
 
@@ -1141,7 +1320,44 @@ static void slot_admit(Model *m, Tok *T, SSlot *s, SReq *q, uint64_t seq) {
     s->gen = 0; s->max_tok = q->max_tok; s->limited = 1;
     s->temp = q->temp; s->top_p = q->top_p; s->t0 = now_s();
     s->rng = g_rng ^ (0x9E3779B97F4A7C15ull * (seq + 1));   /* per-slot stream, SEED-deterministic */
-    kv_init(&s->kv, m, np + q->max_tok + 8);
+    if (!s->kv_ready) {         /* allocate once per slot, then keep it across requests */
+        kv_init(&s->kv, m, ctx_max + 8);
+        s->hist = malloc((size_t)(ctx_max + 8) * sizeof(int));
+        s->hist_len = 0; s->kv_ready = 1;
+    }
+    /* --- prefix reuse: keep the longest common prefix of the cached history ---
+     * ON by default: validated byte-identical across a 3-turn agent conversation
+     * (turn-1 TTFT 60.7s -> 0.66s, 92x, same tokens). LAG_NOREUSE=1 disables.
+     * The failure mode is silent — a wrong reuse answers from a context subtly unlike
+     * the one the client sent — which is why it stayed behind a flag until the diff was
+     * green, and why the hist_len == kv.len invariant below is spelled out. */
+    static int reuse_on = -1;
+    if (reuse_on < 0) reuse_on = getenv("LAG_NOREUSE") ? 0 : 1;
+    int lcp = 0;
+    if (!reuse_on) s->hist_len = 0;                  /* no cross-request reuse */
+    while (lcp < np && lcp < s->hist_len && s->ids[lcp] == s->hist[lcp]) lcp++;
+    if (lcp >= np) lcp = np - 1;
+    if (lcp > 0 && lcp < kv_reuse_floor(m, &s->kv, s->hist_len)) {
+        lcp = 0;                          /* rewind too deep: sliding history is gone */
+        g_reuse_miss++;
+    }
+    if (lcp > 0) { g_reuse_hit++; g_reuse_tok += lcp; }
+    /* own slot didn't cover much: a shared snapshot may hold this preamble already.
+     * Restoring costs a memcpy of the cache buffers, so only take it if it beats what
+     * the slot already has by enough to pay for the copy. */
+    if (g_psnap_max > 0) {
+        int si = psnap_lookup(s->ids, np);
+        if (si >= 0 && g_psnap[si].n > lcp + PSNAP_GRAN) {
+            kv_copy(&s->kv, &g_psnap[si].kv, m, g_psnap[si].n);
+            lcp = g_psnap[si].n;
+            g_psnap_hit++; g_psnap_tok += lcp;
+        }
+    }
+    if (lcp >= np) lcp = np - 1;           /* always leave one token to run through forward */
+    s->np_done = lcp;
+    s->kv.len = lcp;
+    memcpy(s->hist, s->ids, (size_t)np * sizeof(int));
+    s->hist_len = lcp;                    /* only what the cache really holds (== kv.len) */
 }
 
 /* Feed up to `budget` more prompt tokens into a prefilling slot. When the prompt is
@@ -1152,10 +1368,21 @@ static void slot_prefill_step(Model *m, Tok *T, SSlot *s, int budget) {
     float *H = falloc((int64_t)n * D);
     forward(m, &s->kv, s->ids + s->np_done, n, s->np_done, H);   /* grouped MoE over the chunk */
     s->np_done += n;
+    s->hist_len = s->np_done;                                    /* invariant: == kv.len */
     if (s->np_done < s->np) { free(H); return; }                 /* more chunks to come */
     float *lg = falloc(c->vocab);
     compute_logits(m, H + (int64_t)(n - 1) * D, lg);
-    free(H); free(s->ids); s->ids = NULL;
+    free(H);
+    /* snapshot the prompt prefix for other slots/conversations. Rounded down to a
+     * granule so requests sharing a preamble produce the SAME key; done here, before
+     * any generated token, so the cache has not advanced past what the sliding ring can
+     * still reconstruct. */
+    if (g_psnap_max > 0) {
+        int sl = (s->np / PSNAP_GRAN) * PSNAP_GRAN;
+        int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+        if (sl >= PSNAP_MIN) psnap_store(m, &s->kv, s->ids, sl, ctx_max);
+    }
+    free(s->ids); s->ids = NULL;
     if (s->max_tok <= 0) { free(lg); slot_done(m, s); return; }
     g_rng = s->rng; int tk = sample_logits(lg, c->vocab, s->temp, s->top_p); s->rng = g_rng;
     free(lg);
@@ -1174,16 +1401,28 @@ static void serve_loop_batched(Model *m, Tok *T, int nslots) {
      * long prompt arrives. 999999 = prefill in one shot (the old blocking admission). */
     int pchunk = getenv("LAG_PREFILL_CHUNK") ? atoi(getenv("LAG_PREFILL_CHUNK")) : 128;
     if (pchunk < 1) pchunk = 1;
+    /* shared prefix snapshots: 0 disables. Each costs one slot's worth of KV, which is
+     * why the default is modest and the knob exists — this is a RAM-for-prefill trade. */
+    g_psnap_max = getenv("LAG_NOREUSE") ? 0
+                : (getenv("LAG_PREFIX_SNAPS") ? atoi(getenv("LAG_PREFIX_SNAPS")) : 4);
+    if (g_psnap_max < 0) g_psnap_max = 0;
+    if (g_psnap_max > 0) g_psnap = calloc((size_t)g_psnap_max, sizeof(*g_psnap));
     serve_banner();
     for (;;) {
         int nact = 0; for (int i = 0; i < nslots; i++) nact += S[i].used;
         if (!nact) { if (serve_read_cmd(NULL) < 0) break; }        /* idle: block for work */
         while (stdin_readable()) if (serve_read_cmd(NULL) < 0) goto drain;
-        while (g_qn) {                                             /* admit into free slots */
-            int f = -1; for (int i = 0; i < nslots; i++) if (!S[i].used) { f = i; break; }
-            if (f < 0) break;
-            SReq q = g_q[0];
-            memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        for (int qi = 0; qi < g_qn; ) {   /* admit, preferring each request's own cache slot */
+            SReq *qp = &g_q[qi];
+            /* the gateway pins a conversation to a cache_slot; honour it so the prefix
+             * this conversation already prefilled is the one we reuse. If that slot is
+             * busy, wait rather than scatter the conversation onto a cold cache. */
+            int f = -1;
+            if (qp->slot >= 0 && qp->slot < nslots) f = S[qp->slot].used ? -1 : qp->slot;
+            else for (int i = 0; i < nslots; i++) if (!S[i].used) { f = i; break; }
+            if (f < 0) { qi++; continue; }
+            SReq q = *qp;
+            memmove(g_q + qi, g_q + qi + 1, (size_t)(--g_qn - qi) * sizeof(SReq));
             if (serve_take_cancel(q.id)) {                          /* cancelled before it ran */
                 printf("DONE %s STAT 0 0.000 100.0 %.2f 0 0\n", q.id, rss_gb()); fflush(stdout);
             } else slot_admit(m, T, &S[f], &q, seq++);
@@ -1202,6 +1441,10 @@ static void serve_loop_batched(Model *m, Tok *T, int nslots) {
             if (S[i].used && !S[i].ids) { kvs[B] = &S[i].kv; ids[B] = S[i].cur; of[B] = i; B++; }
         if (!B) continue;
         forward_batch(m, kvs, ids, B, Hd);
+        for (int b = 0; b < B; b++) {      /* these tokens are now IN the cache */
+            SSlot *s = &S[of[b]];
+            if (s->hist && s->hist_len < s->kv.max_pos) s->hist[s->hist_len++] = ids[b];
+        }
         resmm_b(lg, Hd, m->lm_head, m->d_lm_head, B, D, V);        /* batched lm_head */
         for (int b = 0; b < B; b++) {
             SSlot *s = &S[of[b]];
@@ -1213,7 +1456,16 @@ static void serve_loop_batched(Model *m, Tok *T, int nslots) {
         }
     }
 drain:
-    for (int i = 0; i < nslots; i++) if (S[i].used) kv_free(&S[i].kv, c->n_layers);
+    if (g_reuse_hit || g_reuse_miss || g_psnap_hit)
+        fprintf(stderr, "[kv-reuse] own-slot: %lld hits (%lld tok skipped), %lld refused "
+                "(rewind past the ring) | shared prefix: %lld hits (%lld tok skipped), "
+                "%lld snapshots stored\n",
+                (long long)g_reuse_hit, (long long)g_reuse_tok, (long long)g_reuse_miss,
+                (long long)g_psnap_hit, (long long)g_psnap_tok, (long long)g_psnap_store);
+    for (int i = 0; i < nslots; i++) {
+        if (S[i].kv_ready) kv_free(&S[i].kv, c->n_layers);
+        free(S[i].hist); free(S[i].ids);
+    }
     free(S); free(Hd); free(lg); free(kvs); free(ids); free(of);
 }
 
@@ -1357,6 +1609,7 @@ int main(int argc, char **argv) {
     if (getenv("LAG_PROF")) g_prof = 1;
     if (getenv("LAG_ATTN_EXACT")) g_attn_exact = 1;
     if (getenv("LAG_ATTN_ONLINE")) g_attn_online = 1;
+    if (getenv("KV8")) g_kv8 = atoi(getenv("KV8")) != 0;
     const char *prompt = NULL, *refpath = "ref_laguna.json";
     int n_new = 128;
     char *pbuf = NULL;
@@ -1383,6 +1636,22 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "[cuda] init failed — CPU only\n");
     }
 #endif
+    /* ---- TOKENIZE=1: print the engine's own token ids for a prompt ----
+     * Needed to build a trustworthy perplexity reference: ids produced by any other
+     * tokenizer may not match tok.h (laguna ships a custom pre-tokenizer), and feeding
+     * mismatched ids makes the model look terrible for reasons that have nothing to do
+     * with whatever is being measured. */
+    if (getenv("TOKENIZE") && prompt) {
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        int plen = (int)strlen(prompt), cap = plen + 16;
+        int *seq = malloc((size_t)cap * sizeof(int));
+        int np = tok_encode(&T, prompt, plen, seq, cap);
+        printf("TOKENS %d\n", np);
+        for (int i = 0; i < np; i++) printf("%d%s", seq[i], i + 1 < np ? " " : "\n");
+        return 0;
+    }
+
     Model m; model_load(&m, snap);
     printf("== Laguna C engine (Stage A, %s) ==\n", m.xq ? "int4 container" : "f32");
 #ifdef COLI_CUDA
@@ -1399,7 +1668,7 @@ int main(int argc, char **argv) {
     {   /* KV footprint caps how many requests can share the box — report it */
         int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192, trimmed = 0, ring = 0;
         int64_t kvb = kv_footprint(&m, ctx_max, &trimmed, &ring);
-        printf("KV: %.2f GB per slot at %d ctx", kvb / 1e9, ctx_max);
+        printf("KV: %.2f GB per slot at %d ctx (%s)", kvb / 1e9, ctx_max, g_kv8 ? "int8" : "f32");
         if (trimmed) printf(" (%d/%d sliding layers on a %d-slot ring, window %d)",
                             trimmed, m.c.n_layers, ring, m.c.sliding_window);
         printf("\n");
@@ -1583,9 +1852,11 @@ int main(int argc, char **argv) {
     float *H = falloc((int64_t)nfull * D);
     forward(&m, &kv, full, nfull, 0, H);
     int ok = 0; double nll = 0;
+    int *tfpred = malloc((size_t)nfull * sizeof(int));
     for (int i = 0; i < nfull; i++) {
         float *lg = falloc(m.c.vocab); resmm(lg, H + (int64_t)i * D, m.lm_head, m.d_lm_head, D, m.c.vocab);
         int am = 0; for (int v = 1; v < m.c.vocab; v++) if (lg[v] > lg[am]) am = v;
+        tfpred[i] = am;
         if (tfref && i < ntf && am == tfref[i]) ok++;
         if (i < nfull - 1) {   /* NLL of the true next token */
             softmax_row(lg, m.c.vocab);
@@ -1595,6 +1866,13 @@ int main(int argc, char **argv) {
     }
     double ppl = exp(nll / (nfull - 1));
     printf("teacher-forced argmax: %d/%d match | perplexity: %.4f\n", ok, nfull, ppl);
+    /* TF_DUMP=<file>: write this run's argmax stream, so another configuration can be
+     * scored against it directly ("how many predictions changed") instead of through
+     * perplexity, which conflates model quality with how hard the text happens to be. */
+    if (getenv("TF_DUMP")) {
+        FILE *df = fopen(getenv("TF_DUMP"), "w");
+        if (df) { fprintf(df, "["); for (int i = 0; i < nfull; i++) fprintf(df, "%s%d", i ? "," : "", tfpred[i]); fprintf(df, "]\n"); fclose(df); }
+    }
     jval *pr = json_get(ref, "ppl_ref");
     if (pr && pr->t == J_NUM) printf("ppl_ref: %.4f (%.2f%% diff)\n", pr->num, 100.0 * fabs(ppl - pr->num) / pr->num);
     free(H);

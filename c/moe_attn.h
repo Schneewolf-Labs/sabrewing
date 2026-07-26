@@ -42,6 +42,7 @@
 #ifndef MOE_ATTN_H
 #define MOE_ATTN_H
 #include <stdint.h>
+#include <math.h>       /* lrintf (int8 KV quantization) */
 #include "moe_math.h"   /* softmax_row */
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -130,6 +131,78 @@ static void sdpa_head_online(const float *q, const float *Kbase, const float *Vb
     }
     float inv = s > 0.f ? 1.f / s : 0.f;
     for (int d = 0; d < hd; d++) out[d] *= inv;
+}
+
+/* SDPA over an int8 K/V cache (per (position, kv-head) row: hd int8 values + one f32
+ * scale). Attention is 41-45% of a 2k-context decode step and it is bytes-bound, so
+ * storing the cache at 1.03 bytes/value instead of 4 is the lever that actually removes
+ * work — unlike restructuring passes over data that was already cache-resident.
+ *
+ * The scales fold into the arithmetic for free: <q, K_t> = s_K * <q, K_t^int8>, and the
+ * value accumulation folds s_V into the softmax weight. Both stay f32 FMA over
+ * int8->f32 converted lanes. This is a LOSSY storage choice (like the int4 experts), so
+ * it is opt-in and gated on perplexity, not on speed alone. Laguna's contract only
+ * (no per-distance bias). */
+static void sdpa_head_q8(const float *q,
+                         const int8_t *Kq, const float *Ks,
+                         const int8_t *Vq, const float *Vs,
+                         int kv_stride, int sc_stride,
+                         int hd, int t0, int qpos, float scale, float tau,
+                         float *out, float *sc, int ring) {
+    int n = qpos - t0 + 1, mask = ring - 1;
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = ring ? (t & mask) : t;
+        const int8_t *k = Kq + slot * kv_stride;
+        float dot;
+#if defined(__AVX512F__)
+        {
+            __m512 acc = _mm512_setzero_ps();
+            int d = 0;
+            for (; d + 16 <= hd; d += 16)
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + d),
+                        _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)(k + d)))), acc);
+            float s = _mm512_reduce_add_ps(acc);
+            for (; d < hd; d++) s += q[d] * (float)k[d];
+            dot = s;
+        }
+#else
+        { float s = 0; for (int d = 0; d < hd; d++) s += q[d] * (float)k[d]; dot = s; }
+#endif
+        sc[t - t0] = tau * (dot * Ks[slot * sc_stride] * scale);
+    }
+    softmax_row(sc, n);
+    for (int d = 0; d < hd; d++) out[d] = 0.f;
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = ring ? (t & mask) : t;
+        const int8_t *v = Vq + slot * kv_stride;
+        float a = sc[t - t0] * Vs[slot * sc_stride];      /* value scale folds into the weight */
+#if defined(__AVX512F__)
+        {
+            __m512 va = _mm512_set1_ps(a);
+            int d = 0;
+            for (; d + 16 <= hd; d += 16)
+                _mm512_storeu_ps(out + d, _mm512_fmadd_ps(va,
+                        _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)(v + d)))),
+                        _mm512_loadu_ps(out + d)));
+            for (; d < hd; d++) out[d] += a * (float)v[d];
+        }
+#else
+        for (int d = 0; d < hd; d++) out[d] += a * (float)v[d];
+#endif
+    }
+}
+
+/* quantize one hd-long row to int8 + scale (symmetric per row, like the residents) */
+static void kv_quant_row(const float *x, int hd, int8_t *q, float *scale) {
+    float mx = 0;
+    for (int d = 0; d < hd; d++) { float a = x[d] < 0 ? -x[d] : x[d]; if (a > mx) mx = a; }
+    float s = mx / 127.f; if (s < 1e-12f) s = 1e-12f;
+    *scale = s;
+    float inv = 1.f / s;
+    for (int d = 0; d < hd; d++) {
+        int v = (int)lrintf(x[d] * inv);
+        q[d] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v);
+    }
 }
 
 static void sdpa_head(const float *q, const float *Kbase, const float *Vbase, int kv_stride,

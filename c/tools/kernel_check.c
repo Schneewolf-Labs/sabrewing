@@ -151,6 +151,43 @@ int main(void) {
         }
     }
 
+    /* ---- int8 KV cache: quantization error of the whole attention output ----
+     * Storing K/V at 1.03 bytes/value instead of 4 is lossy, so bound the damage: the
+     * attention output from an int8 cache vs the same data in f32 with the exact
+     * double-accumulate contract. Per-row symmetric int8 over hd=128 should land near
+     * 1e-3 relative; the real gate is model perplexity, this just catches a broken
+     * scale or a layout mistake. */
+    {
+        int hd = 128, nkvh = 8, stride = nkvh * hd;
+        int wins[] = {17, 512, 2187};
+        printf("int8 KV sdpa_head_q8 [hd=%d] vs f32 cache + MOE_QK_DBL:\n", hd);
+        for (size_t wi = 0; wi < sizeof(wins) / sizeof(wins[0]); wi++) {
+            int npos = wins[wi];
+            float *q = malloc((size_t)hd * 4);
+            float *K = malloc((size_t)npos * stride * 4), *V = malloc((size_t)npos * stride * 4);
+            int8_t *Kq = malloc((size_t)npos * stride), *Vq = malloc((size_t)npos * stride);
+            float *Ks = malloc((size_t)npos * nkvh * 4), *Vs = malloc((size_t)npos * nkvh * 4);
+            float *o1 = malloc((size_t)hd * 4), *o2 = malloc((size_t)hd * 4), *sc = malloc((size_t)npos * 4);
+            for (int i = 0; i < hd; i++) q[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            for (int64_t i = 0; i < (int64_t)npos * stride; i++) {
+                K[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+                V[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+            }
+            for (int t = 0; t < npos; t++) for (int h = 0; h < nkvh; h++) {  /* quantize as the engine does */
+                int64_t off = (int64_t)t * nkvh + h;
+                kv_quant_row(K + (int64_t)t * stride + h * hd, hd, Kq + off * hd, Ks + off);
+                kv_quant_row(V + (int64_t)t * stride + h * hd, hd, Vq + off * hd, Vs + off);
+            }
+            sdpa_head(q, K, V, stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                      NULL, 0, MOE_QK_DBL, o1, sc, 0);
+            sdpa_head_q8(q, Kq, Ks, Vq, Vs, stride, nkvh, hd, 0, npos - 1,
+                         1.f / sqrtf((float)hd), 1.f, o2, sc, 0);
+            char name[64]; snprintf(name, sizeof(name), "window %-5d int8 KV", npos);
+            ok &= report(name, o2, o1, hd, 2e-2);
+            free(q); free(K); free(V); free(Kq); free(Vq); free(Ks); free(Vs); free(o1); free(o2); free(sc);
+        }
+    }
+
     /* ---- sampler: the top-k head path must pick EXACTLY what the full sort picks ----
      * Same RNG state in, same token out, across distribution shapes: peaked (the head
      * covers top_p immediately), realistic, near-uniform (forces the head to widen),

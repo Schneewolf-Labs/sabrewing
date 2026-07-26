@@ -20,7 +20,11 @@
 #include <string.h>
 #include <sys/select.h>
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+/* `slot` is the gateway's cache_slot: which persistent KV cache this request should
+ * attach to, so a conversation that re-sends a growing context can reuse the prefix it
+ * already prefilled instead of paying for it again. Engines that keep no cross-request
+ * state can ignore it. */
+typedef struct { char id[64]; int slot; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
@@ -71,14 +75,14 @@ static int serve_read_cmd(const char *cur_id) {
         int slot, plen, max_tok; float temp, top_p;
         if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
             plen < 0 || plen > (1 << 22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
+
         char *pl = malloc((size_t)plen + 1);
         if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
         int nl = fgetc(stdin); (void)nl; pl[plen] = 0;
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->slot = slot; q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
             q->payload = pl; q->plen = plen;
         } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
     }
