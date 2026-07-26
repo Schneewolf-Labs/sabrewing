@@ -166,7 +166,9 @@ int main(void) {
             float *q = malloc((size_t)hd * 4);
             float *K = malloc((size_t)npos * stride * 4), *V = malloc((size_t)npos * stride * 4);
             int8_t *Kq = malloc((size_t)npos * stride), *Vq = malloc((size_t)npos * stride);
-            float *Ks = malloc((size_t)npos * nkvh * 4), *Vs = malloc((size_t)npos * nkvh * 4);
+            int nblk = kv_q8_blocks(hd);
+            float *Ks = malloc((size_t)npos * nkvh * nblk * 4);
+            float *Vs = malloc((size_t)npos * nkvh * nblk * 4);
             float *o1 = malloc((size_t)hd * 4), *o2 = malloc((size_t)hd * 4), *sc = malloc((size_t)npos * 4);
             for (int i = 0; i < hd; i++) q[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
             for (int64_t i = 0; i < (int64_t)npos * stride; i++) {
@@ -175,15 +177,30 @@ int main(void) {
             }
             for (int t = 0; t < npos; t++) for (int h = 0; h < nkvh; h++) {  /* quantize as the engine does */
                 int64_t off = (int64_t)t * nkvh + h;
-                kv_quant_row(K + (int64_t)t * stride + h * hd, hd, Kq + off * hd, Ks + off);
-                kv_quant_row(V + (int64_t)t * stride + h * hd, hd, Vq + off * hd, Vs + off);
+                kv_quant_row(K + (int64_t)t * stride + h * hd, hd, Kq + off * hd, Ks + off * nblk);
+                kv_quant_row(V + (int64_t)t * stride + h * hd, hd, Vq + off * hd, Vs + off * nblk);
             }
             sdpa_head(q, K, V, stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
                       NULL, 0, MOE_QK_DBL, o1, sc, 0);
-            sdpa_head_q8(q, Kq, Ks, Vq, Vs, stride, nkvh, hd, 0, npos - 1,
+            sdpa_head_q8(q, Kq, Ks, Vq, Vs, stride, nkvh * nblk, hd, 0, npos - 1,
                          1.f / sqrtf((float)hd), 1.f, o2, sc, 0);
             char name[64]; snprintf(name, sizeof(name), "window %-5d int8 KV", npos);
             ok &= report(name, o2, o1, hd, 2e-2);
+
+            /* The case per-row scales broke on: V carries outlier channels (real LLM
+             * activations do), so one scale per 128 values buries everything else. */
+            for (int t = 0; t < npos; t++) for (int h = 0; h < nkvh; h++) {
+                float *vrow = V + (int64_t)t * stride + h * hd;
+                vrow[(t + h) % hd] *= 60.f;                  /* one big channel per row */
+                int64_t off = (int64_t)t * nkvh + h;
+                kv_quant_row(vrow, hd, Vq + off * hd, Vs + off * nblk);
+            }
+            sdpa_head(q, K, V, stride, hd, 0, npos - 1, 1.f / sqrtf((float)hd), 1.f,
+                      NULL, 0, MOE_QK_DBL, o1, sc, 0);
+            sdpa_head_q8(q, Kq, Ks, Vq, Vs, stride, nkvh * nblk, hd, 0, npos - 1,
+                         1.f / sqrtf((float)hd), 1.f, o2, sc, 0);
+            snprintf(name, sizeof(name), "window %-5d int8 KV +outliers", npos);
+            ok &= report(name, o2, o1, hd, 4e-2);
             free(q); free(K); free(V); free(Kq); free(Vq); free(Ks); free(Vs); free(o1); free(o2); free(sc);
         }
     }

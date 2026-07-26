@@ -519,7 +519,9 @@ static void kv_init(KVCache *kv, Model *m, int max_pos) {
         kv->ring[l] = trimmed ? ring : 0;
         if (kv->q8) {
             kv->kq[l] = malloc((size_t)slots * nkv * hd); kv->vq[l] = malloc((size_t)slots * nkv * hd);
-            kv->ks[l] = falloc((int64_t)slots * nkv);      kv->vs[l] = falloc((int64_t)slots * nkv);
+            int nb = kv_q8_blocks(hd);                 /* scales per quantized row */
+            kv->ks[l] = falloc((int64_t)slots * nkv * nb);
+            kv->vs[l] = falloc((int64_t)slots * nkv * nb);
             if (!kv->kq[l] || !kv->vq[l]) { fprintf(stderr, "OOM int8 KV layer %d\n", l); exit(1); }
         } else {
             kv->k[l] = falloc((int64_t)slots * nkv * hd);
@@ -538,8 +540,8 @@ static int64_t kv_footprint(Model *m, int max_pos, int *trimmed, int *ring_out) 
     int nkv = m->c.n_kv, hd = m->c.head_dim;
     int ring = kv_ring_size(m, max_pos);
     int64_t bytes = 0; *trimmed = 0; *ring_out = ring;
-    /* per value: 4 B f32, or 1 B int8 + 4 B per hd-row of scales */
-    int64_t per_row = g_kv8 ? (hd + 4) : (int64_t)hd * 4;
+    /* per value: 4 B f32, or 1 B int8 + 4 B per KV_Q8_BLOCK-element block of scales */
+    int64_t per_row = g_kv8 ? (hd + 4 * kv_q8_blocks(hd)) : (int64_t)hd * 4;
     for (int l = 0; l < m->c.n_layers; l++) {
         int slots = max_pos;
         if (ring && m->c.is_sliding[l]) { slots = ring; (*trimmed)++; }
@@ -868,10 +870,13 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
                 rmsnorm_row(k, k, L->kn, hd, c->rms_eps);
                 rope_apply(k, pos, inv, rdim, rscale);
             }
-            if (kv->q8) for (int hh = 0; hh < nkv; hh++) {   /* quantize into the cache */
-                int64_t off = slot * nkv + hh;
-                kv_quant_row(kt + hh * hd, hd, kv->kq[li] + off * hd, kv->ks[li] + off);
-                kv_quant_row(vt + hh * hd, hd, kv->vq[li] + off * hd, kv->vs[li] + off);
+            if (kv->q8) {                                    /* quantize into the cache */
+                int nb = kv_q8_blocks(hd);
+                for (int hh = 0; hh < nkv; hh++) {
+                    int64_t off = slot * nkv + hh;
+                    kv_quant_row(kt + hh * hd, hd, kv->kq[li] + off * hd, kv->ks[li] + off * nb);
+                    kv_quant_row(vt + hh * hd, hd, kv->vq[li] + off * hd, kv->vs[li] + off * nb);
+                }
             }
         }
         free(kst); free(vst);
@@ -887,10 +892,13 @@ static void forward_span(Model *m, KVCache *kv, const int *ids, int S, int pos0,
                  * cache is [pos][kv-head][hd] so this head's rows stride by nkv*hd. */
                 float *o = AO + ((int64_t)t * H + hh) * hd;
                 const float *qq = Q + ((int64_t)t * H + hh) * hd;
-                if (kv->q8)
-                    sdpa_head_q8(qq, kv->kq[li] + kh * hd, kv->ks[li] + kh,
-                                 kv->vq[li] + kh * hd, kv->vs[li] + kh, nkv * hd, nkv,
+                if (kv->q8) {
+                    int nb = kv_q8_blocks(hd);
+                    sdpa_head_q8(qq, kv->kq[li] + kh * hd, kv->ks[li] + (int64_t)kh * nb,
+                                 kv->vq[li] + kh * hd, kv->vs[li] + (int64_t)kh * nb,
+                                 nkv * hd, nkv * nb,
                                  hd, j0, pos, scaling, 1.f, o, att, kv->ring[li]);
+                }
                 else
                     sdpa_head(qq, Kc + kh * hd, Vc + kh * hd, nkv * hd,
                               hd, j0, pos, scaling, 1.f, NULL, 0, lag_qk_mode(),
@@ -996,10 +1004,11 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
             for (int hh = 0; hh < nkv; hh++) { float *k = kt + hh * hd;
                 rmsnorm_row(k, k, L->kn, hd, c->rms_eps); rope_apply(k, pos[b], inv, rdim, rscale); }
             if (kvs[b]->q8) {
+                int nb = kv_q8_blocks(hd);
                 for (int hh = 0; hh < nkv; hh++) {
                     int64_t off = slot * nkv + hh;
-                    kv_quant_row(kt + hh * hd, hd, kvs[b]->kq[li] + off * hd, kvs[b]->ks[li] + off);
-                    kv_quant_row(vt + hh * hd, hd, kvs[b]->vq[li] + off * hd, kvs[b]->vs[li] + off);
+                    kv_quant_row(kt + hh * hd, hd, kvs[b]->kq[li] + off * hd, kvs[b]->ks[li] + off * nb);
+                    kv_quant_row(vt + hh * hd, hd, kvs[b]->vq[li] + off * hd, kvs[b]->vs[li] + off * nb);
                 }
             } else {
                 memcpy(kvs[b]->k[li] + slot * nkv * hd, kt, (size_t)nkv * hd * sizeof(float));
@@ -1027,10 +1036,13 @@ static void forward_batch(Model *m, KVCache **kvs, const int *ids, int B, float 
                 const float *qq = Q + ((int64_t)b * H + hh) * hd;
                 float *o = AO + ((int64_t)b * H + hh) * hd;
                 KVCache *kc = kvs[b];
-                if (kc->q8)
-                    sdpa_head_q8(qq, kc->kq[li] + kh * hd, kc->ks[li] + kh,
-                                 kc->vq[li] + kh * hd, kc->vs[li] + kh, nkv * hd, nkv,
+                if (kc->q8) {
+                    int nb = kv_q8_blocks(hd);
+                    sdpa_head_q8(qq, kc->kq[li] + kh * hd, kc->ks[li] + (int64_t)kh * nb,
+                                 kc->vq[li] + kh * hd, kc->vs[li] + (int64_t)kh * nb,
+                                 nkv * hd, nkv * nb,
                                  hd, j0, p, scaling, 1.f, o, att, kc->ring[li]);
+                }
                 else
                     sdpa_head(qq, kc->k[li] + kh * hd, kc->v[li] + kh * hd, nkv * hd,
                               hd, j0, p, scaling, 1.f, NULL, 0, lag_qk_mode(), o, att, kc->ring[li]);
@@ -1222,8 +1234,9 @@ static void kv_copy(KVCache *dst, const KVCache *src, Model *m, int len) {
         if (src->q8) {
             memcpy(dst->kq[l], src->kq[l], (size_t)slots * nkv * hd);
             memcpy(dst->vq[l], src->vq[l], (size_t)slots * nkv * hd);
-            memcpy(dst->ks[l], src->ks[l], (size_t)slots * nkv * sizeof(float));
-            memcpy(dst->vs[l], src->vs[l], (size_t)slots * nkv * sizeof(float));
+            int nb = kv_q8_blocks(hd);
+            memcpy(dst->ks[l], src->ks[l], (size_t)slots * nkv * nb * sizeof(float));
+            memcpy(dst->vs[l], src->vs[l], (size_t)slots * nkv * nb * sizeof(float));
         } else {
             memcpy(dst->k[l], src->k[l], (size_t)slots * nkv * hd * sizeof(float));
             memcpy(dst->v[l], src->v[l], (size_t)slots * nkv * hd * sizeof(float));

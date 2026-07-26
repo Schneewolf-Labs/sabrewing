@@ -386,14 +386,26 @@ than being invisible.
 Two things in this document are implemented but **not** yet backed by a measurement, and
 are off by default for that reason:
 
-- **int8 KV (`KV8=1`).** Memory is verified (1.11 → 0.29 GB/slot) and the kernel agrees
-  with the f32+double contract to L2rel 4.2e-3, flat across window sizes. The tiny
-  oracle behaves exactly as a lossy cache should: 36/36 teacher-forced, 24/24 greedy,
-  ppl +0.06%. But on the real model int8 appeared to *improve* perplexity (210.5 → 173.9
-  on hard text, 1.91 → 1.81 on easy text), which a lossy cache cannot legitimately do.
-  Tokenization was ruled out as the cause (the engine's ids are byte-identical to the
-  reference tokenizer). Perplexity is the wrong instrument here, so the open gate scores
-  it as "how many of 1024 next-token predictions change versus f32" instead.
+- **int8 KV (`KV8=1`).** Per-ROW scales failed the real gate: **706/1024** teacher-forced
+  predictions matched f32, i.e. a third of next-token predictions changed. Perplexity had
+  hidden this completely — it *improved* (210.5 → 173.9), because the path was altering
+  the model rather than approximating it, so the score was free to move either way. The
+  f32-vs-itself control is 1024/1024, so the instrument is sound.
+
+  Diagnosis, and it is asymmetric: **K is normalized before caching, V is not.** K passes
+  through qk-RMSNorm and RoPE; V is stored raw from `v_proj`, where LLM activations carry
+  outlier channels. One outlier fixes the scale for all 128 values in a row and collapses
+  the rest into a couple of levels.
+
+  Fixed by scaling per **32-element block** (what llama.cpp's `q8_0` KV does), costing
+  4 bytes per 32 values — 1.125 B/value instead of 1.03, still ~3.5× smaller than f32.
+  `make kernel-check` now includes an outlier stress case (one 60× channel per V row),
+  which is the case per-row scales died on: L2rel 1.2-1.35e-2, bounded across window
+  sizes. Tiny oracle with block scales: 36/36, 24/24, ppl +0.06%.
+
+  **Still off by default:** the real-model prediction-agreement gate has not been re-run
+  with block scales (the GPU was committed to an agent workload). Nothing here should be
+  believed about the real model until that number replaces 706/1024.
 Prefix reuse is no longer in that category — it is measured and on by default:
 
 | 3-turn agent conversation (~2.3k-token transcript, greedy) | turn 0 | turn 1 | turn 2 |
