@@ -204,6 +204,90 @@ faulty logic, and both worth recording because neither produces obviously-broken
 Also needed: `tok.h` learned the older space-separated merge format (`"Ġ Ġ"`) that Qwen3.5
 still ships, alongside the pair-array form it already handled.
 
+## The CUDA tier, and what the decode profile says
+
+`make qwen35 CUDA=1 ARCH=native`. The whole int4 container is 21.7 GB against 48 GB of VRAM,
+so **everything uploads** — residents, `lm_head`, and every layer's experts. There is no expert
+cache, no pager, and no CPU expert tier, which is the structural difference from Laguna (57 GB
+of experts that do not fit, whose CPU fallback costs 70% of expert time). Partial upload
+degrades safely: a NULL device pointer routes that tensor through the CPU kernel.
+
+The MoE/GEMM kernels in `backend_cuda_laguna.{cu,h}` turned out to be arch-generic — bf16 GEMM,
+int4 row-scaled GEMM, and the fused/grouped expert paths take device pointers and dimensions,
+nothing Laguna-specific — so they are reused rather than duplicated.
+
+Measured, 3321-token context, same binary, quiet box:
+
+| | prefill | decode |
+|---|---|---|
+| CPU only (`NOCUDA=1`) | 24.7 tok/s | 5.3 tok/s |
+| GPU tier | 38.8 tok/s | **23.9 tok/s** |
+
+### What the profile found (`QW_PROF=1`)
+
+The first GPU decode profile at this context was 12.1 tok/s with 75% of the time in *two CPU
+kernels*: attention 40%, the recurrence 35%. Both had non-obvious causes.
+
+**Attention was re-reading the KV cache 8 times.** GQA here is 16 query heads over 2 KV heads,
+and the code called `sdpa_head` per query head, so each KV window was streamed once per query
+head instead of once per KV head — 108 MB per layer per token instead of 13.6 MB. `sdpa_group`
+(already in `moe_attn.h`) fixes it.
+
+**That fix halved the recurrence too, without touching it** (28.6 → 14.2 ms/step). The two are
+coupled through L3: 30 layers of recurrent state is 63 MB against this CPU's 64 MB of L3, so
+the redundant KV traffic was evicting the state and making the recurrence pay RAM latency.
+After also parallelizing attention the recurrence landed at **4.27 ms/step, 6.7× better than
+where it started**, purely as a side effect.
+
+**Attention was single-threaded.** Grouping *reduces* the work-item count to `n_kv_heads` — 2
+at batch 1, which cannot fill 12 cores. Writing all K/V in one pass and attending in a second
+lets the `(token, kv-head)` loop run in parallel, which is where the rest of the win came from.
+
+Final decode profile at 3321 tokens, 41.8 ms/step:
+
+| phase | ms/step | % |
+|---|---|---|
+| attention (SDPA) | 16.88 | 40.4 |
+| experts (GPU) | 4.75 | 11.4 |
+| linattn proj | 4.14 | 9.9 |
+| **linattn recurrence** | **4.27** | 10.2 |
+| routing | 2.46 | 5.9 |
+| shared expert | 2.21 | 5.3 |
+| linattn norm+out, conv | 3.63 | 8.7 |
+| lm_head | 1.55 | 3.7 |
+| qkv+rope, o_proj, sampling | 1.55 | 3.8 |
+
+Attention is still the largest single item and still only 2-way parallel, so that is where the
+next decode win is.
+
+### Ruled out: splitting the KV window
+
+`sdpa_group_split` in `moe_attn.h` implements flash-decoding's split-K — chunk the KV window
+across threads, merge the online-softmax partials exactly. It is validated in `kernel-check`
+(bit-identical at `nchunk=1`, ~1.3e-7 at every other chunk count including uneven splits) and
+it is **2.5× slower than not splitting** on this box:
+
+| `QW_SPLIT` | decode | attention |
+|---|---|---|
+| 1 (default) | 22.8 tok/s | 16.7 ms/step |
+| 2 | 9.0 tok/s | 52.0 ms/step |
+| 6 | 9.7 tok/s | 45.8 ms/step |
+
+The bytes read are identical; the cost is OpenMP region overhead. With `split>1` the
+`(token, kv-head)` loop must run serially and the split kernel opens a fresh parallel region
+per call — 20 regions per token on a 24-thread team for 2–6 chunks of work each. Making it pay
+needs **one** region per layer spanning `(token, kv-head, chunk)` with the merge outside. The
+kernel stays, reachable via `QW_SPLIT`, for whoever builds that.
+
+### A note on numerical divergence
+
+`sdpa_group` is not bit-identical to per-head `sdpa_head` (online vs two-pass softmax), and
+after 40 layers that shows up as a different greedy token around position 15. Two benign
+controls say it is float noise, not a defect: two different `QW_SPLIT` values (both correct by
+construction) give **byte-identical** output, and per-head SIMD vs per-head *double*
+accumulation — a change of precision alone — diverges at **exactly the same character**.
+`QW_NOGROUP=1` selects the per-head path for that comparison; the oracle always uses it.
+
 ## Serving, and what it costs
 
 `SERVE=1` puts `qwen35.c` on the same stdin/stdout protocol as the other engines, so the

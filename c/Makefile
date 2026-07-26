@@ -296,8 +296,8 @@ laguna$(EXE): laguna.c st.h tok.h json.h compat.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) laguna.c $(LAG_CUDA_OBJ) -o laguna$(EXE) $(LDFLAGS)
 
 # Qwen3.5-MoE: gated-delta-net linear attention on 3/4 of layers. CPU only for now.
-qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_quant.h
-	$(CC) $(CFLAGS) qwen35.c -o qwen35$(EXE) $(LDFLAGS)
+qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_quant.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
 # Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)
 qwen35-test: qwen35$(EXE)

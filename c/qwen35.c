@@ -34,6 +34,10 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "compat.h"
 #include "json.h"
 #include "moe_math.h"
@@ -46,8 +50,20 @@
 #include "st.h"
 #include "tok.h"
 
+#ifdef COLI_CUDA
+/* The MoE/GEMM kernels in backend_cuda_laguna.{cu,h} are arch-generic -- bf16 GEMM,
+ * int4 row-scaled GEMM, and the fused/grouped expert paths take device pointers and
+ * dimensions, nothing Laguna-specific. Reused here rather than duplicated; the file
+ * keeps its name so laguna.c's build is untouched. */
+#include "backend_cuda_laguna.h"
+#endif
+
 #define MAXL 80
 static int g_exact = 0;          /* double accumulation, for the oracle */
+#ifdef COLI_CUDA
+static int g_cuda = 0;           /* 1 = GPU tier active */
+#endif
+static double g_vram_gb = 0;     /* what we actually uploaded */
 
 /* ---------- config ---------- */
 typedef struct {
@@ -78,6 +94,12 @@ typedef struct {
     float *gu_s, *dn_s;
     float **eg, **eu, **ed;                    /* f32 per-expert (tiny oracle) */
     void *sg, *su, *sd;                        /* shared expert */
+    /* VRAM copies; NULL = this tensor stays on the CPU path */
+    void *d_wq, *d_wk, *d_wv, *d_wo;
+    void *d_w_qkv, *d_w_z, *d_w_b, *d_w_a, *d_w_out;
+    void *d_sg, *d_su, *d_sd;
+    void *d_gu_q, *d_dn_q;
+    float *d_gu_s, *d_dn_s;
 } Layer;
 
 typedef struct {
@@ -85,6 +107,7 @@ typedef struct {
     Cfg c;
     Layer L[MAXL];
     void *embed, *lm_head;
+    void *d_lm_head;
     float *norm;
     int xq;                                    /* 1 = int4 fused experts */
     int res_dt;                                /* 0 f32, 1 bf16 */
@@ -242,9 +265,32 @@ static void *load_res(Model *m, const char *name) {
     }
     return load_t(m, name);
 }
-static void resmm(Model *m, float *y, const float *x, const void *W, int S, int I, int O) {
+/* resident GEMM. Wdev is the weight's VRAM copy (NULL = CPU only). The GPU path is
+ * skipped under g_exact so the oracle keeps its double-accumulate reference. */
+static void resmm(Model *m, float *y, const float *x, const void *W, const void *Wdev,
+                  int S, int I, int O) {
+#ifdef COLI_CUDA
+    if (Wdev && !g_exact && lag_cuda_matmul_bf16(y, x, Wdev, S, I, O) == 0) return;
+#else
+    (void)Wdev;
+#endif
     if (m->res_dt == 1) matmul_bf16_k(y, x, (const uint16_t *)W, S, I, O, 0, g_exact);
     else matmul_f32(y, x, (const float *)W, S, I, O, g_exact);
+}
+
+/* Upload a bf16 resident to VRAM. Only bf16 (the real container); the f32 tiny oracle
+ * stays on the CPU, which is also where its exactness contract lives. */
+static void *dev_up(Model *m, const char *name, const void *host) {
+#ifdef COLI_CUDA
+    if (!g_cuda || m->res_dt != 1) return NULL;
+    int64_t ne = st_numel(&m->S, name);
+    if (ne <= 0) return NULL;
+    void *d = lag_cuda_upload(host, (size_t)ne * 2);
+    if (d) g_vram_gb += (double)ne * 2 / 1e9;
+    return d;
+#else
+    (void)m; (void)name; (void)host; return NULL;
+#endif
 }
 
 /* The checkpoint nests text weights under model.language_model.; the converted container
@@ -274,6 +320,10 @@ static void model_load(Model *m, const char *snap) {
     m->embed = load_res(m, NM(nm, "embed_tokens.weight"));
     m->norm = load_norm(m, NM(nm, "norm.weight"));
     m->lm_head = st_has(&m->S, "lm_head.weight") ? load_res(m, "lm_head.weight") : m->embed;
+    /* lm_head is a real D->V GEMM and the single widest read per token (248320x2048 bf16
+     * = 1.0 GB), so it earns VRAM. embed_tokens stays host-side: it is a row gather. */
+    m->d_lm_head = dev_up(m, st_has(&m->S, "lm_head.weight") ? "lm_head.weight"
+                                                             : "embed_tokens.weight", m->lm_head);
 
     for (int i = 0; i < c->n_layers; i++) {
         Layer *L = &m->L[i];
@@ -285,9 +335,11 @@ static void model_load(Model *m, const char *snap) {
         if (c->is_linear[i]) {
             const char *sfx[] = {"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"};
             void **dst[] = {&L->w_qkv, &L->w_z, &L->w_b, &L->w_a, &L->w_out};
+            void **ddst[] = {&L->d_w_qkv, &L->d_w_z, &L->d_w_b, &L->d_w_a, &L->d_w_out};
             for (int j = 0; j < 5; j++) {
                 snprintf(base, sizeof(base), "layers.%d.linear_attn.%s.weight", i, sfx[j]);
                 *dst[j] = load_res(m, NM(nm, "%s", base));
+                *ddst[j] = dev_up(m, nm, *dst[j]);
             }
             snprintf(base, sizeof(base), "layers.%d.linear_attn.conv1d.weight", i);
             L->conv_w = load_t(m, NM(nm, "%s", base));
@@ -300,9 +352,11 @@ static void model_load(Model *m, const char *snap) {
         } else {
             const char *sfx[] = {"q_proj", "k_proj", "v_proj", "o_proj"};
             void **dst[] = {&L->wq, &L->wk, &L->wv, &L->wo};
+            void **ddst[] = {&L->d_wq, &L->d_wk, &L->d_wv, &L->d_wo};
             for (int j = 0; j < 4; j++) {
                 snprintf(base, sizeof(base), "layers.%d.self_attn.%s.weight", i, sfx[j]);
                 *dst[j] = load_res(m, NM(nm, "%s", base));
+                *ddst[j] = dev_up(m, nm, *dst[j]);
             }
             snprintf(base, sizeof(base), "layers.%d.self_attn.q_norm.weight", i);
             L->qn = load_norm(m, NM(nm, "%s", base));
@@ -323,9 +377,11 @@ static void model_load(Model *m, const char *snap) {
         L->sgate = load_t(m, NM(nm, "%s", base));
         const char *ssfx[] = {"gate_proj", "up_proj", "down_proj"};
         void **sdst[] = {&L->sg, &L->su, &L->sd};
+        void **sddst[] = {&L->d_sg, &L->d_su, &L->d_sd};
         for (int j = 0; j < 3; j++) {
             snprintf(base, sizeof(base), "layers.%d.mlp.shared_expert.%s.weight", i, ssfx[j]);
             *sdst[j] = load_res(m, NM(nm, "%s", base));
+            *sddst[j] = dev_up(m, nm, *sdst[j]);
         }
 
         if (m->xq) {                            /* fused int4 */
@@ -337,6 +393,28 @@ static void model_load(Model *m, const char *snap) {
             L->dn_q = load_u8(m, NM(nm, "%s", base));
             snprintf(base, sizeof(base), "layers.%d.mlp.experts.down_proj.qs", i);
             L->dn_s = load_t(m, NM(nm, "%s", base));
+#ifdef COLI_CUDA
+            /* The whole int4 container is ~21.7 GB against 48 GB of VRAM, so every layer's
+             * experts fit -- no cache, no pager, no CPU expert tier. That is the structural
+             * difference from Laguna, whose 57 GB of experts do not fit and whose resulting
+             * CPU fallback costs 70% of expert time. Partial upload still degrades safely:
+             * a NULL device pointer just routes that layer through the CPU kernel. */
+            if (g_cuda) {
+                int64_t gub = st_nbytes(&m->S, NM(nm, "layers.%d.mlp.experts.gate_up_proj", i));
+                int64_t gus = st_nbytes(&m->S, NM(nm, "layers.%d.mlp.experts.gate_up_proj.qs", i));
+                int64_t dnb = st_nbytes(&m->S, NM(nm, "layers.%d.mlp.experts.down_proj", i));
+                int64_t dns = st_nbytes(&m->S, NM(nm, "layers.%d.mlp.experts.down_proj.qs", i));
+                size_t need = (size_t)(gub + gus + dnb + dns);
+                if (lag_cuda_free_bytes() > need + (size_t)1e9) {
+                    L->d_gu_q = lag_cuda_upload(L->gu_q, (size_t)gub);
+                    L->d_gu_s = (float *)lag_cuda_upload(L->gu_s, (size_t)gus);
+                    L->d_dn_q = lag_cuda_upload(L->dn_q, (size_t)dnb);
+                    L->d_dn_s = (float *)lag_cuda_upload(L->dn_s, (size_t)dns);
+                    if (L->d_gu_q && L->d_gu_s && L->d_dn_q && L->d_dn_s) g_vram_gb += need / 1e9;
+                    else { L->d_gu_q = L->d_dn_q = NULL; L->d_gu_s = L->d_dn_s = NULL; }
+                }
+            }
+#endif
         } else {
             /* f32, either fused [E,2I,D]/[E,D,I] or per-expert (what save_pretrained
              * writes, and what the tiny oracle therefore has). Normalize to per-expert
@@ -400,6 +478,54 @@ static void state_free(Model *m, State *s) {
     free(s->k); free(s->v); free(s->ls);
 }
 
+/* ---------- profiling ----------
+ * Decode in an agentic loop is the case that matters and the one that is hardest to reason
+ * about, because the cost mix changes with context length: the MoE and the projections are
+ * flat per token, the 10 full-attention layers grow linearly, and the 30 recurrent layers
+ * are flat by construction. QW_PROF=1 attributes a run so that is measurable rather than
+ * argued about. Phases sum to a checked fraction of wall time so a missing one is visible. */
+static int g_prof = 0;
+/* QW_NOGROUP=1 forces the per-head SDPA path in non-exact mode, so the grouped kernel has
+ * something to be A/B'd against in ONE process on ONE build (the two use different softmax
+ * structures, so greedy-token identity is the bar, not bit-identity). */
+static int g_nogroup = 0;
+/* QW_SPLIT=N overrides the KV-split chunk count. Two different N are both correct by
+ * construction (kernel-check proves the merge is exact algebra), so comparing them
+ * calibrates how much greedy divergence is pure float noise -- the control that tells a
+ * real kernel bug apart from reassociation amplified through 40 layers. */
+static int g_split_override = 0;
+/* QW_ATTN_DBL=1 keeps the per-head path but accumulates QK in double. Both precisions are
+ * correct, so this is the second benign control: it measures how far a legitimate change of
+ * accumulation order alone moves a greedy continuation. */
+static int g_attn_dbl = 0;
+static double pr_qkv, pr_attn, pr_gate, pr_lin_proj, pr_lin_conv, pr_lin_scan, pr_lin_out,
+              pr_route, pr_experts, pr_shared, pr_lmhead, pr_sample;
+#define PROF_T0() (g_prof ? now_s() : 0.0)
+#define PROF_ADD(acc, t0) do { if (g_prof) (acc) += now_s() - (t0); } while (0)
+
+static void prof_report(const char *what, double wall, int steps) {
+    if (!g_prof || steps <= 0) return;
+    struct { const char *n; double v; } ph[] = {
+        {"qkv+rope proj", pr_qkv}, {"attention (SDPA)", pr_attn}, {"gate+o_proj", pr_gate},
+        {"linattn proj", pr_lin_proj}, {"linattn conv", pr_lin_conv},
+        {"linattn recurrence", pr_lin_scan}, {"linattn norm+out", pr_lin_out},
+        {"routing", pr_route}, {"experts", pr_experts}, {"shared expert", pr_shared},
+        {"lm_head", pr_lmhead}, {"sampling", pr_sample},
+    };
+    double tot = 0;
+    for (unsigned i = 0; i < sizeof(ph) / sizeof(ph[0]); i++) tot += ph[i].v;
+    fprintf(stderr, "[prof] %s: %.2fs wall over %d steps (%.1f ms/step); phases sum to "
+            "%.2fs (%.0f%%)\n", what, wall, steps, wall / steps * 1e3, tot,
+            wall > 0 ? tot / wall * 100 : 0);
+    for (unsigned i = 0; i < sizeof(ph) / sizeof(ph[0]); i++)
+        fprintf(stderr, "[prof]   %-20s %7.2fs %6.1f%%  %8.2f ms/step\n", ph[i].n, ph[i].v,
+                wall > 0 ? ph[i].v / wall * 100 : 0, ph[i].v / steps * 1e3);
+}
+static void prof_reset(void) {
+    pr_qkv = pr_attn = pr_gate = pr_lin_proj = pr_lin_conv = pr_lin_scan = pr_lin_out =
+        pr_route = pr_experts = pr_shared = pr_lmhead = pr_sample = 0;
+}
+
 /* ---------- MoE ---------- */
 /* softmax over ALL experts, then top-k, then renormalize by the top-k sum. Order matters:
  * top-k-then-softmax gives different weights and is the common way to get this wrong. */
@@ -430,13 +556,25 @@ static void moe_route(const float *logit, int E, int K, int *sel, float *w) {
 static void moe_forward(Model *m, Layer *L, const float *x, float *out) {
     Cfg *c = &m->c;
     int D = c->D, I = c->moe_I, E = c->E, K = c->K, SI = c->shared_I;
+    double tr = PROF_T0();
     float *logit = falloc(E);
     matmul_f32(logit, x, L->router, 1, D, E, g_exact);
     int *sel = malloc(sizeof(int) * K);
     float *w = falloc(K);
     moe_route(logit, E, K, sel, w);
+    PROF_ADD(pr_route, tr);
 
     for (int i = 0; i < D; i++) out[i] = 0.f;
+    double tx = PROF_T0();
+#ifdef COLI_CUDA
+    /* All K experts in ONE submission with device-side accumulate: K separate
+     * launch+sync round-trips per layer is what makes the naive port slow. */
+    int gpu_done = 0;
+    if (m->xq && L->d_gu_q && !g_exact)
+        gpu_done = (lag_cuda_moe_experts(out, x, L->d_gu_q, L->d_gu_s, L->d_dn_q, L->d_dn_s,
+                                         sel, w, K, I, D) == 0);
+    if (!gpu_done) {
+#endif
     float *gu = falloc(2 * I), *glu = falloc(I), *eo = falloc(D);
     for (int a = 0; a < K; a++) {
         int e = sel[a];
@@ -454,18 +592,26 @@ static void moe_forward(Model *m, Layer *L, const float *x, float *out) {
         }
         for (int i = 0; i < D; i++) out[i] += w[a] * eo[i];
     }
+    free(gu); free(glu); free(eo);
+#ifdef COLI_CUDA
+    }
+#endif
+
+    PROF_ADD(pr_experts, tx);
 
     /* shared expert, scaled by sigmoid of its own 1-wide gate */
+    double tsh = PROF_T0();
     float *sg = falloc(SI), *su = falloc(SI), *so = falloc(D), gval;
     matmul_f32(&gval, x, L->sgate, 1, D, 1, g_exact);
     float gscale = 1.f / (1.f + expf(-gval));
-    resmm(m, sg, x, L->sg, 1, D, SI);
-    resmm(m, su, x, L->su, 1, D, SI);
+    resmm(m, sg, x, L->sg, L->d_sg, 1, D, SI);
+    resmm(m, su, x, L->su, L->d_su, 1, D, SI);
     for (int i = 0; i < SI; i++) sg[i] = siluf(sg[i]) * su[i];
-    resmm(m, so, sg, L->sd, 1, SI, D);
+    resmm(m, so, sg, L->sd, L->d_sd, 1, SI, D);
     for (int i = 0; i < D; i++) out[i] += gscale * so[i];
+    PROF_ADD(pr_shared, tsh);
 
-    free(logit); free(sel); free(w); free(gu); free(glu); free(eo);
+    free(logit); free(sel); free(w);
     free(sg); free(su); free(so);
 }
 
@@ -491,43 +637,102 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
 
     float *qp = falloc((int64_t)n * qw);
     float *kp = falloc((int64_t)n * kvw), *vp = falloc((int64_t)n * kvw);
-    resmm(m, qp, xn, L->wq, n, D, qw);
-    resmm(m, kp, xn, L->wk, n, D, kvw);
-    resmm(m, vp, xn, L->wv, n, D, kvw);
+    double tq = PROF_T0();
+    resmm(m, qp, xn, L->wq, L->d_wq, n, D, qw);
+    resmm(m, kp, xn, L->wk, L->d_wk, n, D, kvw);
+    resmm(m, vp, xn, L->wv, L->d_wv, n, D, kvw);
+    PROF_ADD(pr_qkv, tq);
 
     float *ao = falloc((int64_t)n * H * hd);
-    float *sc = falloc(pos0 + n + 1);
+    double ta = PROF_T0();
+
+    /* Pass 1: write every token's K/V (per-head RMSNorm then rope) before attending.
+     * Separating this from the attention pass is what lets pass 2 be parallel: with K/V
+     * already in place there is no dependency between (token, kv-head) work items. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n > 1)
+#endif
     for (int t = 0; t < n; t++) {
         int pos = pos0 + t;
-        /* K/V: per-head RMSNorm then rope, stored post-norm/post-rope */
         float *kdst = s->k[li] + (int64_t)pos * kvw, *vdst = s->v[li] + (int64_t)pos * kvw;
         for (int h = 0; h < nkv; h++) {
             rmsnorm_row(kdst + h * hd, kp + (int64_t)t * kvw + h * hd, L->kn, hd, c->eps);
             rope_apply(kdst + h * hd, pos, c->inv, c->rdim);
         }
         memcpy(vdst, vp + (int64_t)t * kvw, (size_t)kvw * sizeof(float));
+    }
 
-        for (int h = 0; h < H; h++) {
-            /* query and gate are interleaved per head: [q(hd) | gate(hd)] per head */
-            const float *qsrc = qp + (int64_t)t * qw + (int64_t)h * hd * 2;
-            const float *gate = qsrc + hd;
-            float q[512];
-            if (hd > 512) { fprintf(stderr, "head_dim %d > 512\n", hd); exit(1); }
-            rmsnorm_row(q, qsrc, L->qn, hd, c->eps);
-            rope_apply(q, pos, c->inv, c->rdim);
-            float *o = ao + (int64_t)t * H * hd + (int64_t)h * hd;
-            /* tau is a score MULTIPLIER in sdpa_head (sc = tau*(dot*scale + bias)), not a
-             * softcap -- passing 0 makes every score equal and attention a uniform mean of V.
-             * Qwen3.5 has no logit cap, so tau = 1. */
-            sdpa_head(q, s->k[li] + (int64_t)(h / grp) * hd, s->v[li] + (int64_t)(h / grp) * hd,
-                      kvw, hd, 0, pos, scale, 1.f, NULL, 0,
-                      g_exact ? MOE_QK_DBL : MOE_QK_SIMD, o, sc, 0);
-            /* per-element output gate */
-            for (int d = 0; d < hd; d++) o[d] *= 1.f / (1.f + expf(-gate[d]));
+    /* Pass 2: attention.
+     * Work items are (token, kv-head) pairs. In PREFILL that is n*n_kv items -- plenty, so
+     * parallelize across them and use the plain grouped kernel. In DECODE there is one token
+     * and n_kv=2, which cannot fill 12 cores; there the parallelism has to come from splitting
+     * the KV window instead (sdpa_group_split). Both read each KV element exactly once.
+     * The oracle keeps the scalar per-head path, which is what its exactness is validated on. */
+    int items = n * nkv;
+    int nthr = 1;
+#ifdef _OPENMP
+    nthr = omp_get_max_threads();
+#endif
+    (void)nthr;
+    /* RULED OUT, with numbers: splitting the KV window (sdpa_group_split, flash-decoding
+     * split-K) is 2.5x SLOWER here than not splitting, despite reading the same bytes.
+     * Measured on this box at 3321-token context, same binary, back to back:
+     *     QW_SPLIT=1  22.8 tok/s   attention 16.7 ms/step
+     *     QW_SPLIT=2   9.0 tok/s   attention 52.0 ms/step
+     *     QW_SPLIT=6   9.7 tok/s   attention 45.8 ms/step
+     * The cause is OpenMP region overhead, not memory: with split>1 the (token, kv-head)
+     * loop must run serially and the split kernel opens a fresh parallel region per call --
+     * 20 regions per token on a 24-thread team, each with only 2-6 chunks of real work.
+     * Amortizing that needs ONE region per layer spanning (token, kv-head, chunk) with the
+     * merge outside, which is the shape to build if decode attention needs more than the
+     * 2-way parallelism the (token, kv-head) loop gives at batch 1. The kernel stays in
+     * moe_attn.h, validated by kernel-check, reachable via QW_SPLIT for that work. */
+    int split = 1;
+    if (g_split_override > 0 && !g_exact && !g_nogroup && items < nthr) split = g_split_override;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) collapse(2) if (items > 1 && split == 1)
+#endif
+    for (int t = 0; t < n; t++) {
+        for (int kh = 0; kh < nkv; kh++) {
+            int pos = pos0 + t;
+            float qg[SDPA_MAX_GROUP * 512];
+            for (int j = 0; j < grp; j++) {
+                int h = kh * grp + j;
+                /* query and gate are interleaved per head: [q(hd) | gate(hd)] per head */
+                const float *qsrc = qp + (int64_t)t * qw + (int64_t)h * hd * 2;
+                rmsnorm_row(qg + (int64_t)j * hd, qsrc, L->qn, hd, c->eps);
+                rope_apply(qg + (int64_t)j * hd, pos, c->inv, c->rdim);
+            }
+            float *og = ao + (int64_t)t * H * hd + (int64_t)kh * grp * hd;
+            const float *Kb = s->k[li] + (int64_t)kh * hd;
+            const float *Vb = s->v[li] + (int64_t)kh * hd;
+            if (g_exact || g_nogroup) {
+                float *scl = falloc(pos + 1);
+                for (int j = 0; j < grp; j++)
+                    sdpa_head(qg + (int64_t)j * hd, Kb, Vb, kvw, hd, 0, pos, scale, 1.f,
+                              NULL, 0, (g_exact || g_attn_dbl) ? MOE_QK_DBL : MOE_QK_SIMD,
+                              og + (int64_t)j * hd, scl, 0);
+                free(scl);
+            } else if (split > 1) {
+                sdpa_group_split(qg, hd, Kb, Vb, kvw, hd, 0, pos, scale, 1.f, og, hd, grp,
+                                 0, split, NULL);
+            } else {
+                sdpa_group(qg, hd, Kb, Vb, kvw, hd, 0, pos, scale, 1.f, og, hd, grp, 0);
+            }
+            /* per-element output gate, applied to each head's own slice */
+            for (int j = 0; j < grp; j++) {
+                const float *gate = qp + (int64_t)t * qw + (int64_t)(kh * grp + j) * hd * 2 + hd;
+                float *o = og + (int64_t)j * hd;
+                for (int d = 0; d < hd; d++) o[d] *= 1.f / (1.f + expf(-gate[d]));
+            }
         }
     }
-    resmm(m, out, ao, L->wo, n, H * hd, D);
-    free(qp); free(kp); free(vp); free(ao); free(sc);
+    PROF_ADD(pr_attn, ta);
+    double tg = PROF_T0();
+    resmm(m, out, ao, L->wo, L->d_wo, n, H * hd, D);
+    PROF_ADD(pr_gate, tg);
+    free(qp); free(kp); free(vp); free(ao);
 }
 
 /* gated delta net over `n` tokens; state and conv window carry across calls */
@@ -539,12 +744,17 @@ static void linattn_forward(Model *m, Layer *L, State *s, int li, const float *x
     float *mix = falloc((int64_t)n * cd);
     float *z = falloc((int64_t)n * vdim);
     float *bb = falloc((int64_t)n * nv), *aa = falloc((int64_t)n * nv);
-    resmm(m, mix, xn, L->w_qkv, n, D, cd);
-    resmm(m, z, xn, L->w_z, n, D, vdim);
-    resmm(m, bb, xn, L->w_b, n, D, nv);
-    resmm(m, aa, xn, L->w_a, n, D, nv);
+    double tp = PROF_T0();
+    resmm(m, mix, xn, L->w_qkv, L->d_w_qkv, n, D, cd);
+    resmm(m, z, xn, L->w_z, L->d_w_z, n, D, vdim);
+    resmm(m, bb, xn, L->w_b, L->d_w_b, n, D, nv);
+    resmm(m, aa, xn, L->w_a, L->d_w_a, n, D, nv);
+    PROF_ADD(pr_lin_proj, tp);
 
+    double tc = PROF_T0();
     linattn_conv_span(s->ls[li].conv, mix, L->conv_w, NULL, mix, n, cd, c->conv_k);
+
+    PROF_ADD(pr_lin_conv, tc);
 
     /* beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias) */
     float *g = falloc((int64_t)n * nv);
@@ -565,14 +775,18 @@ static void linattn_forward(Model *m, Layer *L, State *s, int li, const float *x
         memcpy(v + (int64_t)t * vdim, r + 2 * kdim, (size_t)vdim * sizeof(float));
     }
     float *core = falloc((int64_t)n * vdim);
+    double ts = PROF_T0();
     linattn_scan(&s->ls[li], q, k, v, g, bb, core, n, c->lin_kh, nv, c->lin_kd, c->lin_vd);
+    PROF_ADD(pr_lin_scan, ts);
 
     /* gated RMSNorm per value head, then out_proj */
+    double to = PROF_T0();
     for (int t = 0; t < n; t++)
         for (int h = 0; h < nv; h++)
             linattn_gated_norm(core + (int64_t)t * vdim + h * c->lin_vd,
                                z + (int64_t)t * vdim + h * c->lin_vd, L->gnorm, c->lin_vd, c->eps);
-    resmm(m, out, core, L->w_out, n, vdim, D);
+    resmm(m, out, core, L->w_out, L->d_w_out, n, vdim, D);
+    PROF_ADD(pr_lin_out, to);
 
     free(mix); free(z); free(bb); free(aa); free(g);
     free(q); free(k); free(v); free(core);
@@ -631,7 +845,9 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
         float hn[8192];
         float *hp = D <= 8192 ? hn : falloc(D);
         rmsnorm_row(hp, x + (int64_t)t * D, m->norm, D, c->eps);
-        resmm(m, logits + (int64_t)(logits_all ? t : 0) * V, hp, m->lm_head, 1, D, V);
+        double tl = PROF_T0();
+        resmm(m, logits + (int64_t)(logits_all ? t : 0) * V, hp, m->lm_head, m->d_lm_head, 1, D, V);
+        PROF_ADD(pr_lmhead, tl);
         if (D > 8192) free(hp);
     }
     free(x); free(xn); free(mo);
@@ -794,6 +1010,10 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("EXACT")) g_exact = 1;
+    if (getenv("QW_PROF")) g_prof = 1;
+    if (getenv("QW_NOGROUP")) g_nogroup = 1;
+    if (getenv("QW_SPLIT")) g_split_override = atoi(getenv("QW_SPLIT"));
+    if (getenv("QW_ATTN_DBL")) g_attn_dbl = 1;
 
     const char *ref = NULL, *pfile = NULL, *prompt = NULL;
     int n_gen = 64;
@@ -808,9 +1028,21 @@ int main(int argc, char **argv) {
 
     Model m;
     memset(&m, 0, sizeof(m));
+#ifdef COLI_CUDA
+    /* NOCUDA=1 forces the CPU path for an in-process A/B against the GPU tier. */
+    if (!getenv("NOCUDA")) {
+        int dev = getenv("CUDA_DEV") ? atoi(getenv("CUDA_DEV")) : 0;
+        g_cuda = (lag_cuda_init(dev) == 0);
+        if (g_cuda)
+            fprintf(stderr, "[qwen35] CUDA device %d: %.1f GB free of %.1f GB\n", dev,
+                    lag_cuda_free_bytes() / 1e9, lag_cuda_total_bytes() / 1e9);
+        else fprintf(stderr, "[qwen35] CUDA init failed; CPU only\n");
+    }
+#endif
     double t0 = now_s();
     model_load(&m, snap);
-    fprintf(stderr, "[qwen35] loaded in %.1fs (rss %.1f GB)\n", now_s() - t0, rss_gb());
+    fprintf(stderr, "[qwen35] loaded in %.1fs (rss %.1f GB, VRAM %.1f GB)\n",
+            now_s() - t0, rss_gb(), g_vram_gb);
 
     if (ref) { g_exact = 1; return run_oracle(&m, ref); }
 
@@ -845,16 +1077,21 @@ int main(int argc, char **argv) {
     float *lg = falloc(c->V);
     uint64_t rng = 0x243F6A8885A308D3ULL;
 
+    prof_reset();
     double tp0 = now_s();
     forward(&m, &s, ids, np, 0, lg, 0);
     double pre = now_s() - tp0;
     fprintf(stderr, "[qwen35] prefill %.2fs (%.1f tok/s)\n", pre, np / pre);
+    prof_report("prefill", pre, 1);
+    prof_reset();
 
     double td0 = now_s();
     char buf[512];
     for (int i = 0; i < n_gen; i++) {
+        double tsm = PROF_T0();
         int nxt = temp > 0 ? sample_logits(lg, c->V, temp, top_p)
                            : ({ int a = 0; for (int v = 1; v < c->V; v++) if (lg[v] > lg[a]) a = v; a; });
+        PROF_ADD(pr_sample, tsm);
         (void)rng;
         int stop = 0;
         for (int e = 0; e < c->n_eos; e++) if (nxt == c->eos[e]) stop = 1;
@@ -866,6 +1103,7 @@ int main(int argc, char **argv) {
     double dec = now_s() - td0;
     printf("\n");
     fprintf(stderr, "[qwen35] decode %d tok in %.2fs (%.2f tok/s)\n", n_gen, dec, n_gen / dec);
+    prof_report("decode", dec, n_gen);
     state_free(&m, &s);
     return 0;
 }
