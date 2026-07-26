@@ -321,6 +321,74 @@ non-trivial is the asymmetry in the section above — the 10 attention layers ca
 on divergence, the 30 recurrent ones cannot, so one cache holds two data structures with two
 reuse rules.
 
+## Parity with the other engines
+
+| feature | status |
+|---|---|
+| grouped expert GEMM (Megablocks-style) | **done** — prefill 38.8 → 79.7 tok/s |
+| batched decode + `BATCH=N` / `BATCH_VARY` bench | **done**, with the correctness assertion |
+| continuous batching in serve (`KV_SLOTS=N`) | **done** — chunked prefill, per-slot state |
+| prefix reuse across requests | **done**, with an architectural restriction (below) |
+| per-slot state footprint report | **done** — 0.74 GB/slot at 16 k ctx |
+| int8 KV cache | deliberately absent: flips 6.4% of predictions on Laguna, stays off |
+| int8 residents (`RES8`) | unnecessary — the whole container fits in VRAM at bf16 |
+| CUDA kernel self-test | covered: the kernels are shared, `LAG_CUDA_TEST=1 ./laguna` exercises them |
+
+Aggregate decode throughput, 22-token prompt, identical vs divergent streams:
+
+| B | identical streams | `BATCH_VARY=1` (honest) |
+|---|---|---|
+| 1 | 34.6 tok/s | 35.8 |
+| 4 | 51.9 | 52.8 |
+| 8 | 60.9 | **54.4** |
+
+Divergent streams are *slower* than identical ones at B=8, which is the expected shape: identical
+streams route to identical experts, so grouping collapses to top-k and flatters the number.
+
+### Prefix reuse: works, but not for the case that needs it
+
+Reuse is restricted to **pure extension** — the new prompt must extend everything the slot has
+already fed, token for token. A recurrent state cannot be rewound (the decay has multiplied the
+old state away), so a divergence anywhere inside the held prefix forces full recompute even
+though the 10 attention layers could have been truncated.
+
+When it applies it is decisive. Driving the engine protocol directly, 2011-token prompt:
+
+| request | wall |
+|---|---|
+| cold | 21.01 s |
+| pure extension (reused 2009/2011 tokens) | **0.34 s** — 62× |
+| diverges inside the held prefix | 21.20 s (correctly falls back) |
+
+**It does not fire for OpenAI multi-turn chat**, measured: turn 2 of a 2193-token conversation
+took exactly as long as turn 1. The reason is the chat template, not the cache — an assistant
+turn is *re-rendered* on the next request (`<think>\n{reasoning}\n</think>\n\n{content}`)
+differently from how it was generated (`<think>\n` prefilled, then the model emits the closing
+tag), so the token stream diverges mid-prefix and the whole prefix is lost.
+
+The fix is the design this document already argued for: periodic **recurrent-state checkpoints**
+during prefill, so a divergence can roll back to the nearest checkpoint at or before the
+longest common prefix instead of to zero. Checkpoint spacing then sets a replay cost floor —
+at 1024-token spacing that is ~1.07 GB per slot for 16 checkpoints, which is the real tradeoff
+to weigh. Not built.
+
+## Known costs, measured but not yet fixed
+
+Recorded so they are not rediscovered:
+
+1. **Routing is 10.8% of prefill** — larger than the experts themselves after grouping.
+   `moe_route` does an O(K²E) top-k selection (a nested "already taken" scan) plus a `malloc`
+   per row, 256 experts × 3321 rows × 40 layers. A used-mask and hoisted scratch fix it.
+2. **Attention is 40% of decode and only 2-way parallel** at batch 1, because grouping leaves
+   `n_kv_heads` = 2 work items. Batched decode fixes this incidentally (`B*n_kv` items); single
+   stream still needs the one-region-per-layer split described above.
+3. **Batch scaling is sub-linear** (1.57× aggregate at B=8 divergent). Batched decode has not
+   been profiled separately from single-stream decode.
+4. **The int4 tiny oracle reports FAIL by design** — a 64-wide random-weight row has no
+   redundancy to absorb int4, so ppl doubles. It is verified equal to `transformers` running the
+   same dequantized weights (ppl 99.7712, 10/36 both sides), so it is a reference comparison,
+   not a pass/fail gate.
+
 ## Still to do
 
 Batching and the CUDA tier are not written: this is a single-stream engine, so none of the

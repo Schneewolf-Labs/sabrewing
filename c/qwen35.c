@@ -470,6 +470,22 @@ static void state_init(Model *m, State *s, int ctx) {
     }
     s->len = 0;
 }
+/* Per-sequence memory: KV for the full-attention layers grows with context, the recurrent
+ * state and conv window of the linear layers do not. Reporting both makes the architecture's
+ * whole point visible at a glance -- and caps how many slots fit. */
+static double state_bytes(Model *m, int ctx) {
+    Cfg *c = &m->c;
+    double kv = 0, rec = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_linear[i])
+            rec += (double)linattn_state_bytes(c->lin_vh, c->lin_kd, c->lin_vd,
+                                               c->conv_dim, c->conv_k);
+        else
+            kv += 2.0 * ctx * c->n_kv * c->head_dim * sizeof(float);
+    }
+    return kv + rec;
+}
+
 static void state_free(Model *m, State *s) {
     for (int i = 0; i < m->c.n_layers; i++) {
         free(s->k[i]); free(s->v[i]);
@@ -553,66 +569,118 @@ static void moe_route(const float *logit, int E, int K, int *sel, float *w) {
     free(p);
 }
 
-static void moe_forward(Model *m, Layer *L, const float *x, float *out) {
+/* Routed MoE + shared expert over S token rows.
+ *
+ * Grouped by expert (Megablocks-style): the S*K (row, expert) pairs are counting-sorted by
+ * expert id, so each DISTINCT expert's int4 blob is read once and applied to all its rows as
+ * a GEMM. At S=1 that degenerates to the per-expert path; the win is prefill and batched
+ * decode, where B streams sharing an expert pay for it once.
+ *
+ * Bit-exact against the per-row path by construction, which is why BATCH=N can assert token
+ * identity: each row's GEMM is an independent per-row reduction, and the combine sums over
+ * ranks in top-k order regardless of how rows were packed. */
+static void moe_forward_rows(Model *m, Layer *L, const float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->D, I = c->moe_I, E = c->E, K = c->K, SI = c->shared_I;
+    int64_t T = (int64_t)S * K;
+
     double tr = PROF_T0();
-    float *logit = falloc(E);
-    matmul_f32(logit, x, L->router, 1, D, E, g_exact);
-    int *sel = malloc(sizeof(int) * K);
-    float *w = falloc(K);
-    moe_route(logit, E, K, sel, w);
+    float *logit = falloc((int64_t)S * E);
+    matmul_f32(logit, x, L->router, S, D, E, g_exact);
+    int *sel = malloc(sizeof(int) * T);
+    float *w = falloc(T);
+    for (int s = 0; s < S; s++)
+        moe_route(logit + (int64_t)s * E, E, K, sel + (int64_t)s * K, w + (int64_t)s * K);
+
+    /* counting-sort the (row, expert) pairs into per-expert groups, ascending expert id */
+    int *cnt = calloc((size_t)E, sizeof(int));
+    for (int64_t i = 0; i < T; i++) cnt[sel[i]]++;
+    int *gexp = malloc((size_t)E * sizeof(int)), *gbeg = malloc((size_t)E * sizeof(int));
+    int *gcnt = malloc((size_t)E * sizeof(int)), *pos = malloc((size_t)E * sizeof(int));
+    int G = 0, off = 0;
+    for (int e = 0; e < E; e++) {
+        if (!cnt[e]) continue;
+        gexp[G] = e; gbeg[G] = off; gcnt[G] = cnt[e]; pos[e] = off; off += cnt[e]; G++;
+    }
+    int *grow = malloc((size_t)T * sizeof(int));      /* packed row -> source row */
+    int *rowof = malloc((size_t)T * sizeof(int));     /* (row, rank) -> packed row */
+    for (int s = 0; s < S; s++)
+        for (int a = 0; a < K; a++) {
+            int slot = pos[sel[(int64_t)s * K + a]]++;
+            grow[slot] = s; rowof[(int64_t)s * K + a] = slot;
+        }
     PROF_ADD(pr_route, tr);
 
-    for (int i = 0; i < D; i++) out[i] = 0.f;
     double tx = PROF_T0();
+    int done = 0;
 #ifdef COLI_CUDA
-    /* All K experts in ONE submission with device-side accumulate: K separate
-     * launch+sync round-trips per layer is what makes the naive port slow. */
-    int gpu_done = 0;
-    if (m->xq && L->d_gu_q && !g_exact)
-        gpu_done = (lag_cuda_moe_experts(out, x, L->d_gu_q, L->d_gu_s, L->d_dn_q, L->d_dn_s,
-                                         sel, w, K, I, D) == 0);
-    if (!gpu_done) {
+    if (m->xq && L->d_gu_q && !g_exact &&
+        lag_cuda_moe_group(out, x, L->d_gu_q, L->d_gu_s, L->d_dn_q, L->d_dn_s,
+                           gexp, gbeg, gcnt, G, grow, rowof, w, S, K, I, D) == 0) done = 1;
 #endif
-    float *gu = falloc(2 * I), *glu = falloc(I), *eo = falloc(D);
-    for (int a = 0; a < K; a++) {
-        int e = sel[a];
-        if (m->xq) {
-            matmul_q4_k(gu, x, L->gu_q + (int64_t)(e * 2 * I) * (D / 2),
-                        L->gu_s + (int64_t)e * 2 * I, D, 2 * I, MOE_Q4_F32, g_exact);
-            for (int i = 0; i < I; i++) glu[i] = siluf(gu[i]) * gu[I + i];
-            matmul_q4_k(eo, glu, L->dn_q + (int64_t)(e * D) * (I / 2),
-                        L->dn_s + (int64_t)e * D, I, D, MOE_Q4_F32, g_exact);
-        } else {
-            matmul_f32(gu, x, L->eg[e], 1, D, I, g_exact);
-            matmul_f32(gu + I, x, L->eu[e], 1, D, I, g_exact);
-            for (int i = 0; i < I; i++) glu[i] = siluf(gu[i]) * gu[I + i];
-            matmul_f32(eo, glu, L->ed[e], 1, I, D, g_exact);
+    if (!done) {
+        float *slots = falloc(T * D);
+        float *xg = falloc((int64_t)S * D), *gu = falloc((int64_t)S * 2 * I);
+        float *glu = falloc((int64_t)S * I);
+        for (int g = 0; g < G; g++) {
+            int e = gexp[g], ng = gcnt[g], beg = gbeg[g];
+            for (int j = 0; j < ng; j++)
+                memcpy(xg + (int64_t)j * D, x + (int64_t)grow[beg + j] * D,
+                       (size_t)D * sizeof(float));
+            if (m->xq) {
+                matmul_q4_kb(gu, xg, L->gu_q + (int64_t)(e * 2 * I) * (D / 2),
+                             L->gu_s + (int64_t)e * 2 * I, ng, D, 2 * I, MOE_Q4_F32, g_exact);
+                for (int j = 0; j < ng; j++) {
+                    const float *gr = gu + (int64_t)j * 2 * I;
+                    float *o = glu + (int64_t)j * I;
+                    for (int i = 0; i < I; i++) o[i] = siluf(gr[i]) * gr[I + i];
+                }
+                matmul_q4_kb(slots + (int64_t)beg * D, glu,
+                             L->dn_q + (int64_t)(e * D) * (I / 2), L->dn_s + (int64_t)e * D,
+                             ng, I, D, MOE_Q4_F32, g_exact);
+            } else {
+                float *gg = gu, *uu = gu + (int64_t)ng * I;
+                matmul_f32(gg, xg, L->eg[e], ng, D, I, g_exact);
+                matmul_f32(uu, xg, L->eu[e], ng, D, I, g_exact);
+                for (int64_t i = 0; i < (int64_t)ng * I; i++) glu[i] = siluf(gg[i]) * uu[i];
+                matmul_f32(slots + (int64_t)beg * D, glu, L->ed[e], ng, I, D, g_exact);
+            }
         }
-        for (int i = 0; i < D; i++) out[i] += w[a] * eo[i];
+        /* combine in RANK order, so the sum matches the per-token path element for element */
+        for (int s = 0; s < S; s++) {
+            float *o = out + (int64_t)s * D;
+            for (int i = 0; i < D; i++) o[i] = 0.f;
+            for (int a = 0; a < K; a++) {
+                const float *v = slots + (int64_t)rowof[(int64_t)s * K + a] * D;
+                float wa = w[(int64_t)s * K + a];
+                for (int i = 0; i < D; i++) o[i] += wa * v[i];
+            }
+        }
+        free(slots); free(xg); free(gu); free(glu);
     }
-    free(gu); free(glu); free(eo);
-#ifdef COLI_CUDA
-    }
-#endif
-
     PROF_ADD(pr_experts, tx);
 
-    /* shared expert, scaled by sigmoid of its own 1-wide gate */
+    /* shared expert over all S rows (its residents are read once), scaled per row by
+     * sigmoid of its own 1-wide gate */
     double tsh = PROF_T0();
-    float *sg = falloc(SI), *su = falloc(SI), *so = falloc(D), gval;
-    matmul_f32(&gval, x, L->sgate, 1, D, 1, g_exact);
-    float gscale = 1.f / (1.f + expf(-gval));
-    resmm(m, sg, x, L->sg, L->d_sg, 1, D, SI);
-    resmm(m, su, x, L->su, L->d_su, 1, D, SI);
-    for (int i = 0; i < SI; i++) sg[i] = siluf(sg[i]) * su[i];
-    resmm(m, so, sg, L->sd, L->d_sd, 1, SI, D);
-    for (int i = 0; i < D; i++) out[i] += gscale * so[i];
+    float *sg = falloc((int64_t)S * SI), *su = falloc((int64_t)S * SI);
+    float *so = falloc((int64_t)S * D), *gv = falloc((int64_t)S);
+    matmul_f32(gv, x, L->sgate, S, D, 1, g_exact);
+    resmm(m, sg, x, L->sg, L->d_sg, S, D, SI);
+    resmm(m, su, x, L->su, L->d_su, S, D, SI);
+    for (int64_t i = 0; i < (int64_t)S * SI; i++) sg[i] = siluf(sg[i]) * su[i];
+    resmm(m, so, sg, L->sd, L->d_sd, S, SI, D);
+    for (int s = 0; s < S; s++) {
+        float gs = 1.f / (1.f + expf(-gv[s]));
+        float *o = out + (int64_t)s * D;
+        const float *sr = so + (int64_t)s * D;
+        for (int i = 0; i < D; i++) o[i] += gs * sr[i];
+    }
     PROF_ADD(pr_shared, tsh);
 
-    free(logit); free(sel); free(w);
-    free(sg); free(su); free(so);
+    free(logit); free(sel); free(w); free(cnt);
+    free(gexp); free(gbeg); free(gcnt); free(pos); free(grow); free(rowof);
+    free(sg); free(su); free(so); free(gv);
 }
 
 /* ---------- mixers ---------- */
@@ -795,6 +863,172 @@ static void linattn_forward(Model *m, Layer *L, State *s, int li, const float *x
 /* ---------- forward ---------- */
 /* Runs `n` tokens at absolute positions pos0..pos0+n-1. If `logits_all`, writes logits for
  * every position (teacher forcing); otherwise only the last. */
+/* ---------- batched decode ----------
+ * One token for each of B streams, in lockstep. This is the throughput lever and it also
+ * fixes decode's parallelism problem: attention work items go from n_kv_heads (2 at batch 1,
+ * which cannot fill 12 cores) to B*n_kv_heads, and the MoE groups B rows so an expert shared
+ * by several streams is read once.
+ *
+ * Every stream keeps its OWN state -- KV for the 10 attention layers, recurrent state plus
+ * conv window for the 30 linear ones -- and its own position, so streams of different lengths
+ * batch together. Per-stream arithmetic is identical to the single-stream path, which is what
+ * BATCH=N asserts. */
+static void attn_batch(Model *m, Layer *L, State **st, int li, const float *xn,
+                       const int *pos, int B, float *out) {
+    Cfg *c = &m->c;
+    int D = c->D, H = c->n_heads, hd = c->head_dim, nkv = c->n_kv;
+    int qw = H * hd * 2, kvw = nkv * hd, grp = H / nkv;
+    float scale = 1.f / sqrtf((float)hd);
+
+    double tq = PROF_T0();
+    float *qp = falloc((int64_t)B * qw);
+    float *kp = falloc((int64_t)B * kvw), *vp = falloc((int64_t)B * kvw);
+    resmm(m, qp, xn, L->wq, L->d_wq, B, D, qw);
+    resmm(m, kp, xn, L->wk, L->d_wk, B, D, kvw);
+    resmm(m, vp, xn, L->wv, L->d_wv, B, D, kvw);
+    PROF_ADD(pr_qkv, tq);
+
+    float *ao = falloc((int64_t)B * H * hd);
+    double ta = PROF_T0();
+    for (int b = 0; b < B; b++) {              /* each stream writes into its own cache */
+        float *kdst = st[b]->k[li] + (int64_t)pos[b] * kvw;
+        float *vdst = st[b]->v[li] + (int64_t)pos[b] * kvw;
+        for (int h = 0; h < nkv; h++) {
+            rmsnorm_row(kdst + h * hd, kp + (int64_t)b * kvw + h * hd, L->kn, hd, c->eps);
+            rope_apply(kdst + h * hd, pos[b], c->inv, c->rdim);
+        }
+        memcpy(vdst, vp + (int64_t)b * kvw, (size_t)kvw * sizeof(float));
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) collapse(2) if (B * nkv > 1)
+#endif
+    for (int b = 0; b < B; b++) {
+        for (int kh = 0; kh < nkv; kh++) {
+            float qg[SDPA_MAX_GROUP * 512];
+            for (int j = 0; j < grp; j++) {
+                const float *qsrc = qp + (int64_t)b * qw + (int64_t)(kh * grp + j) * hd * 2;
+                rmsnorm_row(qg + (int64_t)j * hd, qsrc, L->qn, hd, c->eps);
+                rope_apply(qg + (int64_t)j * hd, pos[b], c->inv, c->rdim);
+            }
+            float *og = ao + (int64_t)b * H * hd + (int64_t)kh * grp * hd;
+            const float *Kb = st[b]->k[li] + (int64_t)kh * hd;
+            const float *Vb = st[b]->v[li] + (int64_t)kh * hd;
+            if (g_exact || g_nogroup) {
+                float *scl = falloc(pos[b] + 1);
+                for (int j = 0; j < grp; j++)
+                    sdpa_head(qg + (int64_t)j * hd, Kb, Vb, kvw, hd, 0, pos[b], scale, 1.f,
+                              NULL, 0, g_exact ? MOE_QK_DBL : MOE_QK_SIMD,
+                              og + (int64_t)j * hd, scl, 0);
+                free(scl);
+            } else {
+                sdpa_group(qg, hd, Kb, Vb, kvw, hd, 0, pos[b], scale, 1.f, og, hd, grp, 0);
+            }
+            for (int j = 0; j < grp; j++) {
+                const float *gate = qp + (int64_t)b * qw
+                                  + (int64_t)(kh * grp + j) * hd * 2 + hd;
+                float *o = og + (int64_t)j * hd;
+                for (int d = 0; d < hd; d++) o[d] *= 1.f / (1.f + expf(-gate[d]));
+            }
+        }
+    }
+    PROF_ADD(pr_attn, ta);
+    double tg = PROF_T0();
+    resmm(m, out, ao, L->wo, L->d_wo, B, H * hd, D);
+    PROF_ADD(pr_gate, tg);
+    free(qp); free(kp); free(vp); free(ao);
+}
+
+static void linattn_batch(Model *m, Layer *L, State **st, int li, const float *xn,
+                          int B, float *out) {
+    Cfg *c = &m->c;
+    int D = c->D, cd = c->conv_dim, vdim = c->value_dim, kdim = c->key_dim, nv = c->lin_vh;
+
+    double tp = PROF_T0();
+    float *mix = falloc((int64_t)B * cd), *z = falloc((int64_t)B * vdim);
+    float *bb = falloc((int64_t)B * nv), *aa = falloc((int64_t)B * nv);
+    resmm(m, mix, xn, L->w_qkv, L->d_w_qkv, B, D, cd);
+    resmm(m, z, xn, L->w_z, L->d_w_z, B, D, vdim);
+    resmm(m, bb, xn, L->w_b, L->d_w_b, B, D, nv);
+    resmm(m, aa, xn, L->w_a, L->d_w_a, B, D, nv);
+    PROF_ADD(pr_lin_proj, tp);
+
+    /* conv window and recurrent state are PER STREAM, so these stay per-stream calls even
+     * though the projections above batched. Each is one token, so the conv is a shift. */
+    double tc = PROF_T0();
+    for (int b = 0; b < B; b++)
+        linattn_conv_span(st[b]->ls[li].conv, mix + (int64_t)b * cd, L->conv_w, NULL,
+                          mix + (int64_t)b * cd, 1, cd, c->conv_k);
+    PROF_ADD(pr_lin_conv, tc);
+
+    float *g = falloc((int64_t)B * nv);
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < nv; h++) {
+            int64_t o = (int64_t)b * nv + h;
+            g[o] = -expf(L->A_log[h]) * linattn_softplus(aa[o] + L->dt_bias[h]);
+            bb[o] = 1.f / (1.f + expf(-bb[o]));
+        }
+
+    float *core = falloc((int64_t)B * vdim);
+    double ts = PROF_T0();
+    for (int b = 0; b < B; b++) {
+        const float *r = mix + (int64_t)b * cd;
+        linattn_scan(&st[b]->ls[li], r, r + kdim, r + 2 * kdim,
+                     g + (int64_t)b * nv, bb + (int64_t)b * nv,
+                     core + (int64_t)b * vdim, 1, c->lin_kh, nv, c->lin_kd, c->lin_vd);
+    }
+    PROF_ADD(pr_lin_scan, ts);
+
+    double to = PROF_T0();
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < nv; h++)
+            linattn_gated_norm(core + (int64_t)b * vdim + h * c->lin_vd,
+                               z + (int64_t)b * vdim + h * c->lin_vd, L->gnorm,
+                               c->lin_vd, c->eps);
+    resmm(m, out, core, L->w_out, L->d_w_out, B, vdim, D);
+    PROF_ADD(pr_lin_out, to);
+    free(mix); free(z); free(bb); free(aa); free(g); free(core);
+}
+
+/* logits[B][V] */
+static void forward_batch(Model *m, State **st, const int *tok, const int *pos, int B,
+                          float *logits) {
+    Cfg *c = &m->c;
+    int D = c->D, V = c->V;
+    float *x = falloc((int64_t)B * D), *xn = falloc((int64_t)B * D);
+    for (int b = 0; b < B; b++) {
+        if (m->res_dt == 1) {
+            const uint16_t *e = (const uint16_t *)m->embed + (int64_t)tok[b] * D;
+            for (int i = 0; i < D; i++) x[(int64_t)b * D + i] = bf16_f32(e[i]);
+        } else {
+            memcpy(x + (int64_t)b * D, (const float *)m->embed + (int64_t)tok[b] * D,
+                   (size_t)D * sizeof(float));
+        }
+    }
+    float *mo = falloc((int64_t)B * D);
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *L = &m->L[li];
+        for (int b = 0; b < B; b++)
+            rmsnorm_row(xn + (int64_t)b * D, x + (int64_t)b * D, L->ln1, D, c->eps);
+        if (c->is_linear[li]) linattn_batch(m, L, st, li, xn, B, mo);
+        else                  attn_batch(m, L, st, li, xn, pos, B, mo);
+        for (int64_t i = 0; i < (int64_t)B * D; i++) x[i] += mo[i];
+
+        for (int b = 0; b < B; b++)
+            rmsnorm_row(xn + (int64_t)b * D, x + (int64_t)b * D, L->ln2, D, c->eps);
+        moe_forward_rows(m, L, xn, B, mo);
+        for (int64_t i = 0; i < (int64_t)B * D; i++) x[i] += mo[i];
+    }
+    for (int b = 0; b < B; b++) st[b]->len = pos[b] + 1;
+
+    double tl = PROF_T0();
+    float *hn = falloc((int64_t)B * D);
+    for (int b = 0; b < B; b++)
+        rmsnorm_row(hn + (int64_t)b * D, x + (int64_t)b * D, m->norm, D, c->eps);
+    resmm(m, logits, hn, m->lm_head, m->d_lm_head, B, D, V);
+    PROF_ADD(pr_lmhead, tl);
+    free(x); free(xn); free(mo); free(hn);
+}
+
 static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *logits,
                     int logits_all) {
     Cfg *c = &m->c;
@@ -832,8 +1066,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
 
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, x + (int64_t)t * D, L->ln2, D, c->eps);
-        for (int t = 0; t < n; t++)
-            moe_forward(m, L, xn + (int64_t)t * D, mo + (int64_t)t * D);
+        moe_forward_rows(m, L, xn, n, mo);
         if (dbg) { char tg[16]; snprintf(tg, sizeof(tg), "moe%d", li); DUMP(tg, mo); }
         for (int64_t i = 0; i < (int64_t)n * D; i++) x[i] += mo[i];
         if (dbg) { char tg[16]; snprintf(tg, sizeof(tg), "layer%d", li); DUMP(tg, x); }
@@ -987,6 +1220,170 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     free(ids); free(lg); state_free(m, &s);
 }
 
+/* ---------- continuous batching (KV_SLOTS > 1) ----------
+ * The serial loop finishes one request before starting the next, so a second client waits out
+ * the first and the aggregate throughput BATCH measures is unreachable from the gateway. Here
+ * up to KV_SLOTS requests stay in flight: each owns a slot (KV for the attention layers,
+ * recurrent state + conv window for the linear ones), new arrivals prefill while others decode,
+ * and every ready slot advances one token per forward_batch.
+ *
+ * PREFIX REUSE, and why it is restricted here: an agent loop re-sends a growing context, so a
+ * slot usually already holds a prefix of the next request. Reusing it skips that prefill --
+ * which is worth a lot (a measured turn re-prefilled 4998 tokens to emit ONE token). But a
+ * recurrent state cannot be rewound: the state after n tokens does not contain the state after
+ * n-k, and the decay has already multiplied that information away. So reuse is allowed only
+ * when the new prompt EXTENDS what the slot holds exactly (lcp == hist_len). A divergence
+ * anywhere inside the held prefix forces a full recompute, even though the 10 attention layers
+ * could have been truncated. See docs/linear-attention.md.
+ *
+ * The invariant that makes this safe -- and whose violation silently corrupted laguna's reuse
+ * once -- is hist_len == the number of tokens actually fed through the model. History is
+ * appended when a token is FED, never when it is emitted. */
+typedef struct {
+    int used, ready;
+    char id[64];
+    State st;
+    int *hist, hist_len;            /* tokens whose K/V and recurrent state are in `st` */
+    int *ids, np, np_done;          /* the request's full prompt, and how much is prefilled */
+    int gen, max_tok, limited, cur;
+    float temp, top_p;
+    double t0;
+} SSlot;
+
+static int slot_prefix_reuse(SSlot *sl, const int *ids, int np) {
+    if (!sl->hist_len || sl->hist_len > np) return 0;
+    for (int i = 0; i < sl->hist_len; i++) if (sl->hist[i] != ids[i]) return 0;
+    return sl->hist_len;            /* pure extension: the whole held prefix matches */
+}
+
+static void serve_loop_batched(Model *m, Tok *T, int nslots) {
+    Cfg *c = &m->c;
+    int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+    int chunk = getenv("PREFILL_CHUNK") ? atoi(getenv("PREFILL_CHUNK")) : 256;
+    if (chunk < 1) chunk = 1;
+    SSlot *S = calloc(nslots, sizeof(SSlot));
+    for (int i = 0; i < nslots; i++) {
+        state_init(m, &S[i].st, ctx_max);
+        S[i].hist = malloc(sizeof(int) * ctx_max);
+    }
+    float *lg = falloc((int64_t)nslots * c->V);
+    State **sp = malloc(sizeof(State *) * nslots);
+    int *pos = malloc(sizeof(int) * nslots), *tk = malloc(sizeof(int) * nslots);
+    int *map = malloc(sizeof(int) * nslots);
+
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    g_rng ^= sd ? (uint64_t)strtoull(sd, NULL, 10) : (uint64_t)time(NULL) * 2654435761u;
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+
+    for (;;) {
+        int busy = 0;
+        for (int i = 0; i < nslots; i++) if (S[i].used) busy = 1;
+        /* block for work only when nothing is in flight, else poll so decode keeps moving */
+        if (!busy && !g_qn) { if (serve_read_cmd(NULL) < 0) break; }
+        while (stdin_readable()) if (serve_read_cmd(NULL) < 0) goto done;
+
+        /* --- admit --- */
+        while (g_qn) {
+            int free_i = -1;
+            for (int i = 0; i < nslots && free_i < 0; i++) if (!S[i].used) free_i = i;
+            if (free_i < 0) break;
+            SReq q = g_q[0];
+            memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+            if (serve_take_cancel(q.id)) {
+                printf("DONE %s STAT 0 0.000 100.0 %.2f 0 0\n", q.id, rss_gb());
+                fflush(stdout); free(q.payload); continue;
+            }
+            int cap = q.plen + 16;
+            int *ids = malloc((size_t)cap * sizeof(int));
+            int np = tok_encode(T, q.payload, q.plen, ids, cap);
+            free(q.payload);
+            if (np <= 0 || np + q.max_tok > ctx_max) {
+                printf("ERROR %s %s\n", q.id, np <= 0 ? "empty prompt" : "context exceeds CTX_MAX");
+                fflush(stdout); free(ids); continue;
+            }
+            /* prefer the slot that already holds the longest usable prefix */
+            int best = free_i, best_reuse = 0;
+            for (int i = 0; i < nslots; i++) {
+                if (S[i].used) continue;
+                int r = slot_prefix_reuse(&S[i], ids, np);
+                if (r > best_reuse) { best_reuse = r; best = i; }
+            }
+            SSlot *sl = &S[best];
+            if (!best_reuse) {                       /* fresh state; nothing reusable */
+                state_free(m, &sl->st);
+                state_init(m, &sl->st, ctx_max);
+                sl->hist_len = 0;
+            }
+            sl->used = 1; sl->ready = 0;
+            snprintf(sl->id, sizeof(sl->id), "%s", q.id);
+            sl->ids = ids; sl->np = np; sl->np_done = best_reuse;
+            sl->gen = 0; sl->max_tok = q.max_tok; sl->limited = 1;
+            sl->temp = q.temp; sl->top_p = q.top_p; sl->t0 = now_s();
+            if (best_reuse)
+                fprintf(stderr, "[qwen35] slot %d reused %d/%d prompt tokens\n",
+                        best, best_reuse, np);
+        }
+
+        /* --- chunked prefill: one chunk per slot per pass, so decode is not starved --- */
+        for (int i = 0; i < nslots; i++) {
+            SSlot *sl = &S[i];
+            if (!sl->used || sl->ready) continue;
+            int take = sl->np - sl->np_done;
+            if (take > chunk) take = chunk;
+            forward(m, &sl->st, sl->ids + sl->np_done, take, sl->np_done,
+                    lg + (int64_t)i * c->V, 0);
+            for (int j = 0; j < take; j++) sl->hist[sl->hist_len++] = sl->ids[sl->np_done + j];
+            sl->np_done += take;
+            if (sl->np_done >= sl->np) sl->ready = 1;   /* logits for the last position are live */
+        }
+
+        /* --- one decode step for every ready slot, in lockstep --- */
+        int B = 0;
+        for (int i = 0; i < nslots; i++) {
+            SSlot *sl = &S[i];
+            if (!sl->used || !sl->ready) continue;
+            const float *l = lg + (int64_t)i * c->V;
+            int t = sample_logits(l, c->V, sl->temp, sl->top_p);
+            int is_eos = 0;
+            for (int e = 0; e < c->n_eos; e++) if (t == c->eos[e]) is_eos = 1;
+            int cancelled = serve_take_cancel(sl->id);
+            if (is_eos || cancelled || sl->gen >= sl->max_tok) {
+                double dt = now_s() - sl->t0;
+                printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", sl->id, sl->gen,
+                       dt > 0 ? sl->gen / dt : 0.0, 100.0, rss_gb(), sl->np,
+                       (is_eos || cancelled) ? 0 : sl->limited);
+                fflush(stdout);
+                free(sl->ids); sl->ids = NULL;
+                sl->used = 0; sl->ready = 0;
+                continue;
+            }
+            char buf[512];
+            int nb = tok_decode(T, &t, 1, buf, sizeof(buf) - 1);
+            printf("DATA %s %d\n", sl->id, nb);
+            fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout); fflush(stdout);
+            sl->gen++;
+            sl->cur = t;
+            sp[B] = &sl->st; tk[B] = t; pos[B] = sl->hist_len; map[B] = i;
+            sl->hist[sl->hist_len++] = t;      /* fed below: history tracks FED tokens */
+            B++;
+        }
+        if (B) {
+            float *blg = falloc((int64_t)B * c->V);
+            forward_batch(m, sp, tk, pos, B, blg);
+            for (int b = 0; b < B; b++)
+                memcpy(lg + (int64_t)map[b] * c->V, blg + (int64_t)b * c->V,
+                       (size_t)c->V * sizeof(float));
+            free(blg);
+        }
+    }
+done:
+    for (int i = 0; i < nslots; i++) { state_free(m, &S[i].st); free(S[i].hist); free(S[i].ids); }
+    free(S); free(lg); free(sp); free(pos); free(tk); free(map);
+}
+
 static void serve_loop(Model *m, Tok *T) {
     setvbuf(stdin, NULL, _IONBF, 0);
     const char *sd = getenv("SEED");
@@ -1049,9 +1446,116 @@ int main(int argc, char **argv) {
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok Ts; tok_load(&Ts, tkp);
-        fprintf(stderr, "[qwen35] serve: serial (no batching), %d stop tokens\n", m.c.n_eos);
-        printf("serve: serial\n"); fflush(stdout);
-        serve_loop(&m, &Ts);
+        int nslots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
+        if (nslots < 1) nslots = 1;
+        if (nslots > SRV_QMAX) nslots = SRV_QMAX;
+        int ctxm = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+        fprintf(stderr, "[qwen35] serve: %s (KV_SLOTS=%d), %d stop tokens, "
+                "state %.2f GB/slot at %d ctx\n",
+                nslots > 1 ? "continuous batching" : "serial", nslots, m.c.n_eos,
+                state_bytes(&m, ctxm) / 1e9, ctxm);
+        printf("serve: %s (KV_SLOTS=%d)\n", nslots > 1 ? "batched" : "serial", nslots);
+        fflush(stdout);
+        if (nslots > 1) serve_loop_batched(&m, &Ts, nslots);
+        else serve_loop(&m, &Ts);
+        return 0;
+    }
+
+    /* ---- BATCH throughput bench ----
+     * BATCH=N decodes N streams in lockstep. Two modes, and the difference matters:
+     *   BATCH=N            N identical copies of the prompt. Every stream MUST reproduce the
+     *                      single-stream greedy output, which is the correctness assertion --
+     *                      but identical streams route to identical experts, so grouping
+     *                      collapses to top-k and OVERSTATES throughput.
+     *   BATCH=N BATCH_VARY=1  streams seeded to diverge, so experts actually differ. This is
+     *                      the honest throughput number; correctness is not asserted because
+     *                      the streams are meant to differ. */
+    if (getenv("BATCH")) {
+        int B = atoi(getenv("BATCH"));
+        if (B < 1) B = 1;
+        if (B > 64) B = 64;
+        int vary = getenv("BATCH_VARY") != NULL;
+        Tok Tb;
+        char tpb[1024];
+        snprintf(tpb, sizeof(tpb), "%s/tokenizer.json", snap);
+        tok_load(&Tb, tpb);
+        long tnb = 0;
+        char *txt = pfile ? read_file(pfile, &tnb) : (prompt ? strdup(prompt) : NULL);
+        if (!txt) { fprintf(stderr, "BATCH needs -f or -p\n"); return 1; }
+        int capb = (int)tnb + 16;
+        int *pids = malloc(sizeof(int) * capb);
+        int npb = tok_encode(&Tb, txt, (int)tnb, pids, capb);
+        int ctxb = npb + n_gen + 8;
+
+        /* reference: the same prompt decoded alone, greedily */
+        State rs;
+        state_init(&m, &rs, ctxb);
+        float *rl = falloc(m.c.V);
+        int *ref = malloc(sizeof(int) * n_gen);
+        forward(&m, &rs, pids, npb, 0, rl, 0);
+        for (int i = 0; i < n_gen; i++) {
+            int a = 0;
+            for (int v = 1; v < m.c.V; v++) if (rl[v] > rl[a]) a = v;
+            ref[i] = a;
+            if (i + 1 < n_gen) forward(&m, &rs, &a, 1, npb + i, rl, 0);
+        }
+        state_free(&m, &rs);
+        free(rl);
+
+        State *sl = calloc(B, sizeof(State));
+        State **sp = malloc(sizeof(State *) * B);
+        int *pos = malloc(sizeof(int) * B), *tk = malloc(sizeof(int) * B);
+        uint64_t *rs2 = malloc(sizeof(uint64_t) * B);
+        float *lg = falloc((int64_t)B * m.c.V);
+        int **got = malloc(sizeof(int *) * B);
+        for (int b = 0; b < B; b++) {
+            state_init(&m, &sl[b], ctxb);
+            sp[b] = &sl[b];
+            got[b] = malloc(sizeof(int) * n_gen);
+            rs2[b] = 0x9E3779B97F4A7C15ULL * (uint64_t)(b + 1);
+        }
+        double tpre = now_s();
+        for (int b = 0; b < B; b++)                /* prefill each stream */
+            forward(&m, sp[b], pids, npb, 0, lg + (int64_t)b * m.c.V, 0);
+        double pre_s = now_s() - tpre;
+        for (int b = 0; b < B; b++) pos[b] = npb;
+
+        prof_reset();
+        double td = now_s();
+        for (int i = 0; i < n_gen; i++) {
+            for (int b = 0; b < B; b++) {
+                const float *l = lg + (int64_t)b * m.c.V;
+                int a = 0;
+                for (int v = 1; v < m.c.V; v++) if (l[v] > l[a]) a = v;
+                if (vary) {                        /* nudge each stream off the greedy path */
+                    rs2[b] = rs2[b] * 6364136223846793005ULL + 1442695040888963407ULL;
+                    if (i > 0 && (rs2[b] >> 33) % 4 == 0) {
+                        int alt = (int)((rs2[b] >> 13) % (uint64_t)m.c.V);
+                        a = alt;
+                    }
+                }
+                got[b][i] = a;
+                tk[b] = a;
+            }
+            forward_batch(&m, sp, tk, pos, B, lg);
+            for (int b = 0; b < B; b++) pos[b]++;
+        }
+        double dt = now_s() - td;
+        fprintf(stderr, "[qwen35] BATCH=%d%s prompt=%d tok: prefill %.2fs (%.1f tok/s over %d "
+                "streams), decode %d steps in %.2fs = %.2f tok/s aggregate (%.2f per stream)\n",
+                B, vary ? " BATCH_VARY" : "", npb, pre_s, B * npb / pre_s, B, n_gen, dt,
+                B * n_gen / dt, n_gen / dt);
+        prof_report("batched decode", dt, n_gen);
+        if (!vary) {
+            int bad = 0;
+            for (int b = 0; b < B; b++)
+                for (int i = 0; i < n_gen; i++)
+                    if (got[b][i] != ref[i]) bad++;
+            fprintf(stderr, "[qwen35] BATCH correctness: %d/%d stream-tokens differ from the "
+                    "single-stream reference -- %s\n", bad, B * n_gen, bad ? "FAIL" : "OK");
+            if (bad) return 1;
+        }
+        for (int b = 0; b < B; b++) { state_free(&m, &sl[b]); free(got[b]); }
         return 0;
     }
 
