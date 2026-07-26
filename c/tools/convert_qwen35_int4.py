@@ -264,8 +264,13 @@ def convert(indir, outdir, xbits, watch=False, vision=False):
             kind = layer_types[li]
             names = layer_tensor_names(src_pre, kind)
             # ready only when the expert blobs and the mixer's own weights have landed
-            need = [f"{src_pre}.mlp.experts.gate_up_proj", f"{src_pre}.mlp.experts.down_proj",
-                    f"{src_pre}.input_layernorm.weight"]
+            fused = f"{src_pre}.mlp.experts.gate_up_proj" in have
+            # save_pretrained writes the per-expert layout even for checkpoints whose
+            # runtime module holds them fused, so a locally-saved model (e.g. the tiny
+            # oracle from make_tiny_qwen35.py) arrives in the older shape. Accept either.
+            need = [f"{src_pre}.input_layernorm.weight"]
+            need += [f"{src_pre}.mlp.experts.gate_up_proj", f"{src_pre}.mlp.experts.down_proj"] \
+                if fused else [f"{src_pre}.mlp.experts.{E-1}.down_proj.weight"]
             need += [f"{src_pre}.linear_attn.in_proj_qkv.weight"] if kind == "linear_attention" \
                 else [f"{src_pre}.self_attn.q_proj.weight"]
             if not all(n in have for n in need):
@@ -274,12 +279,18 @@ def convert(indir, outdir, xbits, watch=False, vision=False):
             pool = ShardPool(smap); out = {}
             copy_plain(pool, out, names)
             if xbits:
-                quant_experts_fused(pool, f"{src_pre}.mlp.experts",
-                                    f"model.layers.{li}.mlp.experts", E, xbits, out)
-            else:
-                for s in ("gate_up_proj", "down_proj"):
-                    n = f"{src_pre}.mlp.experts.{s}"
+                (quant_experts_fused if fused else quant_experts_per_expert)(
+                    pool, f"{src_pre}.mlp.experts", f"model.layers.{li}.mlp.experts",
+                    E, xbits, out)
+            elif fused:
+                for suf in ("gate_up_proj", "down_proj"):
+                    n = f"{src_pre}.mlp.experts.{suf}"
                     out[dst_name(n)] = pool.get(n)
+            else:
+                for e in range(E):
+                    for suf in ("gate_proj", "up_proj", "down_proj"):
+                        n = f"{src_pre}.mlp.experts.{e}.{suf}.weight"
+                        out[dst_name(n)] = pool.get(n)
             save_file(out, dst + ".tmp"); os.replace(dst + ".tmp", dst)
             pool.close()
             print(f"out-layer-{li:03d}.safetensors [{kind:17s}] "

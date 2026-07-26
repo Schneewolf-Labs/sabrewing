@@ -176,9 +176,38 @@ per call). Qwen3.5 makes that whole tier disappear. Between that and O(1) recurr
 is the first supported model where the CPU expert path and the KV-capacity wall both stop being
 constraints on the same box.
 
-## To actually run the model
+## The engine
 
-Remaining: a `MoeSharedMode` variant for the sigmoid-gated shared expert
+`c/qwen35.c` runs it. **Token-exact against transformers** on the tiny oracle
+(`make qwen35-test`): 36/36 teacher forcing, 24/24 greedy, perplexity to four decimals.
+The int4 path is validated separately by dequantizing the container in Python and re-scoring
+with transformers — C reproduces that digit-for-digit (ppl 99.7712 both sides, 10/36 both
+sides on the tiny model, where int4 damage is large because 64-wide rows of random weights
+have no redundancy to absorb it).
+
+Real model, CPU only, 21.7 GB container: loads in 7.1 s at 19.7 GB RSS, prefill 30.3 tok/s,
+**decode 6.66 tok/s** — already above Laguna's ~4 tok/s, with no CUDA tier written yet.
+
+Two bugs found on the way to exactness, both from misreading the reference rather than from
+faulty logic, and both worth recording because neither produces obviously-broken output:
+
+1. **`Qwen3_5MoeRMSNorm` scales by `(1 + weight)`, not `weight`** — while
+   `Qwen3_5MoeRMSNormGated` (the linear-attn norm) uses `weight` directly. Two conventions in
+   one model, which is exactly why the standalone gated-delta-net check passed while the
+   engine scored 0/36 at ppl 254. The `+1` is folded in at load so the shared `rmsnorm_row`
+   kernel stays untouched.
+2. **`sdpa_head`'s `tau` is a score multiplier, not a softcap** (`sc = tau*(dot*scale+bias)`).
+   Passing `0` for "no cap" zeroed every score, turning attention into a uniform mean over V.
+   Qwen3.5 has no logit cap, so `tau = 1`.
+
+Also needed: `tok.h` learned the older space-separated merge format (`"Ġ Ġ"`) that Qwen3.5
+still ships, alongside the pair-array form it already handled.
+
+## Still to do
+
+Batching and the CUDA tier are not written: this is a single-stream engine, so none of the
+serving levers (continuous batching, group-by-expert GEMM, prefix caching) apply to it yet,
+and neither does the MTP draft head. Also missing: a `MoeSharedMode` variant for the sigmoid-gated shared expert
 (`sigmoid(shared_expert_gate(x)) * shared(x)`, added to the routed sum — the router is plain
 softmax → top-8 → renormalize, with no correction bias and no route scale, so `route_scale` is
 1.0); the full-attention layers, which need a **per-element** output gate (`q_proj` emits

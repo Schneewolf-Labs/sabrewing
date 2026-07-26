@@ -295,6 +295,15 @@ inkling$(EXE): inkling.c st.h lora.h tok.h json.h compat.h $(INK_CUDA_OBJ)
 laguna$(EXE): laguna.c st.h tok.h json.h compat.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) laguna.c $(LAG_CUDA_OBJ) -o laguna$(EXE) $(LDFLAGS)
 
+# Qwen3.5-MoE: gated-delta-net linear attention on 3/4 of layers. CPU only for now.
+qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_quant.h
+	$(CC) $(CFLAGS) qwen35.c -o qwen35$(EXE) $(LDFLAGS)
+
+# Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)
+qwen35-test: qwen35$(EXE)
+	@if [ ! -f tiny_qwen35/ref_qwen35.json ]; then $(PYTHON) tools/make_tiny_qwen35.py tiny_qwen35; fi
+	SNAP=tiny_qwen35 ./qwen35$(EXE) tiny_qwen35/ref_qwen35.json
+
 # MoE-runtime shared-kernel harness: validates moe_quant.h against a double
 # dequant reference (the quant kernels the f32 oracle can't cover). See
 # docs/moe-runtime-plan.md.
@@ -474,4 +483,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
+.PHONY: all colibri qwen35 qwen35-test glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
