@@ -204,6 +204,39 @@ faulty logic, and both worth recording because neither produces obviously-broken
 Also needed: `tok.h` learned the older space-separated merge format (`"Ġ Ġ"`) that Qwen3.5
 still ships, alongside the pair-array form it already handled.
 
+## Serving, and what it costs
+
+`SERVE=1` puts `qwen35.c` on the same stdin/stdout protocol as the other engines, so the
+gateway drives it:
+
+```sh
+CTX_MAX=16384 python3 openai_server.py --model /path/to/qwen35_i4 --engine ./qwen35 --port 8099
+```
+
+`openai_server.py` gained `ARCH=qwen35`: a renderer that **byte-matches the shipped
+chat_template.jinja** (verified against `apply_chat_template` across 10 cases — plain,
+system, multi-turn, tools, tool-call + multiple results, thinking on and off), a reasoning
+splitter, and a tool-call parser for Qwen3.5's `<function=>`/`<parameter=>` syntax, which is
+neither GLM's `arg_key`/`arg_value` nor Qwen3's JSON-in-`<tool_call>`. Serving is **serial** —
+one request at a time, no slot pool, no prefix reuse.
+
+Driven from egirl (agent loop, tools, memory) it works end to end: native tool call parsed,
+executed, fed back, answered in 2 turns. The cost is where the design predicted:
+
+| turn | input tok | output tok | wall |
+|---|---|---|---|
+| 1 (tool call) | 4928 | 59 | 256 s |
+| 2 (final answer) | 4998 | 1 | 249 s |
+
+**Turn 2 re-prefilled 4998 tokens to emit one token.** Prefill is ~19 tok/s at these lengths
+(not the 30 tok/s a 22-token prompt shows), and nothing is reused between turns, so an agent
+loop pays for its whole context on every step. Prefix reuse is the single biggest lever here
+and it is worth more on this architecture than on Laguna: the linear layers' share of the
+snapshot is a fixed 67 MB blob with no ring and no per-position bookkeeping. What makes it
+non-trivial is the asymmetry in the section above — the 10 attention layers can be truncated
+on divergence, the 30 recurrent ones cannot, so one cache holds two data structures with two
+reuse rules.
+
 ## Still to do
 
 Batching and the CUDA tier are not written: this is a single-stream engine, so none of the

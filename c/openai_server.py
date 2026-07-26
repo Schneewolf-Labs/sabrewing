@@ -562,6 +562,177 @@ def split_laguna(text):
     return text, ""
 
 
+
+# ---------------------------------------------------------------- Qwen3.5-MoE
+# Byte-matched against the shipped chat_template.jinja. Qwen3.5 does NOT use GLM's
+# <arg_key>/<arg_value> form: a call is
+#   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>
+# and tool RESULTS come back as a *user* turn wrapping <tool_response>. Both differ from
+# every other arch here, so Qwen3.5 gets its own renderer and parser rather than a flag.
+Q35_TOOL_RULES = (
+    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:"
+    "\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+    "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+    "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> block "
+    "must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language BEFORE the "
+    "function call, but NOT after\n- If there is no function call available, answer the question "
+    "like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>"
+)
+
+
+def _q35_text(content):
+    """Flatten OpenAI content (string or part list) to text; Qwen3.5 vision is unsupported here."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    out = []
+    for part in content:
+        if isinstance(part, dict):
+            if part.get("type") in (None, "text") and part.get("text"):
+                out.append(part["text"])
+            elif "image" in part or part.get("type") in ("image", "image_url"):
+                raise APIError(400, "this engine builds the text tower only: image input is "
+                                    "not supported.", "messages")
+        elif isinstance(part, str):
+            out.append(part)
+    return "".join(out)
+
+
+def render_chat_qwen35(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Render Qwen3.5-MoE's chat template (text-only subset)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
+
+    sys_msg = messages[0] if messages[0].get("role") == "system" else None
+    sys_text = _q35_text(sys_msg.get("content")).strip() if sys_msg else ""
+    out = []
+    if tools:
+        out.append("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>")
+        for tool in tools:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+            out.append("\n" + json.dumps({"type": "function", "function": clean}, ensure_ascii=False)
+                       if tool.get("type") == "function" else "\n" + json.dumps(clean, ensure_ascii=False))
+        out.append("\n</tools>")
+        out.append(Q35_TOOL_RULES)
+        if sys_text:
+            out.append("\n\n" + sys_text)
+        out.append("<|im_end|>\n")
+    elif sys_text:
+        out.append("<|im_start|>system\n" + sys_text + "<|im_end|>\n")
+
+    body = messages[1:] if sys_msg else messages
+    # The template only re-emits <think> blocks for assistant turns AFTER the last real user
+    # query; earlier reasoning is dropped. Find that boundary the same way it does.
+    last_query = -1
+    for i, msg in enumerate(body):
+        if msg.get("role") != "user":
+            continue
+        txt = _q35_text(msg.get("content")).strip()
+        if not (txt.startswith("<tool_response>") and txt.endswith("</tool_response>")):
+            last_query = i
+    prev_role = None
+    for i, msg in enumerate(body):
+        role = msg.get("role")
+        content = _q35_text(msg.get("content")).strip()
+        if role == "user":
+            out.append("<|im_start|>user\n" + content + "<|im_end|>\n")
+        elif role == "assistant":
+            reasoning = msg.get("reasoning_content") or ""
+            if not isinstance(reasoning, str):
+                reasoning = ""
+            if not reasoning and "</think>" in content:
+                head, _, tail = content.partition("</think>")
+                reasoning = head.rsplit("<think>", 1)[-1].strip("\n")
+                content = tail.lstrip("\n")
+            reasoning = reasoning.strip()
+            if i > last_query:
+                out.append("<|im_start|>assistant\n<think>\n" + reasoning + "\n</think>\n\n" + content)
+            else:
+                out.append("<|im_start|>assistant\n" + content)
+            for j, call in enumerate(msg.get("tool_calls") or []):
+                fn = call.get("function", call)
+                args = fn.get("arguments") or "{}"
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        args = {}
+                lead = "\n\n" if (j == 0 and content.strip()) else ("\n" if j else "")
+                out.append(lead + "<tool_call>\n<function=" + str(fn.get("name", "")) + ">\n")
+                for key, val in (args or {}).items():
+                    if not isinstance(val, str):
+                        val = json.dumps(val, ensure_ascii=False)
+                    out.append("<parameter=" + str(key) + ">\n" + val + "\n</parameter>\n")
+                out.append("</function>\n</tool_call>")
+            out.append("<|im_end|>\n")
+        elif role in ("tool", "function"):
+            # tool results are a USER turn wrapping <tool_response>; consecutive results share it
+            if prev_role not in ("tool", "function"):
+                out.append("<|im_start|>user")
+            out.append("\n<tool_response>\n" + content + "\n</tool_response>")
+            nxt = body[i + 1].get("role") if i + 1 < len(body) else None
+            if nxt not in ("tool", "function"):
+                out.append("<|im_end|>\n")
+        elif role == "system":
+            raise APIError(400, "system message must be first.", "messages")
+        else:
+            raise APIError(400, f"unexpected message role {role!r}.", "messages")
+        prev_role = role
+
+    out.append("<|im_start|>assistant\n")
+    # The template PREFILLS the opening <think>, so generation starts inside the reasoning
+    # block and the model emits only the closing tag. split_qwen35 relies on this.
+    out.append("<think>\n\n</think>\n\n" if not enable_thinking else "<think>\n")
+    return "".join(out)
+
+
+def split_qwen35(text):
+    """Reasoning ends at </think>. The opening tag was prefilled into the prompt, so output
+    normally has no <think> of its own -- everything up to </think> is reasoning."""
+    if "</think>" in text:
+        reasoning, _, content = text.partition("</think>")
+        return content.lstrip("\n"), reasoning.replace("<think>", "").strip()
+    return text, ""
+
+
+_Q35_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+_Q35_FN_RE = re.compile(r"<function=([^>\s]+)\s*>(.*)", re.S)
+_Q35_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\n?(.*?)\n?</parameter>", re.S)
+
+
+def parse_tool_calls_qwen35(reply, tools=None):
+    """Return (content, tool_calls) for Qwen3.5's <function=>/<parameter=> syntax."""
+    types = _tool_param_types(tools)
+    calls = []
+    for box in _Q35_CALL_RE.finditer(reply):
+        fn = _Q35_FN_RE.match(box.group(1).strip())
+        if not fn:
+            continue
+        name = fn.group(1)
+        args = {}
+        for prm in _Q35_PARAM_RE.finditer(fn.group(2)):
+            args[prm.group(1)] = _coerce_arg(prm.group(2), types.get(name, {}).get(prm.group(1)))
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if tools and not calls and "<tool_call>" in reply:
+        sys.stderr.write("[api] qwen35: tool_call markers present but nothing parsed -- "
+                         "output may be quantization-mangled\n")
+        sys.stderr.flush()
+    return _Q35_CALL_RE.sub("", reply).strip(), calls
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
@@ -1576,9 +1747,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     text, reasoning = split_inkling(text)
                 elif ARCH == "laguna":
                     text, reasoning = split_laguna(text)
+                elif ARCH == "qwen35":
+                    text, reasoning = split_qwen35(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
+                                      else parse_tool_calls)(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -1696,7 +1870,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     lambda: not connected, grammar=grammar)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
+                                   else parse_tool_calls)("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -1765,7 +1940,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = {"inkling": render_chat_inkling, "laguna": render_chat_laguna}.get(ARCH, render_chat)
+        renderer = {"inkling": render_chat_inkling, "laguna": render_chat_laguna,
+                    "qwen35": render_chat_qwen35}.get(ARCH, render_chat)
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
@@ -1825,7 +2001,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_tool_calls(text, tools)
+                text, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
+                               else parse_tool_calls)(text, tools)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -2053,7 +2230,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "laguna"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "laguna", "qwen35"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--lora", default=os.environ.get("LORA"),
                         help="LoRA adapter directory (Tinker raw format; inkling engine only)")
@@ -2076,11 +2253,13 @@ def main():
         try:
             with open(Path(args.model) / "config.json") as fh:
                 mt = json.load(fh).get("model_type") or ""
-                ARCH = "inkling" if "inkling" in mt else "laguna" if "laguna" in mt else "glm"
+                ARCH = ("inkling" if "inkling" in mt else "laguna" if "laguna" in mt
+                        else "qwen35" if "qwen3_5" in mt or "qwen35" in mt else "glm")
         except OSError:
             ARCH = "glm"
     if args.model_id is None:
-        args.model_id = {"inkling": "inkling-colibri", "laguna": "laguna-s-2.1-colibri"}.get(ARCH, "glm-5.2-colibri")
+        args.model_id = {"inkling": "inkling-colibri", "laguna": "laguna-s-2.1-colibri",
+                         "qwen35": "qwen3.5-35b-a3b-sabrewing"}.get(ARCH, "glm-5.2-colibri")
     if args.lora:
         # the engine reads LORA from its environment (serve-mode twin of -l)
         os.environ["LORA"] = str(args.lora)

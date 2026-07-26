@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "compat.h"
 #include "json.h"
@@ -41,6 +42,7 @@
 #include "moe_attn.h"
 #include "moe_linattn.h"
 #include "moe_sample.h"
+#include "moe_serve.h"
 #include "st.h"
 #include "tok.h"
 
@@ -59,6 +61,7 @@ typedef struct {
     float inv[256];                            /* rotary inverse frequencies */
     int rdim;                                  /* rotated dims per head (<= head_dim) */
     int ctx_max;
+    int eos[8], n_eos;                         /* stop tokens (generation_config.json) */
 } Cfg;
 
 typedef struct {
@@ -176,6 +179,31 @@ static void cfg_load(Cfg *c, const char *dir) {
         c->inv[j] = 1.0f / powf(theta, (float)(2 * j) / (float)c->rdim);
 
     c->ctx_max = (int)jnum(o, "max_position_embeddings", 4096);
+
+    /* Stop tokens. generation_config.json is authoritative and lists BOTH <|im_end|>
+     * (end of an assistant turn) and <|endoftext|>; config.json's single eos_token_id
+     * would stop only on the latter, so a chat turn would never terminate. Accept a
+     * scalar or an array from either file. */
+    c->n_eos = 0;
+    for (int pass = 0; pass < 2 && !c->n_eos; pass++) {
+        jval *src = NULL; char *gbuf = NULL; char *garena = NULL;
+        if (pass == 0) {
+            char gp[1024]; snprintf(gp, sizeof(gp), "%s/generation_config.json", dir);
+            FILE *gf = fopen(gp, "rb");
+            if (gf) {
+                fseek(gf, 0, SEEK_END); long gn = ftell(gf); fseek(gf, 0, SEEK_SET);
+                gbuf = malloc(gn + 1);
+                if (fread(gbuf, 1, gn, gf) == (size_t)gn) { gbuf[gn] = 0; src = json_parse(gbuf, &garena); }
+                fclose(gf);
+            }
+        } else src = o;
+        jval *e = src ? json_get(src, "eos_token_id") : NULL;
+        if (e && e->t == J_NUM) c->eos[c->n_eos++] = (int)e->num;
+        else if (e && e->t == J_ARR)
+            for (int i = 0; i < e->len && c->n_eos < 8; i++)
+                if (e->kids[i]->t == J_NUM) c->eos[c->n_eos++] = (int)e->kids[i]->num;
+        free(gbuf); free(garena);
+    }
     free(buf); free(arena);
 }
 
@@ -692,6 +720,75 @@ static int run_oracle(Model *m, const char *ref_path) {
     return !ok;
 }
 
+/* ---------- serve mode: the openai_server.py gateway protocol ----------
+ * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n / CANCEL <id>
+ * stdout: READY sentinel + STAT, then DATA <id> <n>\n<bytes>\n frames and
+ *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <limited>\n
+ * SReq, the submit queue, stdin_readable and serve_read_cmd are shared (moe_serve.h).
+ *
+ * Serial only: one request finishes before the next starts. qwen35.c has no continuous
+ * batching (no slot pool, no group-by-expert GEMM), so `slot` is ignored and there is no
+ * prefix reuse -- every request re-prefills. That is the honest state; see
+ * docs/linear-attention.md for why the recurrent state makes reuse cheap but rewind
+ * impossible, which is the design that has to land before batching is worth writing. */
+static void serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+    if (np + q->max_tok > ctx_max) {
+        printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+
+    State s; state_init(m, &s, np + q->max_tok + 8);
+    float *lg = falloc(c->V);
+    double t0 = now_s();
+    forward(m, &s, ids, np, 0, lg, 0);
+    char buf[512];
+    int gen = 0, limited = 1, pos = np, cancelled = 0;
+    for (int i = 0; i < q->max_tok && !cancelled; i++) {
+        int tk = sample_logits(lg, c->V, q->temp, q->top_p);
+        int is_eos = 0;
+        for (int e = 0; e < c->n_eos; e++) if (tk == c->eos[e]) is_eos = 1;
+        if (is_eos) { limited = 0; break; }
+        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf) - 1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout); fputc('\n', stdout); fflush(stdout);
+        gen++;
+        forward(m, &s, &tk, 1, pos, lg, 0); pos++;
+        while (stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); free(lg); state_free(m, &s); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+    }
+    double dt = now_s() - t0;
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen / dt : 0.0, 100.0, rss_gb(), np, limited);
+    printf("PROF %.3f %d %d 0.000 0.000 %.3f 0.000 0.000 %d\n", dt, np, gen, dt, gen + 1);
+    fflush(stdout);
+    free(ids); free(lg); state_free(m, &s);
+}
+
+static void serve_loop(Model *m, Tok *T) {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    g_rng ^= sd ? (uint64_t)strtoull(sd, NULL, 10) : (uint64_t)time(NULL) * 2654435761u;
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
+        if (serve_take_cancel(q.id)) {
+            printf("DONE %s STAT 0 0.000 100.0 %.2f 0 0\n", q.id, rss_gb()); fflush(stdout);
+        } else serve_one(m, T, &q);
+        free(q.payload);
+    }
+}
+
 /* ---------- main ---------- */
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
@@ -716,6 +813,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[qwen35] loaded in %.1fs (rss %.1f GB)\n", now_s() - t0, rss_gb());
 
     if (ref) { g_exact = 1; return run_oracle(&m, ref); }
+
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok Ts; tok_load(&Ts, tkp);
+        fprintf(stderr, "[qwen35] serve: serial (no batching), %d stop tokens\n", m.c.n_eos);
+        printf("serve: serial\n"); fflush(stdout);
+        serve_loop(&m, &Ts);
+        return 0;
+    }
 
     /* generation: tokenize, prefill, decode greedily or by sampling */
     Tok T;
@@ -750,6 +856,9 @@ int main(int argc, char **argv) {
         int nxt = temp > 0 ? sample_logits(lg, c->V, temp, top_p)
                            : ({ int a = 0; for (int v = 1; v < c->V; v++) if (lg[v] > lg[a]) a = v; a; });
         (void)rng;
+        int stop = 0;
+        for (int e = 0; e < c->n_eos; e++) if (nxt == c->eos[e]) stop = 1;
+        if (stop) break;
         int one = nxt;
         if (tok_decode(&T, &one, 1, buf, sizeof(buf)) > 0) { fputs(buf, stdout); fflush(stdout); }
         if (i + 1 < n_gen) forward(&m, &s, &nxt, 1, np + i, lg, 0);
