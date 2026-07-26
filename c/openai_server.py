@@ -1023,6 +1023,7 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 class Engine:
     def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
+        self.model = model            # snapshot dir; /tokenize reads its tokenizer.json
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         self.process = subprocess.Popen(
@@ -1251,6 +1252,26 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self._tok = False          # False = not tried yet, None = unavailable
+
+    def hf_tokenizer(self):
+        """Tokenizer for /tokenize, loaded from the model's own tokenizer.json.
+
+        Optional by design: the inference path never needs it (the engine tokenizes),
+        it only serves clients that want exact token counts for context fitting. If the
+        `tokenizers` package or the file is missing we return None and /tokenize 404s,
+        which is what those clients already fall back from."""
+        if self._tok is not False:
+            return self._tok
+        self._tok = None
+        try:
+            from tokenizers import Tokenizer
+            path = Path(self.engine.model) / "tokenizer.json"
+            if path.is_file():
+                self._tok = Tokenizer.from_file(str(path))
+        except Exception as exc:      # missing package, unreadable file, bad json
+            sys.stderr.write(f"[api] /tokenize unavailable: {exc}\n")
+        return self._tok
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1342,8 +1363,32 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Request body must be a JSON object.")
         return body
 
+    # llama.cpp's /tokenize, because clients use it to fit a context window and the
+    # alternative is guessing. egirl falls back to len/3.5 when this 404s, which is off by
+    # 20-30% on code — the sort of error that turns "fits in 32k" into a mid-run retrim.
+    # Uses the tokenizer.json the model already ships. The `tokenizers` package is
+    # optional: without it we 404 exactly as before and clients keep estimating, so this
+    # never becomes a hard dependency of the gateway.
+    def tokenize(self, body, request_id):
+        content = body.get("content")
+        if not isinstance(content, str):
+            raise APIError(400, "`content` must be a string.", "content")
+        tok = self.server.hf_tokenizer()
+        if tok is None:
+            raise APIError(404, "Not found.", None, "not_found")
+        ids = tok.encode(content, add_special_tokens=bool(body.get("add_special", False))).ids
+        self.send_json(200, {"tokens": ids}, request_id)
+
     def check_model(self, body):
+        # A single-model server has nothing to disambiguate, so an ABSENT `model` means
+        # "the one you serve" — llama.cpp behaves this way and clients written against it
+        # (egirl's provider, for one) omit the field entirely. Rejecting that with a 404
+        # for model `None` is a bad error for a request that was unambiguous. A model name
+        # that is present but wrong is still a 404, since that request asked for something
+        # this server does not have.
         model = body.get("model")
+        if model is None:
+            return
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
@@ -1454,6 +1499,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.completion(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
+            elif path in ("/tokenize", "/v1/tokenize"):
+                self.tokenize(body, request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
