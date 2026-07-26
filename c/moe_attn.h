@@ -42,6 +42,7 @@
 #ifndef MOE_ATTN_H
 #define MOE_ATTN_H
 #include <stdint.h>
+#include <stdlib.h>     /* malloc (sdpa_group_split scratch fallback) */
 #include <math.h>       /* lrintf (int8 KV quantization) */
 #include "moe_math.h"   /* softmax_row */
 #if defined(__AVX512F__)
@@ -223,6 +224,126 @@ static void sdpa_group(const float *q, int q_stride,
         float *o = out + (int64_t)j * out_stride;
         for (int d = 0; d < hd; d++) o[d] *= inv;
     }
+}
+
+/* sdpa_group_split — GQA-grouped SDPA with the KV window split across threads.
+ *
+ * The problem this solves is specific to DECODE at long context, which is the dominant cost
+ * in an agentic loop. sdpa_group reads each KV head's window once for all its query heads,
+ * which is the right memory behaviour — but it leaves only `n_kv_heads` units of work, and
+ * models keep shrinking that (Qwen3.5 has 2, Laguna 8). At batch 1 that cannot fill a
+ * 12-core machine, so attention ends up single-threaded and latency-bound: measured 136 MB
+ * of KV in 29 ms is 4.6 GB/s, an order below what the memory system can do.
+ *
+ * Splitting the *time* axis instead gives as much parallelism as you want while still
+ * reading each KV element exactly once (each chunk reads its own slice). Every chunk runs a
+ * self-contained online softmax over its slice, then the partials merge exactly:
+ *
+ *     M = max_c m_c,   S = sum_c s_c*exp(m_c - M),   A = sum_c a_c*exp(m_c - M),   out = A/S
+ *
+ * This is flash-decoding's split-K, and it is arch-generic: any engine whose decode attends
+ * over a long window benefits. `scratch` must hold nchunk*nq*(hd+2) floats; pass NULL to let
+ * it allocate. Bit-identical to sdpa_group when nchunk == 1.
+ */
+static void sdpa_group_split(const float *q, int q_stride,
+                             const float *Kbase, const float *Vbase, int kv_stride,
+                             int hd, int t0, int qpos, float scale, float tau,
+                             float *out, int out_stride, int nq, int ring,
+                             int nchunk, float *scratch) {
+    int n = qpos - t0 + 1;
+    if (nchunk < 1) nchunk = 1;
+    if (nchunk > n) nchunk = n;
+    if (nchunk == 1) {
+        sdpa_group(q, q_stride, Kbase, Vbase, kv_stride, hd, t0, qpos, scale, tau,
+                   out, out_stride, nq, ring);
+        return;
+    }
+    /* per chunk, per query head: [hd accumulator][running max][running sum] */
+    int slotsz = hd + 2;
+    float *buf = scratch;
+    float *heap = NULL;
+    if (!buf) {
+        heap = (float *)malloc((size_t)nchunk * nq * slotsz * sizeof(float));
+        if (!heap) {           /* fall back rather than fail: correctness over speed */
+            sdpa_group(q, q_stride, Kbase, Vbase, kv_stride, hd, t0, qpos, scale, tau,
+                       out, out_stride, nq, ring);
+            return;
+        }
+        buf = heap;
+    }
+    int per = (n + nchunk - 1) / nchunk;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int ci = 0; ci < nchunk; ci++) {
+        int lo = t0 + ci * per;
+        int hi = lo + per - 1;
+        if (hi > qpos) hi = qpos;
+        float *cb = buf + (size_t)ci * nq * slotsz;
+        for (int j = 0; j < nq; j++) {
+            float *sl = cb + (size_t)j * slotsz;
+            sl[hd] = -INFINITY;
+            sl[hd + 1] = 0.f;
+            for (int d = 0; d < hd; d++) sl[d] = 0.f;
+        }
+        if (lo > hi) continue;               /* empty chunk (n < nchunk guarded above) */
+        int mask = ring - 1;
+        for (int t = lo; t <= hi; t++) {
+            int64_t slot = ring ? (t & mask) : t;
+            const float *k = Kbase + slot * kv_stride;
+            const float *v = Vbase + slot * kv_stride;
+            for (int j = 0; j < nq; j++) {
+                const float *qj = q + (int64_t)j * q_stride;
+                float *sl = cb + (size_t)j * slotsz;
+                float dot;
+#if defined(__AVX512F__)
+                {
+                    __m512 acc = _mm512_setzero_ps();
+                    int d = 0;
+                    for (; d + 16 <= hd; d += 16)
+                        acc = _mm512_fmadd_ps(_mm512_loadu_ps(qj + d), _mm512_loadu_ps(k + d), acc);
+                    float sd = _mm512_reduce_add_ps(acc);
+                    for (; d < hd; d++) sd += qj[d] * k[d];
+                    dot = sd;
+                }
+#else
+                { float sd = 0; for (int d = 0; d < hd; d++) sd += qj[d] * k[d]; dot = sd; }
+#endif
+                float x = tau * (dot * scale);
+                if (x > sl[hd]) {
+                    float rescale = (sl[hd] == -INFINITY) ? 0.f : expf(sl[hd] - x);
+                    sl[hd + 1] = sl[hd + 1] * rescale + 1.f;
+                    for (int d = 0; d < hd; d++) sl[d] = sl[d] * rescale + v[d];
+                    sl[hd] = x;
+                } else {
+                    float w = expf(x - sl[hd]);
+                    sl[hd + 1] += w;
+                    for (int d = 0; d < hd; d++) sl[d] += w * v[d];
+                }
+            }
+        }
+    }
+    /* merge the chunk partials */
+    for (int j = 0; j < nq; j++) {
+        float M = -INFINITY;
+        for (int ci = 0; ci < nchunk; ci++) {
+            float mc = buf[(size_t)ci * nq * slotsz + (size_t)j * slotsz + hd];
+            if (mc > M) M = mc;
+        }
+        float *o = out + (int64_t)j * out_stride;
+        for (int d = 0; d < hd; d++) o[d] = 0.f;
+        float S = 0.f;
+        for (int ci = 0; ci < nchunk; ci++) {
+            float *sl = buf + (size_t)ci * nq * slotsz + (size_t)j * slotsz;
+            if (sl[hd] == -INFINITY) continue;
+            float wc = expf(sl[hd] - M);
+            S += sl[hd + 1] * wc;
+            for (int d = 0; d < hd; d++) o[d] += sl[d] * wc;
+        }
+        float inv = S > 0.f ? 1.f / S : 0.f;
+        for (int d = 0; d < hd; d++) o[d] *= inv;
+    }
+    free(heap);
 }
 
 /* SDPA over an int8 K/V cache.

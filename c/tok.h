@@ -148,11 +148,25 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
+        const char *l, *r; int ll, rl;
+        if(pr && pr->t==J_STR && pr->str){
+            /* Older tokenizers wrote each merge as one space-separated string ("Ġ Ġ")
+             * rather than a pair array; Qwen3.5 still ships that form. Byte-level BPE
+             * encodes spaces as 'Ġ', so a literal space never occurs inside a token and
+             * the first space is unambiguously the separator. */
+            const char *sp=strchr(pr->str,' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: merge %d has no separator\n",i); exit(1); }
+            l=pr->str; ll=(int)(sp-pr->str); r=sp+1; rl=(int)strlen(r);
+            if(!ll||!rl){ fprintf(stderr,"tokenizer.json: empty side in merge %d\n",i); exit(1); }
+            char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
+            hm_put(&T->merges, key, ll+1+rl, i);
+            continue;
+        }
         if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
            pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
             fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        l=pr->kids[0]->str; r=pr->kids[1]->str;
+        ll=(int)strlen(l); rl=(int)strlen(r);
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }

@@ -48,6 +48,45 @@ static int report(const char *name, const float *y, const float *ref, int O, dou
     return ok;
 }
 
+
+/* sdpa_group_split must agree with sdpa_group for every chunk count: the merge is exact
+ * algebra, so only float reassociation should differ. nchunk=1 must be BIT-identical
+ * (it delegates), and a chunk count that does not divide the window evenly is the case
+ * where an off-by-one in the last chunk would hide. */
+static int check_sdpa_split(void) {
+    const int hd = 128, nq = 8, n = 501;      /* 501: prime-ish, divides evenly by nothing */
+    float *K = malloc((size_t)n * nq * hd * 4), *V = malloc((size_t)n * nq * hd * 4);
+    float *q = malloc((size_t)nq * hd * 4);
+    float *ref = malloc((size_t)nq * hd * 4), *got = malloc((size_t)nq * hd * 4);
+    unsigned r = 7;
+#define RR (((r = r * 1664525u + 1013904223u) >> 8) * (1.f / 8388608.f) - 1.f)
+    int kvs = hd;                              /* one KV head, contiguous */
+    for (long i = 0; i < (long)n * hd; i++) { K[i] = RR; V[i] = RR; }
+    for (int i = 0; i < nq * hd; i++) q[i] = RR;
+#undef RR
+    float scale = 1.f / sqrtf((float)hd);
+    sdpa_group(q, hd, K, V, kvs, hd, 0, n - 1, scale, 1.f, ref, hd, nq, 0);
+    int ok = 1;
+    int chunks[] = {1, 2, 3, 5, 8, 12, 17, 64};
+    for (unsigned c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
+        sdpa_group_split(q, hd, K, V, kvs, hd, 0, n - 1, scale, 1.f, got, hd, nq, 0,
+                         chunks[c], NULL);
+        double md = 0, den = 0;
+        for (int i = 0; i < nq * hd; i++) {
+            double d = fabs((double)got[i] - ref[i]);
+            if (d > md) md = d;
+            if (fabs(ref[i]) > den) den = fabs(ref[i]);
+        }
+        int exact = (chunks[c] == 1) ? (memcmp(got, ref, (size_t)nq * hd * 4) == 0) : 1;
+        int pass = (md / (den + 1e-30) < 1e-5) && exact;
+        ok &= pass;
+        printf("  sdpa_group_split nchunk=%-3d max|abs|=%.3e %s%s\n", chunks[c], md,
+               pass ? "OK" : "FAIL", chunks[c] == 1 ? (exact ? " (bit-identical)" : " (NOT bit-identical)") : "");
+    }
+    free(K); free(V); free(q); free(ref); free(got);
+    return ok;
+}
+
 int main(void) {
     srand(1234);
     int I = 2048, O = 1024;
@@ -316,6 +355,9 @@ int main(void) {
             free(pk); free(scl);
         }
     }
+
+    printf("sdpa_group_split (flash-decoding split-K):\n");
+    ok &= check_sdpa_split();
 
     printf("%s\n", ok ? "KERNEL-CHECK PASS" : "KERNEL-CHECK FAIL");
     return !ok;

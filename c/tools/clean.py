@@ -13,6 +13,9 @@ FILES = [
     "olmoe", "olmoe.exe",
     "glm", "glm.exe",
     "iobench", "iobench.exe",
+    # not the .npz fixture: regenerating it needs torch, and `make check` cleans first
+    "linattn-check", "linattn-check.exe",
+    "qwen35", "qwen35.exe",
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",

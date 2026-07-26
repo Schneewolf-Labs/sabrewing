@@ -65,3 +65,7 @@ stats*.txt
 c/laguna
 c/tiny_laguna/
 c/kernel-check
+c/linattn-check
+c/gdn_ref.npz
+c/qwen35
+c/tiny_qwen35/
