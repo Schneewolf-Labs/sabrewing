@@ -146,13 +146,47 @@ Consequences, and they are not symmetric:
   error **compounds through every subsequent step** of the recurrence. This should be treated
   as f32-only until there is evidence otherwise, not as the next obvious win.
 
+## The container, and the thing it changes
+
+`tools/convert_qwen35_int4.py` converts the checkpoint: **71.9 GB bf16 → 21.7 GB int4**, as
+`out-top` / `out-layer-000..039` / `out-mtp`, published at
+[nbeerbower/Qwen3.5-35B-A3B-sabrewing-int4](https://huggingface.co/nbeerbower/Qwen3.5-35B-A3B-sabrewing-int4).
+
+Three things about the source checkpoint were verified against the shipped tensors rather than
+assumed, and two of them were surprises:
+
+- Names nest under `model.language_model.` (it is a multimodal checkpoint,
+  `Qwen3_5MoeForConditionalGeneration`); the converter strips that to `model.` so the container
+  matches every other engine's.
+- Routed experts arrive **already fused** as `gate_up_proj [E, 2I, D]` and `down_proj [E, D, I]`,
+  used as `F.linear(x, W[e]).chunk(2, dim=-1)` — which is *exactly* the block-concat layout
+  laguna.c already wants. No transpose, no de-interleave; the conversion is a row-quantize.
+- The **MTP head uses the old per-expert layout** (`mlp.experts.{e}.gate_proj.weight`) while the
+  main layers use the fused 3D form. One checkpoint, two conventions, so the converter has both
+  read paths. `--selftest` asserts they produce byte-identical containers, because a silent
+  transpose here would only ever show up as a broken model.
+
+The vision tower (333 tensors) is skipped — no engine support.
+
+**The size is the point.** At 21.7 GB the *entire* model fits in the 48 GB A6000 with room to
+spare. Contrast Laguna: 57 GB of int4 routed experts against ~40 GB of spare VRAM, so ~21% of
+MoE layer-calls fall back to the CPU expert tier — and those 21% of calls consume **70% of
+expert time** (measured: 170 CPU calls at 14.66 s against 629 VRAM calls at 6.14 s, 8.8× slower
+per call). Qwen3.5 makes that whole tier disappear. Between that and O(1) recurrent state, this
+is the first supported model where the CPU expert path and the KV-capacity wall both stop being
+constraints on the same box.
+
 ## To actually run the model
 
-Remaining, roughly in order: an int4 converter for the new tensor names; a `MoeSharedMode`
-variant for the sigmoid-gated shared expert (`sigmoid(shared_expert_gate(x))`, no correction
-bias and no route scale — softmax → top-8 → renormalize); the full-attention layers, which
-need a per-element output gate (`q_proj` emits `n_heads*head_dim*2`, chunked into query and
-gate — the same M.1 gate-width trap that already bit us on Laguna, so read the width from the
-checkpoint and fail loudly); a tiny random-init oracle (`make_tiny_qwen35.py`) checked
-token-exact against `transformers`; then the engine. Weights are not downloaded — only
-`config.json` is in the HF cache.
+Remaining: a `MoeSharedMode` variant for the sigmoid-gated shared expert
+(`sigmoid(shared_expert_gate(x)) * shared(x)`, added to the routed sum — the router is plain
+softmax → top-8 → renormalize, with no correction bias and no route scale, so `route_scale` is
+1.0); the full-attention layers, which need a **per-element** output gate (`q_proj` emits
+`[8192, 2048]` = 16 heads × 256 × 2, chunked into query and gate — the same M.1 gate-width trap
+that already bit us on Laguna, so read the width from the checkpoint and fail loudly); mRoPE
+(`mrope_section [11, 11, 10]`, `partial_rotary_factor` 0.25, theta 1e7) which degenerates to
+standard RoPE for text-only input; a tiny random-init oracle (`make_tiny_qwen35.py`) checked
+token-exact against `transformers`; then the engine.
+
+The MTP head is converted but unused. It is the reason to expect single-stream decode to beat
+the per-token weight-read floor here in a way it cannot on Laguna, which ships no draft head.
