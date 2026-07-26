@@ -139,6 +139,9 @@ swing info                    # model / cache / hardware status
 - Per-*expert* VRAM cache instead of per-layer all-or-nothing (the capacity gap is
   ~⅓ of a short-context step, 10× per layer)
 - Tensor-core int8 expert GEMM (our warp-per-row kernel is the last big GPU ceiling)
+- Unified/paged KV cache — cells shared between sequences instead of a reserved buffer per
+  slot; we currently reserve ~35 GB to hold ~2.6 GB of real context
+  ([`docs/kv-cache-design.md`](docs/kv-cache-design.md))
 - Unified VRAM↔RAM↔NVMe pager and cross-layer routing lookahead (the five-pillar plan)
 - Heat-tiered quantization (measured, not vibed) for capacity
 - More of the hummingbird catalog as open MoE models land
