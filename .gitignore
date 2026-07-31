@@ -69,3 +69,7 @@ c/linattn-check
 c/gdn_ref.npz
 c/qwen35
 c/tiny_qwen35/
+c/deepseek
+c/deepseek.exe
+c/tiny_deepseek/
+c/tiny_dsv4_py/

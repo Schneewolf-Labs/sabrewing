@@ -299,6 +299,23 @@ laguna$(EXE): laguna.c st.h tok.h json.h compat.h $(LAG_CUDA_OBJ)
 qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_quant.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
+# DeepSeek-V4-Flash: mHC hyper-connections + CSA/HCA compressed attention. Stage-A f32 CPU.
+deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_sample.h
+	$(CC) $(CFLAGS) deepseek.c -o deepseek$(EXE) $(LDFLAGS)
+
+# Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
+deepseek-test: deepseek$(EXE)
+	@if [ ! -f tiny_deepseek/ref_deepseek.json ]; then $(PYTHON) tools/make_tiny_deepseek.py tiny_deepseek; fi
+	SNAP=tiny_deepseek ./deepseek$(EXE) tiny_deepseek/ref_deepseek.json
+
+# Dependency-free cross-check: a pure-Python reference model (no torch, no weights, no GPU)
+# that the engine must reproduce — mHC/Sinkhorn, CSA overlap windowing, HCA compression,
+# the Lightning Indexer, hash-MoE, YaRN, and prefill/decode agreement. Runs anywhere in
+# under a second. Not a substitute for deepseek-test. See docs/deepseek.md.
+deepseek-ref: deepseek$(EXE)
+	$(PYTHON) tools/dsv4_ref.py tiny_dsv4_py
+	SNAP=tiny_dsv4_py ./deepseek$(EXE) tiny_dsv4_py/ref_deepseek.json
+
 # Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)
 qwen35-test: qwen35$(EXE)
 	@if [ ! -f tiny_qwen35/ref_qwen35.json ]; then $(PYTHON) tools/make_tiny_qwen35.py tiny_qwen35; fi
@@ -483,4 +500,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri qwen35 qwen35-test glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
+.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test deepseek-ref glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
