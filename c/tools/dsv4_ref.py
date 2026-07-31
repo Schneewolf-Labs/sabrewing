@@ -37,7 +37,9 @@ ROPE_DIM = 4                      # partial_rotary_factor = 4/16
 O_GROUPS, O_RANK = 2, 8
 E, K, MOE_I = 6, 2, 16
 HC, SINK_ITERS, HC_EPS = 4, 20, 1.0e-6
-IDX_HEADS, IDX_DIM, IDX_TOPK = 2, 8, 2
+# 4 index heads, not 2: with 2, relu zeroes both often enough that scores of exactly 0.0
+# are common and the top-k boundary is decided by tie order rather than by arithmetic.
+IDX_HEADS, IDX_DIM, IDX_TOPK = 4, 8, 2
 WIN = 6
 M_CSA, M_HCA = 2, 4
 EPS = 1.0e-6

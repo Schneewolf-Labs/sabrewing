@@ -73,7 +73,14 @@ def main():
         sliding_window=6,
         o_groups=2,
         o_lora_rank=8,
-        index_n_heads=2,
+        # 8 index heads, not 2. The indexer scores an entry as sum_h w_h * relu(q_h . k),
+        # so with only 2 heads a ~25% chance of both dots landing <= 0 makes scores of
+        # EXACTLY 0.0 common, and the top-k then turns on `torch.topk`'s tie order — which
+        # is an artifact of its partial-sort, not a specified semantic ([0]*7 with k=2
+        # returns [5, 4]). That is unreproducible by any rule and not worth reproducing.
+        # 8 heads makes exact ties rare, as they are in the real model's 64, so this gate
+        # tests the indexer's arithmetic instead of torch's internal ordering.
+        index_n_heads=8,
         index_head_dim=8,
         index_topk=2,
         hc_mult=4,

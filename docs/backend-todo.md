@@ -41,14 +41,19 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [x] **Multimodal token rejection** — text-only load, but an image/audio
   placeholder token (200054 / 200053) in a prompt reads a meaningless embedding
   row instead of erroring. Detect and reject with a clear message.
-- [ ] **DeepSeek-V4 has never met the transformers oracle** — `c/deepseek.c` landed
-  from a clean read of `modeling_deepseek_v4.py` in a container with no torch, no
-  GPU and no weights, so `make deepseek-test` has *not* run. It is cross-checked
-  against a dependency-free pure-Python reimplementation (`make deepseek-ref`:
-  logits to 6.5e-07, split-prefill bit-identical, mutation-tested), which catches
-  transcription bugs but not a shared misreading of the reference. Run
-  `make deepseek-test` on a box with torch before trusting any output, and before
-  building the quantized container on top. See `docs/deepseek.md`.
+- [x] **DeepSeek-V4 has never met the transformers oracle** — now green against
+  transformers 5.14.1 / torch 2.13: 21/21 teacher forcing, 8/8 greedy, logits to
+  2.98e-08 (the reference's own f32-vs-f64 spread is 3.2e-08). It found three
+  things the dependency-free harness structurally could not, all in how a *real*
+  checkpoint is laid out rather than in the math: experts are saved per-expert as
+  `w1`/`w3`/`w2` rather than fused `gate_up_proj` (mapping resolved by value, not
+  by name); the output projection is saved as `head.weight`, and the old silent
+  "missing lm_head → tie to embeddings" fallback was quietly wrong on an untied
+  model (now an error unless `tie_word_embeddings` is set); and rope
+  `attention_scaling` was missing entirely, worth 8.7e-03 on the logits. Both
+  checks are now CI gates. One principled divergence remains and is documented:
+  `torch.topk`'s tie order among exactly-equal indexer scores is unspecified and
+  is not reproduced. See `docs/deepseek.md`.
 - [ ] **KV cache not trimmed to the sliding window** — global layers keep full KV;
   55/66 layers only need 512 tokens but we store all. Long context over-allocates
   and never recycles across requests. Trim sliding layers to their window.

@@ -93,7 +93,8 @@ typedef struct {
     int hash[MAXL];                 /* mlp_layer_types[i] == "hash_moe" */
     int m_csa, m_hca;               /* compress rates */
     float inv_main[MAXROT], inv_comp[MAXROT];   /* rdim/2 entries each */
-    int ctx_max;
+    float sc_main, sc_comp;                     /* rope attention_scaling on cos AND sin */
+    int ctx_max, tie_embed;
     int eos[8], n_eos;
 } Cfg;
 
@@ -121,6 +122,8 @@ typedef struct {
     Layer L[MAXL];
     float *embed, *lm_head, *norm;
     float *h_fn, *h_base, *h_scale; /* hc_head: final stream collapse */
+    int exp_fused;                  /* 1 = one 3D tensor per layer, 0 = one tensor per expert */
+    const char *exp_g, *exp_u, *exp_d;   /* per-expert suffixes when !exp_fused */
 } Model;
 
 /* Per-layer sequence state. Two "entries" per layer share the compressor machinery:
@@ -178,15 +181,33 @@ static void yarn_inv(float *inv, int dim, double base, double factor,
     }
 }
 
-static void rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
+/* transformers' get_mscale: 0.1*mscale*ln(scale)+1, or 1 when there is no scaling. */
+static double yarn_mscale(double scale, double mscale) {
+    return scale > 1.0 ? 0.1 * mscale * log(scale) + 1.0 : 1.0;
+}
+
+static void rope_table(float *inv, float *ascale, int dim, jval *rp, double dflt_theta, int ctx_max) {
     double theta = rp ? jnum(rp, "rope_theta", dflt_theta) : dflt_theta;
     jval *rt = rp ? json_get(rp, "rope_type") : NULL;
     if (!rt) rt = rp ? json_get(rp, "type") : NULL;
+    *ascale = 1.f;
     if (rt && rt->t == J_STR && !strcmp(rt->str, "yarn")) {
         double factor = jnum(rp, "factor", 1.0);
         double bf = jnum(rp, "beta_fast", 32.0), bs = jnum(rp, "beta_slow", 1.0);
         int om = (int)jnum(rp, "original_max_position_embeddings", ctx_max);
         yarn_inv(inv, dim, theta, factor, bf, bs, om);
+        /* attention_scaling multiplies BOTH cos and sin (_compute_yarn_parameters).
+         * V4 pins it to 1.0 when the config is written flat — but a nested
+         * rope_parameters that omits the key gets the derived mscale instead, and the
+         * shipped checkpoints may carry mscale / mscale_all_dim like DeepSeek-V3. Follow
+         * the config rather than assuming: this is not a rotation when it is not 1, and
+         * the conjugate un-rotation on the attention output scales by it a second time. */
+        jval *af = json_get(rp, "attention_factor");
+        jval *ms = json_get(rp, "mscale"), *msa = json_get(rp, "mscale_all_dim");
+        if (af && af->t == J_NUM) *ascale = (float)af->num;
+        else if (ms && ms->t == J_NUM && msa && msa->t == J_NUM)
+            *ascale = (float)(yarn_mscale(factor, ms->num) / yarn_mscale(factor, msa->num));
+        else *ascale = (float)yarn_mscale(factor, 1.0);
     } else {
         for (int j = 0; j < dim / 2; j++) inv[j] = (float)(1.0 / pow(theta, (double)(2 * j) / dim));
     }
@@ -231,6 +252,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->hc_eps = (float)jnum(o, "hc_eps", 1e-6);
     c->eps = (float)jnum(o, "rms_norm_eps", 1e-6);
     c->ctx_max = (int)jnum(o, "max_position_embeddings", 4096);
+    { jval *te = json_get(o, "tie_word_embeddings");
+      c->tie_embed = te && (te->t == J_BOOL ? te->boolean : te->t == J_NUM && te->num != 0); }
     if (c->hc_mult < 1 || c->hc_mult > MAXHC) {
         fprintf(stderr, "hc_mult %d out of range (max %d)\n", c->hc_mult, MAXHC); exit(1); }
     if (c->o_groups < 1 || (c->n_heads * c->head_dim) % c->o_groups) {
@@ -294,8 +317,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->rdim = (int)(c->head_dim * prf) & ~1;
     if (c->rdim < 2 || c->rdim / 2 > MAXROT) {
         fprintf(stderr, "rotary dim %d unsupported\n", c->rdim); exit(1); }
-    rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
-    rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
+    rope_table(c->inv_main, &c->sc_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
+    rope_table(c->inv_comp, &c->sc_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
 
     c->n_eos = 0;
     for (int pass = 0; pass < 2 && !c->n_eos; pass++) {
@@ -330,6 +353,71 @@ static float *load_opt(Model *m, const char *name) {
     return st_numel(&m->S, name) < 0 ? NULL : load_t(m, name);
 }
 
+/* Expert weights ship in three layouts, and the engine indexes only the fused one:
+ *   fused 3D          — mlp.experts.gate_up_proj [E,2I,D] + mlp.experts.down_proj [E,D,I]
+ *                       (the module declaration, and what a fused re-export writes)
+ *   per-expert w1/w3/w2 — what transformers' save_pretrained actually writes, and the
+ *                       format the V4 inference stacks use. w1 = gate, w3 = up, w2 = down;
+ *                       verified by value against gate_up_proj, not assumed from the name.
+ *   per-expert gate_proj/up_proj/down_proj — the other HF spelling.
+ * Detect from layer 0 and derive the expert width from the weight itself. */
+static void detect_experts(Model *m) {
+    Cfg *c = &m->c;
+    static const char *cand[2][3] = {{"w1", "w3", "w2"}, {"gate_proj", "up_proj", "down_proj"}};
+    char n[256];
+    int derived;
+
+    int64_t fused = st_numel(&m->S, "model.layers.0.mlp.experts.gate_up_proj");
+    if (fused >= 0) {
+        m->exp_fused = 1;
+        derived = (int)(fused / ((int64_t)c->E * 2 * c->D));
+    } else {
+        int k = 0;
+        for (; k < 2; k++) {
+            snprintf(n, sizeof(n), "model.layers.0.mlp.experts.0.%s.weight", cand[k][0]);
+            if (st_numel(&m->S, n) >= 0) break;
+        }
+        if (k == 2) {
+            fprintf(stderr, "no recognizable expert weights: expected mlp.experts.gate_up_proj, "
+                            "or per-expert w1/w3/w2, or per-expert gate_proj/up_proj/down_proj\n");
+            exit(1);
+        }
+        m->exp_fused = 0;
+        m->exp_g = cand[k][0]; m->exp_u = cand[k][1]; m->exp_d = cand[k][2];
+        snprintf(n, sizeof(n), "model.layers.0.mlp.experts.0.%s.weight", m->exp_g);
+        derived = (int)(st_numel(&m->S, n) / c->D);
+    }
+    if (derived <= 0) { fprintf(stderr, "cannot derive expert width\n"); exit(1); }
+    if (c->moe_I <= 0) c->moe_I = derived;
+    if (derived != c->moe_I) {
+        fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n",
+                derived, c->moe_I); exit(1); }
+}
+
+static void load_experts(Model *m, Layer *L, int li) {
+    Cfg *c = &m->c;
+    int64_t I = c->moe_I, D = c->D;
+    char n[256];
+    if (m->exp_fused) {
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.gate_up_proj", li);
+        L->e_gu = load_t(m, n);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.down_proj", li);
+        L->e_dn = load_t(m, n);
+        return;
+    }
+    L->e_gu = falloc((int64_t)c->E * 2 * I * D);
+    L->e_dn = falloc((int64_t)c->E * D * I);
+    for (int e = 0; e < c->E; e++) {
+        float *gu = L->e_gu + (int64_t)e * 2 * I * D;
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, m->exp_g);
+        st_read_f32_cap(&m->S, n, gu, I * D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, m->exp_u);
+        st_read_f32_cap(&m->S, n, gu + I * D, I * D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, m->exp_d);
+        st_read_f32_cap(&m->S, n, L->e_dn + (int64_t)e * D * I, D * I, 0);
+    }
+}
+
 static void model_load(Model *m, const char *snap) {
     st_init(&m->S, snap);
     cfg_load(&m->c, snap);
@@ -338,8 +426,19 @@ static void model_load(Model *m, const char *snap) {
 
     m->embed = load_t(m, "model.embed_tokens.weight");
     m->norm = load_t(m, "model.norm.weight");
+    /* transformers writes the output projection as `head.weight`; a fused/manual export
+     * may use the module name `lm_head.weight`. Falling back to the embedding when neither
+     * is present is only correct for a TIED checkpoint — doing it silently would turn an
+     * untied model into plausible garbage, so an untied model with no head is an error. */
     m->lm_head = load_opt(m, "lm_head.weight");
-    if (!m->lm_head) m->lm_head = m->embed;         /* tie_word_embeddings */
+    if (!m->lm_head) m->lm_head = load_opt(m, "head.weight");
+    if (!m->lm_head) {
+        if (!c->tie_embed) {
+            fprintf(stderr, "no lm_head.weight / head.weight, and tie_word_embeddings is false\n");
+            exit(1); }
+        m->lm_head = m->embed;
+    }
+    detect_experts(m);
     m->h_fn = load_t(m, "model.hc_head.hc_fn");
     m->h_base = load_t(m, "model.hc_head.hc_base");
     m->h_scale = load_t(m, "model.hc_head.hc_scale");
@@ -366,8 +465,7 @@ static void model_load(Model *m, const char *snap) {
         LT(f_scale, "model.layers.%d.ffn_hc.scale");
         LT(router, "model.layers.%d.mlp.gate.weight");
         LO(corr, "model.layers.%d.mlp.gate.e_score_correction_bias");
-        LT(e_gu, "model.layers.%d.mlp.experts.gate_up_proj");
-        LT(e_dn, "model.layers.%d.mlp.experts.down_proj");
+        load_experts(m, L, i);
         LT(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
         LT(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
         LT(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
@@ -403,12 +501,6 @@ static void model_load(Model *m, const char *snap) {
      * `intermediate_size`, which attribute-maps onto moe_intermediate_size). Derive it
      * rather than assume, so a checkpoint with a wider shared expert still loads. */
     c->shared_I = (int)(st_numel(&m->S, "model.layers.0.mlp.shared_experts.gate_proj.weight") / c->D);
-    int64_t egu = st_numel(&m->S, "model.layers.0.mlp.experts.gate_up_proj");
-    int derived = (int)(egu / ((int64_t)c->E * 2 * c->D));
-    if (c->moe_I <= 0) c->moe_I = derived;
-    if (derived != c->moe_I) {
-        fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n", derived, c->moe_I);
-        exit(1); }
 }
 
 /* ---------- per-sequence state ---------- */
@@ -461,12 +553,15 @@ static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
 }
 
 /* Interleaved partial RoPE on the TRAILING rdim channels of one head. sgn = -1 applies
- * the conjugate rotation (used to un-rotate the attention output, since K == V). */
-static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn) {
+ * the conjugate rotation (used to un-rotate the attention output, since K == V).
+ * `as` is the rope's attention_scaling, applied to cos and sin alike — with as != 1 this
+ * is a scaled rotation, and the sgn = -1 pass scales again rather than dividing back out.
+ * That is the reference's behaviour, not an oversight here. */
+static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn, float as) {
     float *r = x + hd - rdim;
     for (int j = 0; j < rdim / 2; j++) {
         float ang = (float)pos * inv[j];
-        float cs = cosf(ang), sn = sgn * sinf(ang);
+        float cs = as * cosf(ang), sn = sgn * as * sinf(ang);
         float a = r[2 * j], b = r[2 * j + 1];
         r[2 * j]     = a * cs - b * sn;
         r[2 * j + 1] = b * cs + a * sn;
@@ -705,7 +800,7 @@ static int compress_push(const Cfg *c, LState *ls, int slot, const float *kv, co
             dst[d] = a;
         }
         rmsnorm_row(dst, dst, norm_w, dim, c->eps);
-        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f);
+        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f, c->sc_comp);
     }
     /* persist this call's last full window's Ca slice for the next call's window 0 */
     if (overlap) {
@@ -733,6 +828,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     LState *ls = &s->l[li];
     int D = c->D, H = c->n_heads, hd = c->head_dim, R = c->rdim;
     const float *inv = c->att[li] == ATT_SLIDING ? c->inv_main : c->inv_comp;
+    float asc = c->att[li] == ATT_SLIDING ? c->sc_main : c->sc_comp;
 
     /* queries: q_a -> q_a_norm -> q_b -> per-head unweighted RMSNorm -> rope */
     float *qres = falloc((int64_t)n * c->q_lora);
@@ -747,7 +843,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         for (int h = 0; h < H; h++) {
             float *qh = q + ((int64_t)t * H + h) * hd;
             rmsnorm_plain(qh, qh, hd, c->eps);
-            rope_head(qh, hd, R, inv, pos0 + t, 1.f);
+            rope_head(qh, hd, R, inv, pos0 + t, 1.f, asc);
         }
 
     /* the single shared KV head: kv_proj -> kv_norm -> rope. K IS V. */
@@ -756,7 +852,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
       mm(raw, xn, L->kv_w, n, D, hd);
       for (int t = 0; t < n; t++) {
           rmsnorm_row(knew + (int64_t)t * hd, raw + (int64_t)t * hd, L->kv_n, hd, c->eps);
-          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f);
+          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f, asc);
       }
       free(raw); }
 
@@ -817,7 +913,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
             float *sc = falloc(cand > 0 ? cand : 1);
             for (int t = 0; t < n; t++) {
                 for (int h = 0; h < IH; h++)
-                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f);
+                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f, c->sc_comp);
                 int thr = (pos0 + t + 1) / m_r;
                 for (int e = 0; e < cand; e++) {
                     float a = 0;
@@ -829,6 +925,14 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                     }
                     sc[e] = e < thr ? a : -INFINITY;
                 }
+                /* Deterministic top-k: highest score first, ties to the LOWER entry id.
+                 * The reference calls torch.topk here, whose order among EQUAL scores is
+                 * an artifact of its partial-sort (`[0]*7`, k=2 gives [5, 4]) rather than
+                 * a defined semantic, so it is not reproducible by any rule and not worth
+                 * reproducing. Exact ties are real though: a score is exactly 0 when relu
+                 * zeroes every head. When that happens at the selection boundary the two
+                 * implementations may keep different — equally unranked — entries. Every
+                 * other part of CSA is bit-exact against the reference; see docs. */
                 int kk = c->idx_topk < cand ? c->idx_topk : cand;
                 for (int a = 0; a < kk; a++) {
                     int best = -1; float bv = -INFINITY;
@@ -838,6 +942,14 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                     }
                     if (best < 0 || best >= thr) break;      /* -1 sentinel: nothing valid left */
                     vis[(int64_t)t * ncomp + best] = 1;
+                }
+                if (getenv("DS_IDX")) {
+                    fprintf(stderr, "[idx] L%d t%d pos%d thr%d:", li, t, pos0 + t, thr);
+                    for (int e = 0; e < ncomp; e++)
+                        if (vis[(int64_t)t * ncomp + e]) fprintf(stderr, " %d", e);
+                    fprintf(stderr, "   scores:");
+                    for (int e = 0; e < cand; e++) fprintf(stderr, " %.9g", sc[e]);
+                    fprintf(stderr, "\n");
                 }
             }
             free(sc); free(iq); free(iw);
@@ -890,7 +1002,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                 for (int i = 0; i < hd; i++) ah[i] += w * v[i];
             }
             /* K == V, so the value carried RoPE: undo it at the QUERY position */
-            rope_head(ah, hd, R, inv, p, -1.f);
+            rope_head(ah, hd, R, inv, p, -1.f, asc);
         }
         /* grouped low-rank output projection: g blocks of gin -> o_rank, then mixed to D */
         for (int g = 0; g < c->o_groups; g++)

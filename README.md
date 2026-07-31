@@ -16,8 +16,7 @@ machine named `sabre`, and the name was sitting right there.*
 
 Each model is a small standalone engine over a shared MoE runtime (see
 [Architecture](#the-moe-native-runtime)). All are validated token-exact against a
-tiny-model `transformers` oracle — except `deepseek`, which is new and still Stage A
-(see its row below).
+tiny-model `transformers` oracle.
 
 | Engine | Model | Size (total / active) | Notes |
 |---|---|---|---|
@@ -26,7 +25,7 @@ tiny-model `transformers` oracle — except `deepseek`, which is new and still S
 | `inkling` | [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) | ~266B / ~10B | Same engine, no code changes — a pure scale-down. 131 GiB int4 fits in RAM |
 | `colibri` | GLM-5.2 (and the upstream arch family) | — | The multi-arch engine sabrewing forks from; MLA + DSA indexer |
 | `olmoe` | [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct) | 7B / 1B | Softmax router, whole-vector QK-norm |
-| `deepseek` | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | 284B / 13B | **Stage A, f32 CPU only** — mHC hyper-connections, CSA/HCA compressed attention + Lightning Indexer, hash-MoE. Cross-checked against a dependency-free reference; the `transformers` oracle has not been run yet ([docs](docs/deepseek.md)) |
+| `deepseek` | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | 284B / 13B | **Stage A: f32 CPU only** — mHC hyper-connections, CSA/HCA compressed attention + Lightning Indexer, hash-MoE. Token-exact vs transformers; no quantized container yet, so it runs tiny models and bf16 re-exports, not the shipped FP4/FP8 container ([docs](docs/deepseek.md)) |
 
 Pre-converted int4 weights on the Hub:
 [`nbeerbower/Laguna-S-2.1-colibri-int4`](https://huggingface.co/nbeerbower/Laguna-S-2.1-colibri-int4),

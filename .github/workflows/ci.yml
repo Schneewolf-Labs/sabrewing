@@ -21,10 +21,14 @@ jobs:
       - uses: actions/checkout@v4
       # ARCH=x86-64-v3: portable AVX2 baseline — hosted runners vary, and
       # `native` would make the build depend on whichever CPU we drew.
-      - name: Build glm + inkling + olmoe
-        run: make -C c glm inkling olmoe ARCH=x86-64-v3
+      - name: Build glm + inkling + olmoe + deepseek
+        run: make -C c glm inkling olmoe deepseek ARCH=x86-64-v3
       - name: C test suite
         run: make -C c test-c ARCH=x86-64-v3
+      # Dependency-free: a pure-Python reference model the engine must reproduce. Needs no
+      # torch, so it gates every PR here rather than only in the oracle job below.
+      - name: DeepSeek-V4 reference cross-check
+        run: make -C c deepseek-ref ARCH=x86-64-v3
 
   cuda-syntax:
     name: CUDA syntax check (glm + inkling backends)
@@ -108,3 +112,25 @@ jobs:
           else
             echo "tools/make_tiny_lora.py not on this branch — skipped"
           fi
+
+  deepseek-oracle:
+    name: DeepSeek-V4 oracle (token-exact vs transformers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/oracle-requirements.txt
+      - name: Install torch (CPU) + transformers
+        run: pip install -r c/tools/oracle-requirements.txt
+      - name: Build deepseek
+        run: make -C c deepseek ARCH=x86-64-v3
+      # A hard gate, like inkling-oracle: transformers is unpinned, so if upstream ever
+      # drops or changes `deepseek_v4` this must go red rather than quietly skip.
+      - name: Tiny-model fixture + oracle (all 3 attention types, both routers, YaRN)
+        run: |
+          cd c
+          python3 tools/make_tiny_deepseek.py tiny_deepseek
+          SNAP=tiny_deepseek ./deepseek tiny_deepseek/ref_deepseek.json

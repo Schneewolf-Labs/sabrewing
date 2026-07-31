@@ -31,7 +31,7 @@ Practical consequences for work in this repo:
 |---|---|
 | `c/laguna.c` | Laguna engine (primary) — see `docs/laguna.md` |
 | `c/inkling.c` | Inkling 975B engine (NVMe expert streaming) — `docs/inkling.md` |
-| `c/deepseek.c` | DeepSeek-V4-Flash engine (mHC + CSA/HCA compressed attention) — `docs/deepseek.md`. Stage A: f32 CPU, transformers oracle not yet run |
+| `c/deepseek.c` | DeepSeek-V4-Flash engine (mHC + CSA/HCA compressed attention) — `docs/deepseek.md`. Stage A: f32 CPU, token-exact vs transformers; no quantized container yet |
 | `c/colibri.c` | GLM engine (vendored upstream substrate) |
 | `c/olmoe.c` | OLMoE (small, fast arch-generalization check) |
 | `c/moe_*.h` | shared MoE runtime: `moe_arch.h` descriptors + hooks, `moe_block.h` routing/combine, `moe_attn.h` SDPA, `moe_matmul.h` f32 GEMM, `moe_quant.h` int4/int8 kernels, `moe_sample.h`, `moe_serve.h` |
