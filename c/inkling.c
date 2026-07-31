@@ -1692,6 +1692,18 @@ int main(int argc, char **argv) {
         setenv("KMP_BLOCKTIME","200",0);
         setenv("OMP_PROC_BIND","close",0);
         setenv("OMP_DYNAMIC","FALSE",0);
+        /* One thread per PHYSICAL core. OpenMP defaults to nproc, which on an SMT
+         * box pairs every worker with a spinning sibling on the same core (active
+         * wait, just above) — the two then fight over one core's vector units.
+         * Measured on a Ryzen 9 7900 (12c/24t), inkling-small int4, warm cache:
+         *   24 threads  0.32-0.62 tok/s   prefill 10.1s
+         *   12 threads  3.05     tok/s    prefill  1.0s
+         * 16/14/10/8 all land 2.8-3.1, so the cliff is specifically full SMT
+         * oversubscription, not a gentle scaling curve. OMP_NUM_THREADS set by
+         * the user still wins (setenv overwrite=0). */
+        { int phys = moe_physical_cores();
+          if (phys > 0) { char b[16]; snprintf(b, sizeof b, "%d", phys);
+                          setenv("OMP_NUM_THREADS", b, 0); } }
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
         execv("/proc/self/exe", argv);

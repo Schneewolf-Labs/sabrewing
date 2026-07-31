@@ -1666,6 +1666,9 @@ static int cuda_selftest(void) {
 #endif
 
 int main(int argc, char **argv) {
+    /* one OpenMP thread per physical core: SMT oversubscription costs 9-28x
+     * on the int4 kernels (see moe_util.h). OMP_NUM_THREADS still wins. */
+    moe_omp_autotune();
 #ifdef COLI_CUDA
     if (getenv("LAG_CUDA_TEST")) return cuda_selftest();
 #endif
