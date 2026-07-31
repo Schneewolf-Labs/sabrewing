@@ -41,6 +41,14 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [x] **Multimodal token rejection** — text-only load, but an image/audio
   placeholder token (200054 / 200053) in a prompt reads a meaningless embedding
   row instead of erroring. Detect and reject with a clear message.
+- [ ] **DeepSeek-V4 has never met the transformers oracle** — `c/deepseek.c` landed
+  from a clean read of `modeling_deepseek_v4.py` in a container with no torch, no
+  GPU and no weights, so `make deepseek-test` has *not* run. It is cross-checked
+  against a dependency-free pure-Python reimplementation (`make deepseek-ref`:
+  logits to 6.5e-07, split-prefill bit-identical, mutation-tested), which catches
+  transcription bugs but not a shared misreading of the reference. Run
+  `make deepseek-test` on a box with torch before trusting any output, and before
+  building the quantized container on top. See `docs/deepseek.md`.
 - [ ] **KV cache not trimmed to the sliding window** — global layers keep full KV;
   55/66 layers only need 512 tokens but we store all. Long context over-allocates
   and never recycles across requests. Trim sliding layers to their window.

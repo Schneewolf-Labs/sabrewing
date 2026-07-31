@@ -62,6 +62,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    if (!strcmp(s, "I64"))  return 4;   /* index tables (deepseek_v4 hash-MoE tid2eid) */
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
@@ -340,7 +341,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
-            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : (t->dtype==4 ? 8 : 2));
               if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
@@ -406,7 +407,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
      * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
      * che e' dimensionato sul config, non sul file. Il chiamante che alloca su
      * st_numel resta coerente; questo blocca l'ingresso ostile a monte. */
-    int esz = (t->dtype == 2) ? 4 : 2;
+    int esz = (t->dtype == 2) ? 4 : (t->dtype == 4 ? 8 : 2);
     if (t->numel < 0 || t->numel > t->nbytes / esz || t->numel * (int64_t)esz != t->nbytes) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
@@ -417,6 +418,8 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+    } else if (t->dtype == 4) {
+        int64_t *p = (int64_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = (float)p[i];
     } else {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
     }
