@@ -64,6 +64,7 @@
 #include "json.h"
 #include "moe_math.h"
 #include "moe_matmul.h"
+#include "moe_quant.h"         /* matmul_fp4_k: e2m1 + ue8m0 block scales (V4's native experts) */
 #include "moe_sample.h"
 #include "st.h"
 #include "tok.h"
@@ -93,7 +94,9 @@ typedef struct {
     int hash[MAXL];                 /* mlp_layer_types[i] == "hash_moe" */
     int m_csa, m_hca;               /* compress rates */
     float inv_main[MAXROT], inv_comp[MAXROT];   /* rdim/2 entries each */
+    float ms_main, ms_comp;         /* YaRN attention_factor: scales cos AND sin */
     int ctx_max;
+    int tie_embed;                  /* tie_word_embeddings: lm_head IS the embedding */
     int eos[8], n_eos;
 } Cfg;
 
@@ -111,7 +114,9 @@ typedef struct {
     /* MoE */
     float *router, *corr;
     int64_t *tid2eid;
-    float *e_gu, *e_dn;             /* [E, 2I, D] and [E, D, I] */
+    float *e_gu, *e_dn;             /* f32 experts: [E, 2I, D] and [E, D, I] */
+    uint8_t *q_gu, *q_dn;           /* fp4 container: e2m1 nibbles [E*2I, D/2], [E*D, I/2] */
+    uint8_t *s_gu, *s_dn;           /* ...and their ue8m0 block scales [E*2I, D/32], [E*D, I/32] */
     float *sg, *su, *sd;            /* shared expert */
 } Layer;
 
@@ -121,6 +126,7 @@ typedef struct {
     Layer L[MAXL];
     float *embed, *lm_head, *norm;
     float *h_fn, *h_base, *h_scale; /* hc_head: final stream collapse */
+    int xq;                         /* 1 = fp4 routed-expert container */
 } Model;
 
 /* Per-layer sequence state. Two "entries" per layer share the compressor machinery:
@@ -156,9 +162,14 @@ static double jnum(jval *o, const char *k, double dflt) {
     return (v && v->t == J_NUM) ? v->num : dflt;
 }
 
-/* YaRN inverse frequencies, matching transformers' _compute_yarn_parameters. V4 forces
- * attention_factor = 1.0 for the compress rope (the reference does not rescale cos/sin),
- * so only inv_freq is affected here. */
+/* YaRN inverse frequencies, matching transformers' _compute_yarn_parameters.
+ *
+ * YaRN also returns an `attention_factor` (mscale) that the rotary embedding multiplies
+ * into BOTH cos and sin. It is NOT 1.0 here: with no explicit override in the config it
+ * is 0.1*ln(factor)+1, which is 1.2773 for V4-Flash's compress rope (factor 16). An
+ * earlier note in this file claimed the reference pinned it to 1.0; it does not, and
+ * dropping it left every CSA/HCA layer subtly wrong while sliding layers stayed exact
+ * (the main rope is not YaRN, so its factor really is 1.0). */
 static void yarn_inv(float *inv, int dim, double base, double factor,
                      double beta_fast, double beta_slow, int orig_max) {
     double lo = dim * log((double)orig_max / (beta_fast * 2 * M_PI)) / (2 * log(base));
@@ -178,18 +189,31 @@ static void yarn_inv(float *inv, int dim, double base, double factor,
     }
 }
 
-static void rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
+/* 0.1*mscale*ln(scale)+1, transformers' get_mscale */
+static double get_mscale(double scale, double mscale) {
+    return scale <= 1.0 ? 1.0 : 0.1 * mscale * log(scale) + 1.0;
+}
+
+/* Fills `inv` and returns the attention_factor that scales cos/sin. */
+static float rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
     double theta = rp ? jnum(rp, "rope_theta", dflt_theta) : dflt_theta;
     jval *rt = rp ? json_get(rp, "rope_type") : NULL;
     if (!rt) rt = rp ? json_get(rp, "type") : NULL;
     if (rt && rt->t == J_STR && !strcmp(rt->str, "yarn")) {
-        double factor = jnum(rp, "factor", 1.0);
-        double bf = jnum(rp, "beta_fast", 32.0), bs = jnum(rp, "beta_slow", 1.0);
         int om = (int)jnum(rp, "original_max_position_embeddings", ctx_max);
+        double factor = jnum(rp, "factor", 0.0);
+        if (factor <= 0) factor = om ? (double)ctx_max / om : 1.0;   /* DeepSeek-V3 style */
+        double bf = jnum(rp, "beta_fast", 32.0), bs = jnum(rp, "beta_slow", 1.0);
         yarn_inv(inv, dim, theta, factor, bf, bs, om);
-    } else {
-        for (int j = 0; j < dim / 2; j++) inv[j] = (float)(1.0 / pow(theta, (double)(2 * j) / dim));
+        jval *af = json_get(rp, "attention_factor");
+        if (af && af->t == J_NUM) return (float)af->num;
+        jval *ms = json_get(rp, "mscale"), *msa = json_get(rp, "mscale_all_dim");
+        if (ms && ms->t == J_NUM && msa && msa->t == J_NUM && ms->num && msa->num)
+            return (float)(get_mscale(factor, ms->num) / get_mscale(factor, msa->num));
+        return (float)get_mscale(factor, 1.0);
     }
+    for (int j = 0; j < dim / 2; j++) inv[j] = (float)(1.0 / pow(theta, (double)(2 * j) / dim));
+    return 1.f;
 }
 
 static void cfg_load(Cfg *c, const char *dir) {
@@ -231,6 +255,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->hc_eps = (float)jnum(o, "hc_eps", 1e-6);
     c->eps = (float)jnum(o, "rms_norm_eps", 1e-6);
     c->ctx_max = (int)jnum(o, "max_position_embeddings", 4096);
+    { jval *t = json_get(o, "tie_word_embeddings");
+      c->tie_embed = t ? (t->t == J_BOOL ? t->boolean : (t->t == J_NUM ? (int)t->num : 0)) : 0; }
     if (c->hc_mult < 1 || c->hc_mult > MAXHC) {
         fprintf(stderr, "hc_mult %d out of range (max %d)\n", c->hc_mult, MAXHC); exit(1); }
     if (c->o_groups < 1 || (c->n_heads * c->head_dim) % c->o_groups) {
@@ -260,7 +286,12 @@ static void cfg_load(Cfg *c, const char *dir) {
             else if (!strcmp(s, "heavily_compressed_attention")) c->att[i] = ATT_HCA;
             else { fprintf(stderr, "unknown layer type '%s'\n", s); exit(1); }
         }
-    } else if (cro && cro->t == J_ARR && cro->len == c->n_layers) {
+    } else if (cro && cro->t == J_ARR && cro->len >= c->n_layers) {
+        /* >=, not ==: the shipped V4-Flash-0731 config carries 46 ratios for 43 layers —
+         * the trailing entries describe the DSpark speculative-decoding module, which is
+         * a separate `mtp.*` stack this engine does not run. Demanding an exact length
+         * silently fell through to the default interleave, which is NOT this checkpoint's
+         * layout (it opens with two SLIDING layers, not two HCA). */
         for (int i = 0; i < c->n_layers; i++) {
             int r = (int)cro->kids[i]->num;
             c->att[i] = r == 0 ? ATT_SLIDING : (r == c->m_hca ? ATT_HCA : ATT_CSA);
@@ -294,8 +325,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->rdim = (int)(c->head_dim * prf) & ~1;
     if (c->rdim < 2 || c->rdim / 2 > MAXROT) {
         fprintf(stderr, "rotary dim %d unsupported\n", c->rdim); exit(1); }
-    rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
-    rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
+    c->ms_main = rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
+    c->ms_comp = rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
 
     c->n_eos = 0;
     for (int pass = 0; pass < 2 && !c->n_eos; pass++) {
@@ -329,6 +360,76 @@ static float *load_t(Model *m, const char *name) {
 static float *load_opt(Model *m, const char *name) {
     return st_numel(&m->S, name) < 0 ? NULL : load_t(m, name);
 }
+/* raw bytes of an already-quantized tensor (fp4 nibbles, ue8m0 scales) */
+static uint8_t *load_u8(Model *m, const char *name) {
+    int64_t nb = st_nbytes(&m->S, name);
+    if (nb < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    uint8_t *p = malloc((size_t)nb);
+    if (!p) { fprintf(stderr, "OOM %lld bytes for %s\n", (long long)nb, name); exit(1); }
+    st_read_raw(&m->S, name, p, 1);
+    return p;
+}
+
+/* Routed experts ship in three shapes; take whichever the snapshot has.
+ *
+ *  1. fp4 container (a `.es` block-scale sidecar next to the packed tensor) —
+ *     what tools/convert_deepseek_fp4.py emits, and the only one that fits the
+ *     real 284B checkpoint. Stored verbatim from the checkpoint's own e2m1 bytes.
+ *  2. fused f32 `gate_up_proj` [E,2I,D] / `down_proj` [E,D,I] — what the pure-python
+ *     harness (tools/dsv4_ref.py) writes, and what transformers <= 5.7 saved.
+ *  3. per-expert f32 `experts.{e}.w1/w2/w3` — what transformers saves TODAY, and
+ *     the layout the real checkpoint uses. Fused here at load time.
+ *
+ * gate_up is block-concatenated per expert (all I gate rows, then all I up rows),
+ * matching F.linear(x, gate_up_proj[e]).chunk(2). */
+static void load_experts(Model *m, Layer *L, int i) {
+    Cfg *c = &m->c;
+    char n[256], es[256];
+    snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.gate_up_proj", i);
+    snprintf(es, sizeof(es), "model.layers.%d.mlp.experts.gate_up_proj.es", i);
+
+    if (st_numel(&m->S, es) >= 0) {                       /* 1. fp4 container */
+        m->xq = 1;
+        if (c->moe_I <= 0) {
+            fprintf(stderr, "fp4 container needs moe_intermediate_size in config.json\n"); exit(1); }
+        int64_t want = (int64_t)c->E * 2 * c->moe_I * (c->D / 2);
+        if (st_nbytes(&m->S, n) != want) {
+            fprintf(stderr, "layer %d gate_up_proj: %lld bytes, expected %lld (E=%d I=%d D=%d)\n",
+                    i, (long long)st_nbytes(&m->S, n), (long long)want, c->E, c->moe_I, c->D); exit(1); }
+        L->q_gu = load_u8(m, n);
+        L->s_gu = load_u8(m, es);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.down_proj", i);
+        snprintf(es, sizeof(es), "model.layers.%d.mlp.experts.down_proj.es", i);
+        L->q_dn = load_u8(m, n);
+        L->s_dn = load_u8(m, es);
+        return;
+    }
+    if (st_numel(&m->S, n) >= 0) {                        /* 2. fused f32 */
+        L->e_gu = load_t(m, n);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.down_proj", i);
+        L->e_dn = load_t(m, n);
+        return;
+    }
+    /* 3. per-expert f32 w1/w2/w3 -> fuse */
+    snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.0.w1.weight", i);
+    int64_t w1n = st_numel(&m->S, n);
+    if (w1n < 0) { fprintf(stderr, "layer %d: no routed experts in any known layout\n", i); exit(1); }
+    int I = (int)(w1n / c->D);
+    if (c->moe_I <= 0) c->moe_I = I;
+    if (I != c->moe_I) {
+        fprintf(stderr, "layer %d expert width %d disagrees with moe_intermediate_size %d\n",
+                i, I, c->moe_I); exit(1); }
+    L->e_gu = falloc((int64_t)c->E * 2 * I * c->D);
+    L->e_dn = falloc((int64_t)c->E * c->D * I);
+    for (int e = 0; e < c->E; e++) {
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w1.weight", i, e);   /* gate */
+        st_read_f32_cap(&m->S, n, L->e_gu + (int64_t)e * 2 * I * c->D, (int64_t)I * c->D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w3.weight", i, e);   /* up */
+        st_read_f32_cap(&m->S, n, L->e_gu + ((int64_t)e * 2 * I + I) * c->D, (int64_t)I * c->D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w2.weight", i, e);   /* down */
+        st_read_f32_cap(&m->S, n, L->e_dn + (int64_t)e * c->D * I, (int64_t)c->D * I, 0);
+    }
+}
 
 static void model_load(Model *m, const char *snap) {
     st_init(&m->S, snap);
@@ -338,8 +439,20 @@ static void model_load(Model *m, const char *snap) {
 
     m->embed = load_t(m, "model.embed_tokens.weight");
     m->norm = load_t(m, "model.norm.weight");
+    /* Output projection. V4 calls it `head.weight` — both in the shipped checkpoint and
+     * in what transformers' save_pretrained writes for this arch — while other engines
+     * here see `lm_head.weight`. Take either. Falling back to the embedding is ONLY
+     * correct when the config actually ties them; doing it silently on a missing tensor
+     * turned an untied model into a tied one and cost a full oracle failure (the whole
+     * stack matched transformers layer-for-layer, and only the logits were wrong). */
     m->lm_head = load_opt(m, "lm_head.weight");
-    if (!m->lm_head) m->lm_head = m->embed;         /* tie_word_embeddings */
+    if (!m->lm_head) m->lm_head = load_opt(m, "head.weight");
+    if (!m->lm_head) {
+        if (!c->tie_embed) {
+            fprintf(stderr, "no output projection (lm_head.weight / head.weight) and "
+                            "tie_word_embeddings is false\n"); exit(1); }
+        m->lm_head = m->embed;
+    }
     m->h_fn = load_t(m, "model.hc_head.hc_fn");
     m->h_base = load_t(m, "model.hc_head.hc_base");
     m->h_scale = load_t(m, "model.hc_head.hc_scale");
@@ -366,8 +479,7 @@ static void model_load(Model *m, const char *snap) {
         LT(f_scale, "model.layers.%d.ffn_hc.scale");
         LT(router, "model.layers.%d.mlp.gate.weight");
         LO(corr, "model.layers.%d.mlp.gate.e_score_correction_bias");
-        LT(e_gu, "model.layers.%d.mlp.experts.gate_up_proj");
-        LT(e_dn, "model.layers.%d.mlp.experts.down_proj");
+        load_experts(m, L, i);
         LT(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
         LT(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
         LT(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
@@ -403,12 +515,17 @@ static void model_load(Model *m, const char *snap) {
      * `intermediate_size`, which attribute-maps onto moe_intermediate_size). Derive it
      * rather than assume, so a checkpoint with a wider shared expert still loads. */
     c->shared_I = (int)(st_numel(&m->S, "model.layers.0.mlp.shared_experts.gate_proj.weight") / c->D);
+    /* load_experts() already cross-checked the routed width against the config for
+     * the fp4 and per-expert layouts; the fused f32 tensor is the remaining case. */
     int64_t egu = st_numel(&m->S, "model.layers.0.mlp.experts.gate_up_proj");
-    int derived = (int)(egu / ((int64_t)c->E * 2 * c->D));
-    if (c->moe_I <= 0) c->moe_I = derived;
-    if (derived != c->moe_I) {
-        fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n", derived, c->moe_I);
-        exit(1); }
+    if (!m->xq && egu >= 0) {
+        int derived = (int)(egu / ((int64_t)c->E * 2 * c->D));
+        if (c->moe_I <= 0) c->moe_I = derived;
+        if (derived != c->moe_I) {
+            fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n", derived, c->moe_I);
+            exit(1); }
+    }
+    if (c->moe_I <= 0) { fprintf(stderr, "could not determine routed expert width\n"); exit(1); }
 }
 
 /* ---------- per-sequence state ---------- */
@@ -462,11 +579,11 @@ static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
 
 /* Interleaved partial RoPE on the TRAILING rdim channels of one head. sgn = -1 applies
  * the conjugate rotation (used to un-rotate the attention output, since K == V). */
-static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn) {
+static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn, float ms) {
     float *r = x + hd - rdim;
     for (int j = 0; j < rdim / 2; j++) {
         float ang = (float)pos * inv[j];
-        float cs = cosf(ang), sn = sgn * sinf(ang);
+        float cs = cosf(ang) * ms, sn = sgn * sinf(ang) * ms;
         float a = r[2 * j], b = r[2 * j + 1];
         r[2 * j]     = a * cs - b * sn;
         r[2 * j + 1] = b * cs + a * sn;
@@ -535,17 +652,29 @@ static void hc_merge(const Cfg *c, float *streams, const float *post, const floa
 }
 
 /* ---------- MoE ---------- */
-static void swiglu_expert(const Cfg *c, const float *gu, const float *dn, const float *x,
+/* One routed expert: clamped SwiGLU over the fused gate_up, then down. Reads either
+ * the f32 tensors or the fp4 container — same arithmetic, different weight decode. */
+static void swiglu_expert(const Model *m, const Layer *L, int e, const float *x,
                           float *out, float *h, int I) {
+    const Cfg *c = &m->c;
+    int D = c->D;
     float lim = c->swiglu_limit;
     float *g = h, *u = h + I;
-    mm(g, x, gu, 1, c->D, 2 * I);                       /* rows [0,I) gate, [I,2I) up */
+    if (m->xq)                                          /* rows [0,I) gate, [I,2I) up */
+        matmul_fp4_k(g, x, L->q_gu + (int64_t)e * 2 * I * (D / 2),
+                     L->s_gu + (int64_t)e * 2 * I * (D / 32), D, 2 * I, g_exact);
+    else
+        mm(g, x, L->e_gu + (int64_t)e * 2 * I * D, 1, D, 2 * I);
     for (int i = 0; i < I; i++) {
         float gi = g[i] > lim ? lim : g[i];
         float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
         g[i] = siluf(gi) * ui;
     }
-    mm(out, g, dn, 1, I, c->D);
+    if (m->xq)
+        matmul_fp4_k(out, g, L->q_dn + (int64_t)e * D * (I / 2),
+                     L->s_dn + (int64_t)e * D * (I / 32), I, D, g_exact);
+    else
+        mm(out, g, L->e_dn + (int64_t)e * D * I, 1, I, D);
 }
 
 static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *out,
@@ -601,8 +730,7 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
 
     for (int i = 0; i < D; i++) acc[i] = 0;
     for (int a = 0; a < K; a++) {
-        swiglu_expert(c, L->e_gu + (int64_t)sel[a] * 2 * I * D, L->e_dn + (int64_t)sel[a] * D * I,
-                      x, tmp, h, I);
+        swiglu_expert(m, L, sel[a], x, tmp, h, I);
         for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
     }
 
@@ -705,7 +833,7 @@ static int compress_push(const Cfg *c, LState *ls, int slot, const float *kv, co
             dst[d] = a;
         }
         rmsnorm_row(dst, dst, norm_w, dim, c->eps);
-        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f);
+        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f, c->ms_comp);
     }
     /* persist this call's last full window's Ca slice for the next call's window 0 */
     if (overlap) {
@@ -733,6 +861,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     LState *ls = &s->l[li];
     int D = c->D, H = c->n_heads, hd = c->head_dim, R = c->rdim;
     const float *inv = c->att[li] == ATT_SLIDING ? c->inv_main : c->inv_comp;
+    float ms = c->att[li] == ATT_SLIDING ? c->ms_main : c->ms_comp;
 
     /* queries: q_a -> q_a_norm -> q_b -> per-head unweighted RMSNorm -> rope */
     float *qres = falloc((int64_t)n * c->q_lora);
@@ -747,7 +876,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         for (int h = 0; h < H; h++) {
             float *qh = q + ((int64_t)t * H + h) * hd;
             rmsnorm_plain(qh, qh, hd, c->eps);
-            rope_head(qh, hd, R, inv, pos0 + t, 1.f);
+            rope_head(qh, hd, R, inv, pos0 + t, 1.f, ms);
         }
 
     /* the single shared KV head: kv_proj -> kv_norm -> rope. K IS V. */
@@ -756,7 +885,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
       mm(raw, xn, L->kv_w, n, D, hd);
       for (int t = 0; t < n; t++) {
           rmsnorm_row(knew + (int64_t)t * hd, raw + (int64_t)t * hd, L->kv_n, hd, c->eps);
-          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f);
+          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f, ms);
       }
       free(raw); }
 
@@ -817,7 +946,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
             float *sc = falloc(cand > 0 ? cand : 1);
             for (int t = 0; t < n; t++) {
                 for (int h = 0; h < IH; h++)
-                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f);
+                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f, c->ms_comp);
                 int thr = (pos0 + t + 1) / m_r;
                 for (int e = 0; e < cand; e++) {
                     float a = 0;
@@ -829,6 +958,13 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                     }
                     sc[e] = e < thr ? a : -INFINITY;
                 }
+                /* top-k by score. Ties go to the LOWEST entry index (strict >, stable
+                 * scan). torch.topk defines no tie-break — it was observed returning the
+                 * highest tied index — so an exactly-tied row is unmatchable by
+                 * construction, not a bug on either side. It only arises when relu()
+                 * zeroes the score across EVERY indexer head at once: a 2^-64 event at
+                 * V4-Flash's 64 heads, but near-certain in a 2-head toy, which is why
+                 * make_tiny_deepseek.py uses 8. */
                 int kk = c->idx_topk < cand ? c->idx_topk : cand;
                 for (int a = 0; a < kk; a++) {
                     int best = -1; float bv = -INFINITY;
@@ -890,7 +1026,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                 for (int i = 0; i < hd; i++) ah[i] += w * v[i];
             }
             /* K == V, so the value carried RoPE: undo it at the QUERY position */
-            rope_head(ah, hd, R, inv, p, -1.f);
+            rope_head(ah, hd, R, inv, p, -1.f, ms);
         }
         /* grouped low-rank output projection: g blocks of gin -> o_rank, then mixed to D */
         for (int g = 0; g < c->o_groups; g++)

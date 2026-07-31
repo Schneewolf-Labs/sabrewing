@@ -73,7 +73,14 @@ def main():
         sliding_window=6,
         o_groups=2,
         o_lora_rank=8,
-        index_n_heads=2,
+        # 8, not 2. The indexer score is sum_h w_h * relu(q_h . k_e); with only 2 heads a
+        # random model relus BOTH to zero for most (query, entry) pairs, so whole score
+        # rows tie at exactly 0.0 and the fixture ends up measuring topk's tie-break
+        # rather than the architecture. torch.topk does not define one (it returned the
+        # HIGHEST tied index here, a stable index-ascending scan returns the lowest), so
+        # that comparison is unwinnable and meaningless. Real V4-Flash has 64 heads,
+        # where an exact all-head tie is a 2^-64 event. See docs/deepseek.md.
+        index_n_heads=8,
         index_head_dim=8,
         index_topk=2,
         hc_mult=4,
