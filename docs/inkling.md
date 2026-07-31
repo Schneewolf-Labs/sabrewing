@@ -87,7 +87,39 @@ SNAP=~/Models/inkling_i4 ./c/inkling -f warmup_prompts.txt -n 32
 | `USAGE_SAVE=0` | don't rewrite the history (benchmark runs) |
 | `NOGPU=1` / `GPU_DEV=<n>` | disable CUDA / select device |
 | `IDOT=0` | byte-exact scalar int kernels (debugging) |
+| `INK_CACHE_CHECK=1` | assert every routed pair still holds the expert it was acquired for (see below) |
 | First positional arg | expert-cache cap per layer (`0` = auto-size from free RAM) |
+
+### The cap does not have to hold the batch
+
+`moe()` acquires, fills and computes routed `(token, expert)` pairs in **rounds**
+bounded by the number of unpinned slots. This is a correctness requirement:
+`slot_acquire` evicts the LRU unpinned slot and cannot tell that a slot is still
+owed to a pair routed earlier in the same call. The engine used to acquire every
+pair up front, so once a call touched more distinct experts than the cache had
+unpinned slots, a late acquire recycled a slot still in use — the pointer stayed
+valid, the expert behind it changed, and the layer computed with the wrong
+weights. No crash, no warning, just degraded output.
+
+Measured on `inkling_small_i4` (256 experts, top-6, 42 layers), 13-token prompt,
+before the fix: `cap=8` served the wrong expert at the *first* MoE layer, and
+`cap=32` (16 pinned, 16 evictable) did too. The tiny oracle cannot see this —
+its expert count is small enough that the cap clamps to full residency and
+nothing ever evicts.
+
+With rounds, the cap is a pure memory/IO trade-off and can go below `topk`:
+
+| Cap | Output (12 greedy tokens, same prompt) | RSS | Expert loads |
+|---|---|---|---|
+| auto (256, full residency) | `technology and technology's impact on society. I.name is Ink` | 36.8 GB | 2159 |
+| 8 | identical | 15.2 GB | 3725 (42% churn) |
+| 1 | identical (3-token run) | 11.9 GB | — |
+
+Pairs are walked in (token, rank) order and each token's contributions still land
+in ascending rank, so a round boundary is **bit-exact**, not merely equivalent —
+and a cap that holds the whole call is a single round, i.e. the old code path.
+`INK_CACHE_CHECK=1` asserts the invariant on every layer call; it is cheap enough
+to leave on for a validation run and exits on the first violation.
 
 ## Performance (975B, Ryzen 9 7900 / 24t, 187 GB DDR5, RTX A6000, NVMe)
 

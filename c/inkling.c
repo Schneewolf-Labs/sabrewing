@@ -991,10 +991,23 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
 }
 
 /* ---------- MoE: sigmoid router + bias top-k, joint routed+shared weights ----------
- * Three passes per layer call: (1) route every position and acquire slots,
- * (2) fill ALL missing experts in one parallel burst (the NVMe wants queue
- * depth — during prefill this batches the whole sequence's misses), then
- * (3) compute. */
+ * (1) route every position, then (2) acquire / fill / compute the routed
+ * (token, expert) pairs in ROUNDS, then (3) the shared experts.
+ *
+ * The rounds are a correctness requirement, not a perf tactic: slot_acquire
+ * evicts the LRU unpinned slot with no idea that pass 1 already handed that
+ * slot out. Acquiring every pair up front therefore let a late acquire recycle
+ * a slot still owed to an earlier pair — the pointer stayed valid, the expert
+ * behind it changed, and the layer computed with the wrong weights silently.
+ * A round is capped at the number of unpinned slots, so nothing acquired in a
+ * round can be evicted before that round computes. Fills still go out as one
+ * parallel burst per round (the NVMe wants queue depth).
+ *
+ * Pairs are walked in (token, rank) order and each token's contributions land
+ * in ascending rank, so `out` accumulates in exactly the order it did before —
+ * a round boundary is bit-exact, not merely equivalent. Whenever the cache can
+ * hold the whole call (decode, or prefill under a roomy cap) there is a single
+ * round and this is the old code path. */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter, ns = c->n_shared;
@@ -1009,7 +1022,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
     int  *fl    = malloc((size_t)S*K*sizeof(int));
     int nfill = 0;
-    /* pass 1: routing + slot bookkeeping (serial) */
+    /* pass 1: routing only — no cache interaction, so nothing can go stale here */
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*ET;
         int *si = idx + (int64_t)s*K;
@@ -1028,9 +1041,52 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int kk = 0; kk < K; kk++)  { w[kk]   = sigmoidf(lg[si[kk]]); sum += w[kk]; }
         for (int j = 0; j < ns; j++)    { w[K+j]  = sigmoidf(lg[E+j]);    sum += w[K+j]; }
         for (int kk = 0; kk < K+ns; kk++) w[kk] *= c->route_scale * l->rgs / sum;
-        for (int kk = 0; kk < K; kk++) {
-            int eid = si[kk];
-            if (m->eusage[layer]) m->eusage[layer][eid]++;
+        if (m->eusage[layer]) for (int kk = 0; kk < K; kk++) m->eusage[layer][si[kk]]++;
+        /* record this decode token's top-M router ranking for next token's probe */
+        if (S == 1 && m->prev_topm[layer]) {
+            int *tm = m->prev_topm[layer];
+            for (int r = 0; r < m->topm; r++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    int taken = 0; for (int j = 0; j < r; j++) if (tm[j]==e){taken=1;break;}
+                    float ch = sigmoidf(lg[e]) + l->rbias[e];
+                    if (!taken && ch > bv) { bv = ch; best = e; }
+                }
+                tm[r] = best;
+            }
+        }
+    }
+    /* pass 2: acquire / fill / compute the routed pairs, `budget` pairs at a time.
+     * gate+up run as ONE matmul over the fused 2I rows — halves the number of
+     * (expensive to open) parallel regions per expert */
+    float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
+    int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
+    /* LoRA runtime path: shared-A projections t1/t3 computed once per token;
+     * the per-expert down deltas accumulate as weighted rank-r vectors in
+     * acc2 so the shared B2 applies once per token, not once per expert.
+     * A token's pairs are contiguous in this order, so lt1/lt3/acc2 survive a
+     * round boundary that lands mid-token — pre at rank 0, apply at rank K-1. */
+    Lora *lr = &m->lora;
+    int lact = lr->experts_on && lr->b1[layer];
+    float *lt = lact ? falloc(3*lr->r) : NULL;
+    float *lt1 = lt, *lt3 = lact ? lt + lr->r : NULL, *acc2 = lact ? lt + 2*lr->r : NULL;
+    /* a round may touch at most as many slots as the cache can hold unpinned:
+     * pinned slots are never eviction candidates, so they cost no budget */
+    LCache *lc = &m->cache[layer];
+    int budget = lc->cap;
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].pinned) budget--;
+    if (budget < 1) budget = 1;       /* slot_acquire itself errors out if all are pinned */
+    /* INK_CACHE_CHECK=1: verify the invariant the rounds exist to hold — every
+     * slot still holds the expert it was acquired for when we come to use it. */
+    static int ckchk = -1;
+    if (ckchk < 0) ckchk = getenv("INK_CACHE_CHECK") ? 1 : 0;
+    int64_t npair = (int64_t)S * K;
+    for (int64_t p0 = 0; p0 < npair; p0 += budget) {
+        int64_t p1 = p0 + budget < npair ? p0 + budget : npair;
+        /* acquire (serial bookkeeping) */
+        nfill = 0;
+        for (int64_t p = p0; p < p1; p++) {
+            int eid = idx[p];
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else {
@@ -1049,48 +1105,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 e = slot_acquire(m, layer, eid);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
-            use[(int64_t)s*K + kk] = e;
+            use[p] = e;
         }
-        /* record this decode token's top-M router ranking for next token's probe */
-        if (S == 1 && m->prev_topm[layer]) {
-            int *tm = m->prev_topm[layer];
-            for (int r = 0; r < m->topm; r++) {
-                int best = -1; float bv = -1e30f;
-                for (int e = 0; e < E; e++) {
-                    int taken = 0; for (int j = 0; j < r; j++) if (tm[j]==e){taken=1;break;}
-                    float ch = sigmoidf(lg[e]) + l->rbias[e];
-                    if (!taken && ch > bv) { bv = ch; best = e; }
-                }
-                tm[r] = best;
+        if (ckchk) for (int64_t p = p0; p < p1; p++) {
+            if (use[p]->eid != idx[p]) {
+                fprintf(stderr, "[cache-check] layer %d S=%d cap=%d budget=%d: token %d rank %d "
+                        "wanted expert %d, slot now holds %d\n", layer, S, lc->cap, budget,
+                        (int)(p / K), (int)(p % K), idx[p], use[p]->eid);
+                exit(1);
             }
         }
-    }
-    /* pass 2: one parallel burst for every miss in this layer call */
-    if (nfill) {
-        double tf = now_s();
-        #pragma omp parallel for schedule(dynamic,1)
-        for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
-        m->t_fill += now_s() - tf;
-    }
-    /* pass 3: compute. gate+up run as ONE matmul over the fused 2I rows —
-     * halves the number of (expensive to open) parallel regions per expert */
-    float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
-    int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
-    /* LoRA runtime path: shared-A projections t1/t3 computed once per token;
-     * the per-expert down deltas accumulate as weighted rank-r vectors in
-     * acc2 so the shared B2 applies once per token, not once per expert */
-    Lora *lr = &m->lora;
-    int lact = lr->experts_on && lr->b1[layer];
-    float *lt = lact ? falloc(3*lr->r) : NULL;
-    float *lt1 = lt, *lt3 = lact ? lt + lr->r : NULL, *acc2 = lact ? lt + 2*lr->r : NULL;
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        float *w = wgt + (int64_t)s*(K+ns);
+        /* fill every miss of this round in one parallel burst */
+        if (nfill) {
+            double tf = now_s();
+            #pragma omp parallel for schedule(dynamic,1)
+            for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+            m->t_fill += now_s() - tf;
+        }
+        /* compute */
         double te = now_s();
-        if (lact) { lora_moe_pre(lr, layer, xs, lt1, lt3); memset(acc2, 0, lr->r*sizeof(float)); }
-        for (int kk = 0; kk < K; kk++) {
-            Slot *e = use[(int64_t)s*K + kk];
+        for (int64_t p = p0; p < p1; p++) {
+            int s = (int)(p / K), kk = (int)(p % K);
+            const float *xs = x + (int64_t)s*D;
+            float *os = out + (int64_t)s*D;
+            float *w = wgt + (int64_t)s*(K+ns);
+            if (lact && kk == 0) { lora_moe_pre(lr, layer, xs, lt1, lt3); memset(acc2, 0, lr->r*sizeof(float)); }
+            Slot *e = use[p];
             int fused = 0;
 #ifdef COLI_CUDA
             /* fused GPU expert: gate+up→silu→down in one launch/sync, no host
@@ -1122,10 +1162,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
             if (lact) lora_moe_down_acc(lr, layer, e->eid, g, w[kk], acc2);
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
+            if (lact && kk == K-1) lora_moe_down_apply(lr, layer, acc2, os);
         }
-        if (lact) lora_moe_down_apply(lr, layer, acc2, os);
-        double ts = now_s(); m->t_expert += ts - te;
-        /* shared experts: gamma inside (before down_proj is linear, so applied at the end) */
+        m->t_expert += now_s() - te;
+    }
+    /* pass 3: shared experts. Every token's `out` has taken its routed ranks
+     * 0..K-1 by now and takes the shared terms after, exactly as before.
+     * gamma inside (before down_proj is linear, so applied at the end) */
+    double ts = now_s();
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s*D;
+        float *os = out + (int64_t)s*D;
+        float *w = wgt + (int64_t)s*(K+ns);
         for (int j = 0; j < ns; j++) {
             matmul_w(g, xs, wt_off(l->sh_g, (int64_t)j*I*D), 1, D, I);
             matmul_w(u, xs, wt_off(l->sh_u, (int64_t)j*I*D), 1, D, I);
@@ -1133,8 +1181,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             matmul_w(hh, g, wt_off(l->sh_d, (int64_t)j*D*I), 1, I, D);
             for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
         }
-        m->t_shared += now_s() - ts;
     }
+    m->t_shared += now_s() - ts;
     free(logits); free(idx); free(wgt); free(sc); free(use); free(fill); free(fl);
     free(g); free(hh); free(lt);    /* u aliases g+I */
 }
