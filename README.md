@@ -22,12 +22,14 @@ tiny-model `transformers` oracle.
 |---|---|---|---|
 | `laguna` | [Poolside Laguna-S-2.1](https://huggingface.co/poolside/Laguna-S-2.1) | 118B / 8B | Agentic coding model; **fits one 48 GB GPU**. YaRN + sliding attention, softplus gate, 256 experts top-10 + shared |
 | `inkling` | [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling) | 975B / 41B | Streamed from NVMe on a workstation. Learned rel-bias, short-convs, MTP |
+| `inkling` | [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) | ~266B / ~10B | Same engine, no code changes — a pure scale-down. 131 GiB int4 fits in RAM |
 | `colibri` | GLM-5.2 (and the upstream arch family) | — | The multi-arch engine sabrewing forks from; MLA + DSA indexer |
 | `olmoe` | [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct) | 7B / 1B | Softmax router, whole-vector QK-norm |
 
 Pre-converted int4 weights on the Hub:
 [`nbeerbower/Laguna-S-2.1-colibri-int4`](https://huggingface.co/nbeerbower/Laguna-S-2.1-colibri-int4),
-[`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4).
+[`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4),
+[`sabrewing-engine/Inkling-Small-colibri-int4`](https://huggingface.co/sabrewing-engine/Inkling-Small-colibri-int4).
 
 ## What it does
 

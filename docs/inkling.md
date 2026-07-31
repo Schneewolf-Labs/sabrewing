@@ -1,17 +1,32 @@
-# Inkling (Thinking Machines 975B MoE) on colibri
+# Inkling (Thinking Machines MoE) on colibri
 
-`c/inkling.c` runs [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling)
-(975B total / 41B active, Apache 2.0) with colibri's expert-streaming approach:
-dense weights resident (RAM or VRAM), routed experts streamed from disk with an
-LRU + pinned cache. Text-only; vision/audio encoders are not loaded. The MTP
-draft head loads on demand for speculative decode (`MTP=1`; see below).
+`c/inkling.c` runs both sizes of [Thinking Machines Inkling](https://huggingface.co/thinkingmachines/Inkling)
+(Apache 2.0) with colibri's expert-streaming approach: dense weights resident
+(RAM or VRAM), routed experts streamed from disk with an LRU + pinned cache.
+Text-only; vision/audio encoders are not loaded. The MTP draft head loads on
+demand for speculative decode (`MTP=1`; see below).
+
+| Model | Total / active | int4 container | Notes |
+|---|---|---|---|
+| [Inkling](https://huggingface.co/thinkingmachines/Inkling) | 975B / 41B | ~469 GiB | NVMe-streamed; the capacity vehicle |
+| [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) | ~266B / ~10B | **131 GiB** | fits in RAM on a 187 GB box |
+
+**Inkling-Small needs no engine changes.** It is a straight scale-down — same MoE
+structure (256 routed experts top-6, 2 shared, 201k vocab), only dimensions differ
+(hidden 4096 vs 6144, 42 layers vs 66, 32 heads vs 64, expert intermediate 2048 vs
+3072, `logits_mup_width_multiplier` 16 vs 24). Both the engine and the converter
+read every dimension from `config.json`; the `6144` literals in `inkling.c` are in
+the CUDA self-test, not the model path.
 
 ## Quickstart
 
-Pre-converted weights (int4 experts + bf16 residents, ~469 GiB):
+Pre-converted weights (int4 experts + bf16 residents):
 
 ```sh
+# 975B — ~469 GiB
 hf download nbeerbower/Inkling-colibri-int4 --local-dir ~/Models/inkling_i4
+# Small — ~131 GiB
+hf download sabrewing-engine/Inkling-Small-colibri-int4 --local-dir ~/Models/inkling_small_i4
 ```
 
 or convert the original bf16 checkpoint yourself (shard-resumable; `--watch`
@@ -21,18 +36,27 @@ converts while the download is still running):
 python3 c/tools/convert_inkling_int4.py --indir <bf16-checkpoint> --outdir ~/Models/inkling_i4
 ```
 
+> `--watch` is a win when the source is on NVMe. When the source download and the
+> converter output share one **spinning disk** it is a ~3x pessimization — the head
+> thrashes between the download's writes and the converter's reads. Measured on an
+> 8 TB WD: 197 MB/s with the disk to itself vs 60 MB/s overlapped. On HDD, let the
+> download finish first, and always put the *output* snapshot on NVMe since the
+> engine reads experts from it on every cache miss.
+
 Build and run:
 
 ```sh
-make -C c inkling                # pure CPU (dependency-free, like glm)
-make -C c inkling CUDA=1         # + bf16 residents in VRAM (needs ~37 GB free)
+make -C c inkling ARCH=native    # pure CPU (dependency-free, like glm)
+make -C c inkling CUDA=1 ARCH=native   # + bf16 residents in VRAM (needs ~37 GB free for 975B)
 
-SNAP=~/Models/inkling_i4 ./c/inkling -p "The capital of France is" -n 64
+SNAP=~/Models/inkling_i4       ./c/inkling -p "The capital of France is" -n 64
+SNAP=~/Models/inkling_small_i4 ./c/inkling -p "The capital of France is" -n 64
 ```
 
-Requirements: ~120 GB RAM (CPU build keeps ~86 GB of bf16 residents in RAM;
-the CUDA build moves them to VRAM and uses the freed RAM for a larger expert
-cache), NVMe storage for the snapshot.
+Requirements: 975B wants ~120 GB RAM (CPU build keeps ~86 GB of bf16 residents in
+RAM; the CUDA build moves them to VRAM and uses the freed RAM for a larger expert
+cache). Small's whole 131 GiB container fits in page cache on a 187 GB machine, so
+a warmed run does no disk I/O at all. NVMe storage for the snapshot either way.
 
 ## Modes
 
@@ -88,6 +112,22 @@ expert compute on the GPU, not more I/O work. The GPU int4 expert GEMM kernel
 (`ink_cuda_matmul_q4`) is in place and validated (`--cuda-q4-test`); the VRAM
 expert cache tier that feeds it is the remaining piece — see
 `docs/gpu-experts-design.md`.
+
+### Inkling-Small (preliminary, CPU build)
+
+Same box, `ARCH=native`, 24-token greedy decode, snapshot on NVMe. Single runs —
+these are first-light numbers, not a tuned benchmark.
+
+| Configuration | Prefill | Decode | Cache hit |
+|---|---|---|---|
+| warm, pins trained on the prompt | 1.1 s | **3.0 tok/s** | 100.0% |
+| warm, novel prompt | 15.5 s | 0.86 tok/s | 82.0% |
+
+At 100% hit the run reports `fill 0.0s` — zero disk reads — so the trained-prompt
+number is pure compute. That is the interesting difference from the 975B: Small's
+whole container fits in RAM, so I/O stops being the constraint and expert matmul
+becomes the ceiling. The CUDA resident tier is therefore the obvious next lever
+here too, and is **not yet measured** for this model.
 
 ## Speculative decode (MTP)
 
