@@ -73,3 +73,6 @@ c/deepseek
 c/deepseek.exe
 c/tiny_deepseek/
 c/tiny_dsv4_py/
+c/tiny_dsv4_32/
+c/tiny_dsv4_fp4/
+c/tiny_dsv4_deq/
