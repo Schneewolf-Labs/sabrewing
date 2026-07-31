@@ -26,16 +26,24 @@ Usage: python3 tools/dsv4_ref.py <outdir>
 """
 import json
 import math
+import os
 import random
 import struct
 import sys
 
+
+def _env(name, dflt):
+    """Dimension override, so tools/make_tiny_dsv4_fp4.py can ask for widths that are
+    multiples of 32 (the fp4 container's scale-block size). Defaults are unchanged,
+    so `make deepseek-ref` builds exactly the same fixture as before."""
+    return int(os.environ.get(name, dflt))
+
 # ---------------------------------------------------------------- tiny architecture
-V, D, NL = 64, 24, 4
+V, D, NL = 64, _env("DSV4_D", 24), 4
 HEADS, HD, QLORA = 2, 16, 16
 ROPE_DIM = 4                      # partial_rotary_factor = 4/16
 O_GROUPS, O_RANK = 2, 8
-E, K, MOE_I = 6, 2, 16
+E, K, MOE_I = 6, 2, _env("DSV4_MOE_I", 16)
 HC, SINK_ITERS, HC_EPS = 4, 20, 1.0e-6
 IDX_HEADS, IDX_DIM, IDX_TOPK = 2, 8, 2
 WIN = 6

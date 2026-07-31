@@ -100,31 +100,45 @@ typedef struct {
     int eos[8], n_eos;
 } Cfg;
 
+/* A projection matrix as it is STORED. The oracle fixtures ship f32; the real
+ * container ships bf16, and keeping it bf16 in RAM instead of expanding on load
+ * halves the resident tier — ~25 GB -> ~12.5 GB across V4-Flash's 43 layers, which
+ * is the difference between fitting a 187 GB box and not. It is also lossless for
+ * this checkpoint: the dense tensors are fp8 e4m3 (3 mantissa bits) times a
+ * power-of-two block scale, which bf16's 8 mantissa bits represent exactly.
+ * Activations stay f32 (round_x=0), so this is weight-only. */
+typedef struct { const float *f; const uint16_t *b; } Wt;
+
 typedef struct {
     float *ln1, *ln2;
     /* attention */
-    float *q_a, *q_an, *q_b, *kv_w, *kv_n, *o_a, *o_b, *sinks;
+    Wt q_a, q_b, kv_w, o_a, o_b;
+    float *q_an, *kv_n, *sinks;
     /* compressor (CSA / HCA) */
-    float *c_kv, *c_gate, *c_bias, *c_norm;
+    Wt c_kv, c_gate;
+    float *c_bias, *c_norm;
     /* lightning indexer (CSA only) */
-    float *i_kv, *i_gate, *i_bias, *i_norm, *i_qb, *i_w;
+    Wt i_kv, i_gate, i_qb, i_w;
+    float *i_bias, *i_norm;
     /* mHC: attention site and ffn site */
     float *a_fn, *a_base, *a_scale;
     float *f_fn, *f_base, *f_scale;
     /* MoE */
-    float *router, *corr;
+    Wt router;
+    float *corr;
     int64_t *tid2eid;
     float *e_gu, *e_dn;             /* f32 experts: [E, 2I, D] and [E, D, I] */
     uint8_t *q_gu, *q_dn;           /* fp4 container: e2m1 nibbles [E*2I, D/2], [E*D, I/2] */
     uint8_t *s_gu, *s_dn;           /* ...and their ue8m0 block scales [E*2I, D/32], [E*D, I/32] */
-    float *sg, *su, *sd;            /* shared expert */
+    Wt sg, su, sd;                  /* shared expert */
 } Layer;
 
 typedef struct {
     shards S;
     Cfg c;
     Layer L[MAXL];
-    float *embed, *lm_head, *norm;
+    Wt embed, lm_head;
+    float *norm;
     float *h_fn, *h_base, *h_scale; /* hc_head: final stream collapse */
     int xq;                         /* 1 = fp4 routed-expert container */
 } Model;
@@ -360,6 +374,28 @@ static float *load_t(Model *m, const char *name) {
 static float *load_opt(Model *m, const char *name) {
     return st_numel(&m->S, name) < 0 ? NULL : load_t(m, name);
 }
+/* A projection: kept bf16 when the file stores bf16, expanded to f32 otherwise.
+ * st.h dtype 0 == BF16. */
+static Wt load_w(Model *m, const char *name) {
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    Wt w = {NULL, NULL};
+    if (t->dtype == 0) {
+        uint16_t *p = malloc((size_t)t->numel * sizeof(uint16_t));
+        if (!p) { fprintf(stderr, "OOM %lld bf16 for %s\n", (long long)t->numel, name); exit(1); }
+        st_read_raw(&m->S, name, p, 1);
+        w.b = p;
+    } else {
+        w.f = load_t(m, name);
+    }
+    return w;
+}
+static Wt load_w_opt(Model *m, const char *name) {
+    Wt z = {NULL, NULL};
+    return st_numel(&m->S, name) < 0 ? z : load_w(m, name);
+}
+static int wt_null(Wt w) { return !w.f && !w.b; }
+
 /* raw bytes of an already-quantized tensor (fp4 nibbles, ue8m0 scales) */
 static uint8_t *load_u8(Model *m, const char *name) {
     int64_t nb = st_nbytes(&m->S, name);
@@ -437,7 +473,7 @@ static void model_load(Model *m, const char *snap) {
     Cfg *c = &m->c;
     char n[256];
 
-    m->embed = load_t(m, "model.embed_tokens.weight");
+    m->embed = load_w(m, "model.embed_tokens.weight");
     m->norm = load_t(m, "model.norm.weight");
     /* Output projection. V4 calls it `head.weight` — both in the shipped checkpoint and
      * in what transformers' save_pretrained writes for this arch — while other engines
@@ -445,9 +481,9 @@ static void model_load(Model *m, const char *snap) {
      * correct when the config actually ties them; doing it silently on a missing tensor
      * turned an untied model into a tied one and cost a full oracle failure (the whole
      * stack matched transformers layer-for-layer, and only the logits were wrong). */
-    m->lm_head = load_opt(m, "lm_head.weight");
-    if (!m->lm_head) m->lm_head = load_opt(m, "head.weight");
-    if (!m->lm_head) {
+    m->lm_head = load_w_opt(m, "lm_head.weight");
+    if (wt_null(m->lm_head)) m->lm_head = load_w_opt(m, "head.weight");
+    if (wt_null(m->lm_head)) {
         if (!c->tie_embed) {
             fprintf(stderr, "no output projection (lm_head.weight / head.weight) and "
                             "tie_word_embeddings is false\n"); exit(1); }
@@ -461,15 +497,16 @@ static void model_load(Model *m, const char *snap) {
         Layer *L = &m->L[i];
 #define LT(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_t(m, n); } while (0)
 #define LO(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_opt(m, n); } while (0)
+#define LW(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_w(m, n); } while (0)
         LT(ln1, "model.layers.%d.input_layernorm.weight");
         LT(ln2, "model.layers.%d.post_attention_layernorm.weight");
-        LT(q_a, "model.layers.%d.self_attn.q_a_proj.weight");
+        LW(q_a, "model.layers.%d.self_attn.q_a_proj.weight");
         LT(q_an, "model.layers.%d.self_attn.q_a_norm.weight");
-        LT(q_b, "model.layers.%d.self_attn.q_b_proj.weight");
-        LT(kv_w, "model.layers.%d.self_attn.kv_proj.weight");
+        LW(q_b, "model.layers.%d.self_attn.q_b_proj.weight");
+        LW(kv_w, "model.layers.%d.self_attn.kv_proj.weight");
         LT(kv_n, "model.layers.%d.self_attn.kv_norm.weight");
-        LT(o_a, "model.layers.%d.self_attn.o_a_proj.weight");
-        LT(o_b, "model.layers.%d.self_attn.o_b_proj.weight");
+        LW(o_a, "model.layers.%d.self_attn.o_a_proj.weight");
+        LW(o_b, "model.layers.%d.self_attn.o_b_proj.weight");
         LT(sinks, "model.layers.%d.self_attn.sinks");
         LT(a_fn, "model.layers.%d.attn_hc.fn");
         LT(a_base, "model.layers.%d.attn_hc.base");
@@ -477,26 +514,26 @@ static void model_load(Model *m, const char *snap) {
         LT(f_fn, "model.layers.%d.ffn_hc.fn");
         LT(f_base, "model.layers.%d.ffn_hc.base");
         LT(f_scale, "model.layers.%d.ffn_hc.scale");
-        LT(router, "model.layers.%d.mlp.gate.weight");
+        LW(router, "model.layers.%d.mlp.gate.weight");
         LO(corr, "model.layers.%d.mlp.gate.e_score_correction_bias");
         load_experts(m, L, i);
-        LT(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
-        LT(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
-        LT(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
+        LW(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
+        LW(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
+        LW(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
 
         if (c->att[i] != ATT_SLIDING) {
-            LT(c_kv, "model.layers.%d.self_attn.compressor.kv_proj.weight");
-            LT(c_gate, "model.layers.%d.self_attn.compressor.gate_proj.weight");
+            LW(c_kv, "model.layers.%d.self_attn.compressor.kv_proj.weight");
+            LW(c_gate, "model.layers.%d.self_attn.compressor.gate_proj.weight");
             LT(c_bias, "model.layers.%d.self_attn.compressor.position_bias");
             LT(c_norm, "model.layers.%d.self_attn.compressor.kv_norm.weight");
         }
         if (c->att[i] == ATT_CSA) {
-            LT(i_kv, "model.layers.%d.self_attn.compressor.indexer.kv_proj.weight");
-            LT(i_gate, "model.layers.%d.self_attn.compressor.indexer.gate_proj.weight");
+            LW(i_kv, "model.layers.%d.self_attn.compressor.indexer.kv_proj.weight");
+            LW(i_gate, "model.layers.%d.self_attn.compressor.indexer.gate_proj.weight");
             LT(i_bias, "model.layers.%d.self_attn.compressor.indexer.position_bias");
             LT(i_norm, "model.layers.%d.self_attn.compressor.indexer.kv_norm.weight");
-            LT(i_qb, "model.layers.%d.self_attn.compressor.indexer.q_b_proj.weight");
-            LT(i_w, "model.layers.%d.self_attn.compressor.indexer.scorer.weights_proj.weight");
+            LW(i_qb, "model.layers.%d.self_attn.compressor.indexer.q_b_proj.weight");
+            LW(i_w, "model.layers.%d.self_attn.compressor.indexer.scorer.weights_proj.weight");
         }
         if (c->hash[i]) {
             snprintf(n, sizeof(n), "model.layers.%d.mlp.gate.tid2eid", i);
@@ -510,6 +547,7 @@ static void model_load(Model *m, const char *snap) {
         }
 #undef LT
 #undef LO
+#undef LW
     }
     /* Shared-expert width is whatever the checkpoint ships (the reference reads it from
      * `intermediate_size`, which attribute-maps onto moe_intermediate_size). Derive it
@@ -568,6 +606,19 @@ static void state_free(Model *m, State *s) {
 /* ---------- small kernels ---------- */
 static void mm(float *y, const float *x, const float *W, int S, int I, int O) {
     matmul_f32(y, x, W, S, I, O, g_exact);
+}
+
+static void mmw(float *y, const float *x, Wt w, int S, int I, int O) {
+    if (w.b) matmul_bf16_k(y, x, w.b, S, I, O, 0, g_exact);
+    else     matmul_f32(y, x, w.f, S, I, O, g_exact);
+}
+static inline const float *wt_row_f32(Wt w, int64_t off, float *tmp, int n) {
+    if (!w.b) return w.f + off;
+    for (int i = 0; i < n; i++) {                    /* bf16 -> f32 for a raw row read */
+        uint32_t u = (uint32_t)w.b[off + i] << 16;
+        memcpy(&tmp[i], &u, 4);
+    }
+    return tmp;
 }
 
 /* RMSNorm with no learned weight (DeepseekV4UnweightedRMSNorm). */
@@ -686,7 +737,7 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
     int sel[64];
     if (K > 64) { fprintf(stderr, "top-k %d exceeds 64\n", K); exit(1); }
 
-    mm(logits, x, L->router, 1, D, E);
+    mmw(logits, x, L->router, 1, D, E);
     for (int e = 0; e < E; e++) score[e] = sqrtf(softplusf(logits[e]));
 
     if (c->hash[li]) {
@@ -737,14 +788,14 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
     /* shared expert: separate gate/up/down tensors, same clamped SwiGLU */
     int SI = c->shared_I; float lim = c->swiglu_limit;
     float *g = h, *u = h + SI;
-    mm(g, x, L->sg, 1, D, SI);
-    mm(u, x, L->su, 1, D, SI);
+    mmw(g, x, L->sg, 1, D, SI);
+    mmw(u, x, L->su, 1, D, SI);
     for (int i = 0; i < SI; i++) {
         float gi = g[i] > lim ? lim : g[i];
         float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
         g[i] = siluf(gi) * ui;
     }
-    mm(tmp, g, L->sd, 1, SI, D);
+    mmw(tmp, g, L->sd, 1, SI, D);
     for (int i = 0; i < D; i++) out[i] = acc[i] + tmp[i];
 }
 
@@ -866,12 +917,12 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     /* queries: q_a -> q_a_norm -> q_b -> per-head unweighted RMSNorm -> rope */
     float *qres = falloc((int64_t)n * c->q_lora);
     float *qtmp = falloc((int64_t)n * c->q_lora);
-    mm(qtmp, xn, L->q_a, n, D, c->q_lora);
+    mmw(qtmp, xn, L->q_a, n, D, c->q_lora);
     for (int t = 0; t < n; t++)
         rmsnorm_row(qres + (int64_t)t * c->q_lora, qtmp + (int64_t)t * c->q_lora, L->q_an, c->q_lora, c->eps);
     free(qtmp);
     float *q = falloc((int64_t)n * H * hd);
-    mm(q, qres, L->q_b, n, c->q_lora, H * hd);
+    mmw(q, qres, L->q_b, n, c->q_lora, H * hd);
     for (int t = 0; t < n; t++)
         for (int h = 0; h < H; h++) {
             float *qh = q + ((int64_t)t * H + h) * hd;
@@ -882,7 +933,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     /* the single shared KV head: kv_proj -> kv_norm -> rope. K IS V. */
     float *knew = falloc((int64_t)n * hd);
     { float *raw = falloc((int64_t)n * hd);
-      mm(raw, xn, L->kv_w, n, D, hd);
+      mmw(raw, xn, L->kv_w, n, D, hd);
       for (int t = 0; t < n; t++) {
           rmsnorm_row(knew + (int64_t)t * hd, raw + (int64_t)t * hd, L->kv_n, hd, c->eps);
           rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f, ms);
@@ -909,8 +960,8 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         m_r = c->att[li] == ATT_CSA ? c->m_csa : c->m_hca;
         int wid = c->att[li] == ATT_CSA ? 2 * hd : hd;
         float *ckv = falloc((int64_t)n * wid), *cgt = falloc((int64_t)n * wid);
-        mm(ckv, xn, L->c_kv, n, D, wid);
-        mm(cgt, xn, L->c_gate, n, D, wid);
+        mmw(ckv, xn, L->c_kv, n, D, wid);
+        mmw(cgt, xn, L->c_gate, n, D, wid);
         compress_push(c, ls, 0, ckv, cgt, n, m_r, hd, c->att[li] == ATT_CSA, L->c_bias, L->c_norm);
         free(ckv); free(cgt);
         ncomp = ls->ncomp[0];
@@ -929,17 +980,17 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
              * aligned across calls, so this cannot be skipped when ncomp == 0. */
             int idim = c->idx_dim, IH = c->idx_heads;
             float *ikv = falloc((int64_t)n * 2 * idim), *igt = falloc((int64_t)n * 2 * idim);
-            mm(ikv, xn, L->i_kv, n, D, 2 * idim);
-            mm(igt, xn, L->i_gate, n, D, 2 * idim);
+            mmw(ikv, xn, L->i_kv, n, D, 2 * idim);
+            mmw(igt, xn, L->i_gate, n, D, 2 * idim);
             compress_push(c, ls, 1, ikv, igt, n, m_r, idim, 1, L->i_bias, L->i_norm);
             free(ikv); free(igt);
             int nic = ls->ncomp[1];
             const float *ic = ls->comp[1];
             if (ncomp > 0) {
             float *iq = falloc((int64_t)n * IH * idim);
-            mm(iq, qres, L->i_qb, n, c->q_lora, IH * idim);
+            mmw(iq, qres, L->i_qb, n, c->q_lora, IH * idim);
             float *iw = falloc((int64_t)n * IH);
-            mm(iw, xn, L->i_w, n, D, IH);
+            mmw(iw, xn, L->i_w, n, D, IH);
             float wsc = 1.f / sqrtf((float)IH), ssc = 1.f / sqrtf((float)idim);
 
             int cand = nic < ncomp ? nic : ncomp;
@@ -1030,9 +1081,11 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         }
         /* grouped low-rank output projection: g blocks of gin -> o_rank, then mixed to D */
         for (int g = 0; g < c->o_groups; g++)
-            mm(grp + (int64_t)g * c->o_rank, acc + (int64_t)g * gin,
-               L->o_a + (int64_t)g * c->o_rank * gin, 1, gin, c->o_rank);
-        mm(out + (int64_t)t * D, grp, L->o_b, 1, c->o_groups * c->o_rank, D);
+        {   Wt oa = L->o_a;
+            int64_t off = (int64_t)g * c->o_rank * gin;
+            Wt g_oa = { oa.f ? oa.f + off : NULL, oa.b ? oa.b + off : NULL };
+            mmw(grp + (int64_t)g * c->o_rank, acc + (int64_t)g * gin, g_oa, 1, gin, c->o_rank); }
+        mmw(out + (int64_t)t * D, grp, L->o_b, 1, c->o_groups * c->o_rank, D);
     }
 
     /* keep the last win-1 sliding entries */
@@ -1055,10 +1108,13 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     int D = c->D, V = c->V, hc = c->hc_mult;
 
     float *hs = falloc((int64_t)n * hc * D);            /* the hc parallel residual streams */
-    for (int t = 0; t < n; t++)
+    float *erow = falloc(D);
+    for (int t = 0; t < n; t++) {
+        const float *e = wt_row_f32(m->embed, (int64_t)ids[t] * D, erow, D);
         for (int k = 0; k < hc; k++)
-            memcpy(hs + ((int64_t)t * hc + k) * D, m->embed + (int64_t)ids[t] * D,
-                   (size_t)D * sizeof(float));
+            memcpy(hs + ((int64_t)t * hc + k) * D, e, (size_t)D * sizeof(float));
+    }
+    free(erow);
 
     int mixn = (2 + hc) * hc;
     float *coll = falloc((int64_t)n * D), *xn = falloc((int64_t)n * D);
@@ -1112,7 +1168,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
             for (int i = 0; i < D; i++) hv[i] += pre * st[(int64_t)k * D + i];
         }
         rmsnorm_row(hv, hv, m->norm, D, c->eps);
-        mm(logits + (int64_t)(logits_all ? t : 0) * V, hv, m->lm_head, 1, D, V);
+        mmw(logits + (int64_t)(logits_all ? t : 0) * V, hv, m->lm_head, 1, D, V);
     }
     free(hs); free(coll); free(xn); free(sub); free(post); free(comb);
     free(flat); free(mix); free(tmp); free(scratch); free(hv);
