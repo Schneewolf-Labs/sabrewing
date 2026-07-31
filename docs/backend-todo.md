@@ -5,6 +5,26 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 
 ## 🔴 Correctness — quietly wrong or unverified
 
+- [x] **Expert cache served the wrong experts** — `moe()` acquired a slot for
+  every routed pair up front; `slot_acquire` evicts the LRU unpinned slot and
+  could recycle one still owed to an earlier pair. Fixed by acquiring / filling /
+  computing in rounds bounded by the unpinned slot count (bit-exact; a cap that
+  holds the whole call is one round). `INK_CACHE_CHECK=1` asserts the invariant.
+  Same class as upstream JustVugg/colibri#701 — `colibri.c` (blocks of 64 unique
+  experts into a dedicated working set), `olmoe.c` (one expert at a time) and
+  `laguna.c` (no evicting expert cache) were all checked and are immune.
+- [x] **Non-finite router / logits were silent** — shared `moe_topk` left
+  `sel[a] = -1` when every score was NaN (laguna read expert −1; inkling wrote
+  `eusage[layer][-1]`), olmoe's own top-k fed −1 to `expert_get` where it is the
+  in-flight sentinel, and shared `sample_logits` pinned greedy output to token 0.
+  All three now degrade deterministically and warn once. Upstream #563 / #370
+  had fixed only the `colibri.c` copies.
+- [ ] **Tiny oracle snapshots are gone** — `/tmp/tlag`, `/tmp/tlag_i4` and the
+  tiny inkling fixture no longer exist on this box, so the token-exact harness
+  cannot run here at all. Rebuilding needs `transformers >= 5.7`
+  (`tools/make_tiny_laguna.py`, `make_tiny_inkling.py`). Until then engine changes
+  can only be validated by cross-build greedy identity on the real containers.
+
 - [~] **MTP speculative decode** — draft+verify with the shipped 8-module head.
   Phase 1 (n-gram scaffolding + conv rollback) and depth-0 drafting are DONE and
   lossless-validated; the depth-0 recipe is correct (real acceptance 38.5% → the

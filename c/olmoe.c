@@ -613,6 +613,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
                 if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
             }
+            /* all-NaN gate probabilities leave best at -1, and expert_get would
+             * then look up eid -1 — which is this cache's IN-FLIGHT sentinel, so
+             * it can match a slot holding nothing. Degrade to the lowest
+             * unselected expert instead (same guard as shared moe_topk). */
+            if (best < 0) {
+                static int warned;
+                if (!warned) { warned = 1; fprintf(stderr, "[router] non-finite gate scores; degraded expert selection\n"); }
+                for (int e = 0; e < E && best < 0; e++) {
+                    int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
+                    if (!taken) best = e;
+                }
+                if (best < 0) best = 0;
+                bv = pr[best];
+            }
             idx[kk] = best; val[kk] = bv;
         }
         if (c->norm_topk) { float sm=0; for(int kk=0;kk<K;kk++) sm+=val[kk]; for(int kk=0;kk<K;kk++) val[kk]/=sm; }

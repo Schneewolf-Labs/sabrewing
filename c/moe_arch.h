@@ -15,6 +15,7 @@
  *   olmoe:  softmax, no bias, no shared.
  *   glm:    sigmoid, corr-bias, shared SCALED. */
 #ifndef MOE_ARCH_H
+#include <stdio.h>      /* moe_topk's degraded-selection warning */
 #define MOE_ARCH_H
 
 /* router score activation applied to the gate logits before top-k selection */
@@ -68,6 +69,20 @@ static void moe_topk(const float *score, const float *corr_bias, int use_bias, i
             if (used) continue;
             float s = score[e] + (use_bias && corr_bias ? corr_bias[e] : 0.f);
             if (s > bv) { bv = s; best = e; }
+        }
+        /* Every candidate non-finite (NaN loses every comparison, so bv never
+         * moves) leaves best at -1, and the callers index with it: laguna reads
+         * expert weights at -1, inkling writes eusage[layer][-1] and asks the
+         * slot cache for expert -1. Degrade to the lowest unselected expert and
+         * say so once — a poisoned router should not become a heap write. */
+        if (best < 0) {
+            static int warned;
+            if (!warned) { warned = 1; fprintf(stderr, "[router] non-finite scores; degraded expert selection\n"); }
+            for (int e = 0; e < E && best < 0; e++) {
+                int used = 0; for (int b = 0; b < a; b++) if (sel[b] == e) { used = 1; break; }
+                if (!used) best = e;
+            }
+            if (best < 0) best = 0;                       /* K > E: the caller's contract is already broken */
         }
         sel[a] = best;
     }

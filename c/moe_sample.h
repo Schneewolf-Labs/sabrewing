@@ -53,10 +53,28 @@ static int sample_logits_full(const float *logit, int n, float temp, double cut,
 #define SAMPLE_HEAD     64      /* first head size tried */
 #define SAMPLE_HEAD_MAX 4096    /* widen to here, then sort the whole vocabulary */
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    int best = 0; for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    /* NaN loses every comparison, so seeding best=0 let one poisoned logit (a bad
+     * streamed expert tile, an fp overflow) pin the argmax to token 0 and emit it
+     * forever — silently. Scan for the best FINITE logit instead; on all-NaN there
+     * is no meaningful answer, so say so and give token 0 deliberately. */
+    int best = -1;
+    for (int i = 0; i < n; i++) if (isfinite(logit[i]) && (best < 0 || logit[i] > logit[best])) best = i;
+    if (best < 0) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "[sample] all logits non-finite; emitting token 0\n"); }
+        return 0;
+    }
     if (temp <= 0.f) return best;
     double sum = 0;                              /* full mass, index order (as above) */
     for (int i = 0; i < n; i++) sum += expf((logit[i] - logit[best]) / temp);
+    /* one NaN poisons the sum, one +Inf saturates it; either way the nucleus walk
+     * below compares against a non-finite cut, never fires, and falls out to
+     * idx[0]. Degrade to the finite argmax instead of a silent wrong draw. */
+    if (!isfinite(sum) || sum <= 0.0) {
+        static int warned;
+        if (!warned) { warned = 1; fprintf(stderr, "[sample] non-finite logits; emitting argmax of the finite entries\n"); }
+        return best;
+    }
     double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
 
     float pv[SAMPLE_HEAD_MAX], tv[SAMPLE_HEAD_MAX];   /* head: probs, logits (descending) */
