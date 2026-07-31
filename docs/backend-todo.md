@@ -41,14 +41,26 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [x] **Multimodal token rejection** — text-only load, but an image/audio
   placeholder token (200054 / 200053) in a prompt reads a meaningless embedding
   row instead of erroring. Detect and reject with a clear message.
-- [ ] **DeepSeek-V4 has never met the transformers oracle** — `c/deepseek.c` landed
-  from a clean read of `modeling_deepseek_v4.py` in a container with no torch, no
-  GPU and no weights, so `make deepseek-test` has *not* run. It is cross-checked
-  against a dependency-free pure-Python reimplementation (`make deepseek-ref`:
-  logits to 6.5e-07, split-prefill bit-identical, mutation-tested), which catches
-  transcription bugs but not a shared misreading of the reference. Run
-  `make deepseek-test` on a box with torch before trusting any output, and before
-  building the quantized container on top. See `docs/deepseek.md`.
+- [x] **DeepSeek-V4 has never met the transformers oracle** — run 2026-07-31 on
+  transformers 5.14.1. It FAILED, exactly as this entry feared: the pure-Python
+  cross-check shared the engine's misreading. Two bugs, both fatal to the real
+  checkpoint — `head.weight` vs `lm_head.weight` (the loader silently fell back to
+  tied embeddings on an untied model) and a dropped YaRN `attention_factor` (1.2773,
+  not 1.0, and it scales cos AND sin so RoPE stops being norm-preserving). Both
+  fixed; `make deepseek-test` is now ORACLE PASS at logits rel 1.50e-07, tf 21/21,
+  greedy 8/8. The harness gaps that hid them are closed too (dsv4_ref.py pinned
+  attention_factor=1.0; make_tiny_deepseek.py's 2-head indexer made whole score rows
+  tie so the fixture measured torch.topk's undefined tie-break). See
+  `docs/deepseek.md`.
+- [ ] **DeepSeek-V4 is CPU-only and single-stream** — the shipped 284B fp4 checkpoint
+  now runs (`tools/convert_deepseek_fp4.py` + `matmul_fp4_k`, ~161 GB resident), but
+  decode is a per-token per-expert loop. `matmul_fp4_kb` (batched, one weight-row read
+  per group) is written and validated but **nothing calls it** — wiring it up plus a
+  CUDA tier is where the throughput is, and 256 experts at top-6 is exactly the shape
+  the group-by-expert path was built for.
+- [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
+  entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
+  the actual blocker on long context, not the weights.
 - [ ] **KV cache not trimmed to the sliding window** — global layers keep full KV;
   55/66 layers only need 512 tokens but we store all. Long context over-allocates
   and never recycles across requests. Trim sliding layers to their window.

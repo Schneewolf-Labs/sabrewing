@@ -31,13 +31,13 @@ Practical consequences for work in this repo:
 |---|---|
 | `c/laguna.c` | Laguna engine (primary) — see `docs/laguna.md` |
 | `c/inkling.c` | Inkling 975B engine (NVMe expert streaming) — `docs/inkling.md` |
-| `c/deepseek.c` | DeepSeek-V4-Flash engine (mHC + CSA/HCA compressed attention) — `docs/deepseek.md`. Stage A: f32 CPU, transformers oracle not yet run |
+| `c/deepseek.c` | DeepSeek-V4-Flash engine (mHC + CSA/HCA compressed attention) — `docs/deepseek.md`. Stage B: oracle-green, runs the shipped 284B fp4 checkpoint on CPU |
 | `c/colibri.c` | GLM engine (vendored upstream substrate) |
 | `c/olmoe.c` | OLMoE (small, fast arch-generalization check) |
-| `c/moe_*.h` | shared MoE runtime: `moe_arch.h` descriptors + hooks, `moe_block.h` routing/combine, `moe_attn.h` SDPA, `moe_matmul.h` f32 GEMM, `moe_quant.h` int4/int8 kernels, `moe_sample.h`, `moe_serve.h` |
+| `c/moe_*.h` | shared MoE runtime: `moe_arch.h` descriptors + hooks, `moe_block.h` routing/combine, `moe_attn.h` SDPA, `moe_matmul.h` f32 GEMM, `moe_quant.h` int4/int8/fp4 kernels, `moe_sample.h`, `moe_serve.h` |
 | `c/backend_cuda_laguna.{cu,h}` | Laguna CUDA tier (VRAM residents + expert cache + grouped expert GEMM) |
 | `c/openai_server.py` | OpenAI + Anthropic gateway, web UI (`web/`) |
-| `c/tools/` | converters (`convert_laguna_int4.py`), tiny-oracle builders (`make_tiny_*.py`), `kernel_check.c` |
+| `c/tools/` | converters (`convert_laguna_int4.py`, `convert_deepseek_fp4.py`), tiny-oracle builders (`make_tiny_*.py`), `kernel_check.c` |
 | `docs/moe-runtime-plan.md` | the five-pillar architecture plan + phase sequencing |
 | `docs/backend-todo.md` | live loose-ends/roadmap ledger — cross items off here |
 
