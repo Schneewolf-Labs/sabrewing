@@ -213,7 +213,29 @@ cd c && python3 tools/convert_deepseek_fp4.py \
 SNAP=/mnt/AZURA/dsv4_fp4 ./deepseek -f chat.txt -n 64
 ```
 
-Download 167 GB, convert ~40 min (I/O bound, ~55 s/layer), container ~161 GB.
+Download 167 GB, convert ~40 min (I/O bound, ~55 s/layer), container 162 GB.
+
+First end-to-end run on the box in CLAUDE.md (24-core AVX-512, 187 GB RAM), CPU only:
+
+```
+[deepseek] 43 layers, 256 experts (top-6), hc_mult 4, loaded in 837.5s (rss 130.6 GB)
+[deepseek] prefill 12 tok in 99.36s (0.1 tok/s)
+A beam splits the night,
+Salt spray crashes on the rocks,
+A silent guide home.
+[deepseek] 18 tok in 171.83s (0.10 tok/s), rss 130.6 GB
+```
+
+Prompt built with the repo's own `encoding/encoding_dsv4.py` (`thinking_mode="chat"`);
+V4 ships **no jinja chat template**, so `-f` needs a file that encoder produced. The 12
+prefill tokens match `AutoTokenizer.encode` exactly, which is the check that the special
+tokens (`<｜begin▁of▁sentence｜>`, `<｜User｜>`, `<｜Assistant｜>`, `</think>`) survive
+`tok.h`. Generation stopped on EOS on its own.
+
+**0.10 tok/s is the honest number and it is slow** — single stream, CPU, per-token
+per-expert GEMV, nothing batched. That is the Known-limits list below, not a surprise.
+Peak RSS was ~171 GB during decode against the 130.6 GB reported after load (scratch,
+the growing compressed-KV series, and the sliding ring).
 
 **The conversion is lossless**, which is the whole point of the container choice:
 
