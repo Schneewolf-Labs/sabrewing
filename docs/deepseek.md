@@ -215,16 +215,57 @@ SNAP=/mnt/AZURA/dsv4_fp4 ./deepseek -f chat.txt -n 64
 
 Download 167 GB, convert ~40 min (I/O bound, ~55 s/layer), container 162 GB.
 
-First end-to-end run on the box in CLAUDE.md (24-core AVX-512, 187 GB RAM), CPU only:
+Runs on the box in CLAUDE.md (Ryzen 9 7900, **12 cores / 24 threads**, 187 GB RAM,
+RTX A6000 48 GB). Same prompt, same output tokens in all three arms:
+
+| | prefill 12 tok | decode | note |
+|---|---|---|---|
+| as first landed | 99.36 s | 0.10 tok/s | OpenMP team = 24 (SMT) |
+| `moe_omp_autotune()` | 2.89 s | 2.37 tok/s | team = 12 physical cores |
+| `+ CUDA=1` residents | 1.44 s | 7.13 tok/s | bf16 projections in VRAM |
 
 ```
-[deepseek] 43 layers, 256 experts (top-6), hc_mult 4, loaded in 837.5s (rss 130.6 GB)
-[deepseek] prefill 12 tok in 99.36s (0.1 tok/s)
+[deepseek] cuda: 50.6 GB free, budgeting 48.6 GB for bf16 residents
+[deepseek] 43 layers, 256 experts (top-6), hc_mult 4, loaded in 801.7s (rss 150.9 GB)
+[deepseek] prefill 12 tok in 1.44s (8.4 tok/s)
 A beam splits the night,
 Salt spray crashes on the rocks,
 A silent guide home.
-[deepseek] 18 tok in 171.83s (0.10 tok/s), rss 130.6 GB
+[deepseek] 18 tok in 2.53s (7.13 tok/s), rss 150.9 GB
+[prof] attn 0.84s (qkv 0.25 compressor 0.12 sdpa-loop 0.02 o_a 0.29 o_b 0.16) |
+       moe 2.84s (router 0.03 routed 2.63 shared 0.17)
 ```
+
+**The 24x was a one-line bug, not an optimisation.** `deepseek.c` was the only engine
+here not calling `moe_omp_autotune()`, so its OpenMP team defaulted to one thread per
+*hardware* thread. `moe_util.h` already documents this exact cliff on this exact CPU
+(~28x for laguna), and V4 hit it just as hard. Measured on a 4-layer subset, one binary:
+12 tok prefill was **8.5 s at 24 threads, 0.32 s at 8**. Output is byte-identical — it
+is purely a scheduling fix.
+
+A caution learned the hard way here: the first profile run was contaminated (a
+`llama-server` and another agent's job were live), and an A/B "showed" CUDA doing
+nothing because `make deepseek-fp4` had silently **rebuilt the binary without
+`-DCOLI_CUDA`** between arms. Both are the failure modes CLAUDE.md's benchmarking rules
+name; the numbers above are from one binary per arm on an otherwise idle box.
+
+`DSV4_PROF=1` prints the phase breakdown (like laguna's `LAG_PROF`); `DSV4_NOCUDA=1`
+forces the CPU path on a CUDA build, so both arms are one binary.
+
+### CUDA tier
+
+`make deepseek CUDA=1 ARCH=native`. Only the **bf16 residents** go to VRAM — attention
+q/kv/o projections, the always-on shared expert, router, embed/head, ~14 GB of the 48 GB
+card. They were 66% of per-token matmul work, and this is a placement decision, not a
+numeric one: `lag_cuda_matmul_bf16` carries the same contract as the CPU kernel (weight
+expanded bf16→f32 exact, activations f32), host copies are kept so any failure degrades
+to CPU, and `EXACT=1` stays on the CPU double-accumulate reference. Budget with
+`DSV4_CUDA_GB`.
+
+The 147 GB of fp4 routed experts stay on the CPU and are now **71% of decode time**
+(2.63 s of 3.68 s above). That is the next lever, and it needs an fp4 (e2m1 + ue8m0)
+CUDA kernel plus a VRAM expert cache — ~34 GB of the card is free after residents, which
+is 23% of the expert set.
 
 Prompt built with the repo's own `encoding/encoding_dsv4.py` (`thinking_mode="chat"`);
 V4 ships **no jinja chat template**, so `-f` needs a file that encoder produced. The 12
@@ -260,7 +301,7 @@ the growing compressed-KV series, and the sliding ring).
 - **Dense fp8 → bf16 is exact too.** e4m3 has 3 mantissa bits and the block scale is a
   power of two, so bf16's 8 bits hold it exactly (verified: `rel=0.00e+00`).
 
-Memory, measured: **~161 GB resident**, which is why the bf16 tier exists. Projections are
+Memory, measured: **~151 GB resident**, which is why the bf16 tier exists. Projections are
 kept bf16 in RAM instead of expanded to f32 (`Wt` in `deepseek.c`, activations stay f32),
 halving residents from ~25 GB to ~12.5 GB. Loading is `pread` + `fadvise(DONTNEED)`, so
 page cache is not doubled. On the 187 GB box here that fits with ~25 GB spare — but only

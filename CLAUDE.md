@@ -113,5 +113,7 @@ once, and a wrong number is worse than no number:**
   `BATCH_VARY=1` too.
 - Keep engine-specific weight layout behind the `moe_arch.h` hooks; shared code
   stays layout-agnostic.
-- Hardware here: RTX A6000 48 GB, 24-core AVX-512 CPU, 187 GB RAM; models on
+- Hardware here: RTX A6000 48 GB, Ryzen 9 7900 **12-core / 24-thread** AVX-512 CPU
+  (the SMT split matters: engines must call `moe_omp_autotune()` or they run 24 OpenMP
+  threads on 12 cores, which is a ~25x cliff, not a small tax), 187 GB RAM; models on
   `/home/nbeerbower/Models`, `/mnt/AZURA`, `/mnt/COVENANT`.

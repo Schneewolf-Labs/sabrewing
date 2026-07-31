@@ -300,8 +300,8 @@ qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_q
 	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
 # DeepSeek-V4-Flash: mHC hyper-connections + CSA/HCA compressed attention. Stage-A f32 CPU.
-deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h
-	$(CC) $(CFLAGS) deepseek.c -o deepseek$(EXE) $(LDFLAGS)
+deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
 deepseek-test: deepseek$(EXE)

@@ -52,12 +52,19 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   attention_factor=1.0; make_tiny_deepseek.py's 2-head indexer made whole score rows
   tie so the fixture measured torch.topk's undefined tie-break). See
   `docs/deepseek.md`.
-- [ ] **DeepSeek-V4 is CPU-only and single-stream** — the shipped 284B fp4 checkpoint
-  now runs (`tools/convert_deepseek_fp4.py` + `matmul_fp4_k`, ~161 GB resident), but
-  decode is a per-token per-expert loop. `matmul_fp4_kb` (batched, one weight-row read
-  per group) is written and validated but **nothing calls it** — wiring it up plus a
-  CUDA tier is where the throughput is, and 256 experts at top-6 is exactly the shape
-  the group-by-expert path was built for.
+- [x] **DeepSeek-V4 ran 24x slower than it should have** — `deepseek.c` was the only
+  engine not calling `moe_omp_autotune()`, so its OpenMP team defaulted to one thread
+  per *hardware* thread (24) on a 12-core SMT part. This file's own laguna entry and
+  moe_util.h's comment already documented the cliff; V4 just never got the call.
+  0.10 -> 2.37 tok/s on the 284B checkpoint, byte-identical output. **Worth grepping
+  every future engine for this call before benchmarking it.**
+- [ ] **DeepSeek-V4 routed experts are still CPU-only** — with the CUDA tier holding the
+  bf16 residents (~14 GB VRAM, 2.37 -> 7.13 tok/s), the 147 GB of fp4 experts are now
+  **71% of decode** (2.63 s of 3.68 s). Needs an fp4 (e2m1 + per-32-block ue8m0) CUDA
+  kernel plus a VRAM expert cache; ~34 GB is free after residents, which covers 23% of
+  the expert set. `matmul_fp4_kb` (batched, one weight-row read per expert group) is
+  written and validated but **nothing calls it** — that is the CPU-side half of the
+  same lever, and 256 experts at top-6 is exactly the shape it was built for.
 - [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
   entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
   the actual blocker on long context, not the weights.
