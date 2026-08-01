@@ -280,6 +280,122 @@ extern "C" int lag_cuda_moe_experts(float *out, const float *x,
     return 0;
 }
 
+
+/* ---------------- fp4 (e2m1) + per-32-block ue8m0 scales ----------------
+ * DeepSeek-V4 ships its routed experts in this format, so the container keeps it
+ * verbatim rather than re-gridding onto int4 (which measured 17% relative error —
+ * e2m1's levels are non-uniform). Mirrors mm_q4_kernel exactly apart from the
+ * value decode: one warp per output row, f32 accumulate, same reduction order. */
+__constant__ float d_fp4_lut[16] = {
+    0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+    -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f,
+};
+
+/* 2^(e-127). e==0 is the denormal 2^-127, e==0xFF the format NaN — same two
+ * special cases as moe_ue8m0() on the host, so the decode agrees bit-for-bit. */
+__device__ __forceinline__ float ue8m0f(unsigned char e) {
+    if (e == 0xFF) return 0.f;
+    if (e == 0)    return 5.8774717541114375e-39f;
+    return __int_as_float(((int)e) << 23);
+}
+
+__global__ void mm_fp4_kernel(const unsigned char * __restrict__ P,
+                              const unsigned char * __restrict__ ES,
+                              const float * __restrict__ x,
+                              float * __restrict__ y, int I, int O) {
+    int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int s = blockIdx.y;
+    if (o >= O) return;
+    const unsigned char *w = P + (size_t)o * (I >> 1);
+    const unsigned char *e = ES + (size_t)o * (I >> 5);
+    const float *xs = x + (size_t)s * I;
+    int nb = I >> 1;
+    float acc = 0.f;
+    /* byte b holds columns 2b and 2b+1, which live in scale block (2b)/32 = b/16 */
+    for (int b = lane; b < nb; b += 32) {
+        unsigned char byte = w[b];
+        float sc = ue8m0f(e[b >> 4]);
+        acc += (xs[2*b] * d_fp4_lut[byte & 0xF] + xs[2*b + 1] * d_fp4_lut[byte >> 4]) * sc;
+    }
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (!lane) y[(size_t)s * O + o] = acc;
+}
+
+extern "C" int lag_cuda_matmul_fp4(float *y, const float *x, const void *packed,
+                                   const void *es, int S, int I, int O) {
+    if (!g_ok || (I & 31)) return -1;          /* scale blocks are 32 wide */
+    size_t xn = (size_t)S * I * 4, yn = (size_t)S * O * 4;
+    if (ensure_xy(xn, yn)) return -1;
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    dim3 grid((unsigned)((O + 3) / 4), (unsigned)S);
+    mm_fp4_kernel<<<grid, 128, 0, g_st>>>((const unsigned char *)packed,
+                                          (const unsigned char *)es, g_dx, g_dy, I, O);
+    cudaMemcpyAsync(g_hy, g_dy, yn, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(y, g_hy, yn);
+    return 0;
+}
+
+/* V4's SwiGLU is clamped, and ASYMMETRICALLY: gate.clamp(max=limit) but
+ * up.clamp(-limit, limit). Getting that symmetric is silent — it only shows on
+ * outliers — so this is a separate kernel rather than a tweak to silu_glu_kernel.
+ * expf (not __expf) to match the host siluf. */
+__global__ void silu_glu_clamp_kernel(const float * __restrict__ g, float * __restrict__ gg,
+                                      int I, float lim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= I) return;
+    float a = g[i], u = g[I + i];
+    a = a > lim ? lim : a;
+    u = u > lim ? lim : (u < -lim ? -lim : u);
+    gg[i] = (a / (1.f + expf(-a))) * u;
+}
+
+extern "C" int lag_cuda_moe_experts_fp4(float *out, const float *x,
+                                        const void *gu_q, const void *gu_es,
+                                        const void *dn_q, const void *dn_es,
+                                        const int *sel, const float *w, int K,
+                                        int I, int D, float limit) {
+    if (!g_ok || (D & 31) || (I & 31)) return -1;
+    size_t xn = (size_t)D * 4;
+    if (xn > g_xcap) {
+        cudaFree(g_dx); cudaFreeHost(g_hx);
+        if (cudaMalloc(&g_dx, xn * 2) != cudaSuccess ||
+            cudaMallocHost(&g_hx, xn * 2) != cudaSuccess) { g_dx = g_hx = nullptr; g_xcap = 0; return -1; }
+        g_xcap = xn * 2;
+    }
+    if (I > e_I) { cudaFree(e_dg); cudaFree(e_dgg);
+        if (cudaMalloc(&e_dg, (size_t)2*I*4) != cudaSuccess ||
+            cudaMalloc(&e_dgg, (size_t)I*4) != cudaSuccess) { e_dg = e_dgg = nullptr; e_I = 0; return -1; }
+        e_I = I; }
+    if (D > e_D) { cudaFree(e_dout); cudaFreeHost(e_hout);
+        if (cudaMalloc(&e_dout, (size_t)D*4) != cudaSuccess ||
+            cudaMallocHost(&e_hout, (size_t)D*4) != cudaSuccess) { e_dout = e_hout = nullptr; e_D = 0; return -1; }
+        e_D = D; }
+    if (D > me_D) { cudaFree(me_acc);
+        if (cudaMalloc(&me_acc, (size_t)D*4) != cudaSuccess) { me_acc = nullptr; me_D = 0; return -1; }
+        me_D = D; }
+    memcpy(g_hx, x, xn);
+    cudaMemcpyAsync(g_dx, g_hx, xn, cudaMemcpyHostToDevice, g_st);
+    zero_kernel<<<(unsigned)((D + 255) / 256), 256, 0, g_st>>>(me_acc, D);
+    for (int k = 0; k < K; k++) {
+        int e = sel[k];
+        const unsigned char *p13 = (const unsigned char *)gu_q  + (size_t)e * (2*I) * (D/2);
+        const unsigned char *b13 = (const unsigned char *)gu_es + (size_t)e * (2*I) * (D/32);
+        const unsigned char *p2  = (const unsigned char *)dn_q  + (size_t)e * D * (I/2);
+        const unsigned char *b2  = (const unsigned char *)dn_es + (size_t)e * D * (I/32);
+        mm_fp4_kernel<<<dim3((unsigned)((2*I + 3) / 4), 1), 128, 0, g_st>>>(p13, b13, g_dx, e_dg, D, 2*I);
+        silu_glu_clamp_kernel<<<(unsigned)((I + 255) / 256), 256, 0, g_st>>>(e_dg, e_dgg, I, limit);
+        mm_fp4_kernel<<<dim3((unsigned)((D + 3) / 4), 1), 128, 0, g_st>>>(p2, b2, e_dgg, e_dout, I, D);
+        axpy_kernel<<<(unsigned)((D + 255) / 256), 256, 0, g_st>>>(me_acc, w[k], e_dout, D);
+    }
+    cudaMemcpyAsync(e_hout, me_acc, (size_t)D*4, cudaMemcpyDeviceToHost, g_st);
+    if (cudaStreamSynchronize(g_st) != cudaSuccess) return -1;
+    memcpy(out, e_hout, (size_t)D*4);
+    return 0;
+}
+
 /* ---------------- grouped (Megablocks-style) routed experts ----------------
  * See backend_cuda_laguna.h for the contract. The layer's S*K (row, expert) pairs
  * arrive sorted by expert; each group runs as a GEMM over its rows so the expert

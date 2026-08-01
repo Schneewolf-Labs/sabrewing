@@ -26,16 +26,24 @@ Usage: python3 tools/dsv4_ref.py <outdir>
 """
 import json
 import math
+import os
 import random
 import struct
 import sys
 
+
+def _env(name, dflt):
+    """Dimension override, so tools/make_tiny_dsv4_fp4.py can ask for widths that are
+    multiples of 32 (the fp4 container's scale-block size). Defaults are unchanged,
+    so `make deepseek-ref` builds exactly the same fixture as before."""
+    return int(os.environ.get(name, dflt))
+
 # ---------------------------------------------------------------- tiny architecture
-V, D, NL = 64, 24, 4
+V, D, NL = 64, _env("DSV4_D", 24), 4
 HEADS, HD, QLORA = 2, 16, 16
 ROPE_DIM = 4                      # partial_rotary_factor = 4/16
 O_GROUPS, O_RANK = 2, 8
-E, K, MOE_I = 6, 2, 16
+E, K, MOE_I = 6, 2, _env("DSV4_MOE_I", 16)
 HC, SINK_ITERS, HC_EPS = 4, 20, 1.0e-6
 IDX_HEADS, IDX_DIM, IDX_TOPK = 2, 8, 2
 WIN = 6
@@ -124,15 +132,23 @@ def inv_yarn(theta, dim, factor, orig, beta_fast, beta_slow):
 INV_MAIN = inv_default(THETA_MAIN, ROPE_DIM)
 INV_COMP = inv_yarn(THETA_COMP, ROPE_DIM, YARN_FACTOR, YARN_ORIG, BETA_FAST, BETA_SLOW)
 
+# YaRN's attention_factor (mscale) multiplies BOTH cos and sin, so it is a per-rotation
+# GAIN, not just a phase. transformers computes 0.1*ln(factor)+1 when the config does not
+# override it. This harness used to pin it to 1.0 in the config it emits, which is why it
+# could not catch the engine dropping it: with mscale == 1 the two behaviours coincide.
+# The real V4-Flash compress rope has factor 16 -> 1.2773, so exercise a non-unit value.
+MS_MAIN = 1.0
+MS_COMP = 0.1 * math.log(YARN_FACTOR) + 1.0 if YARN_FACTOR > 1 else 1.0
 
-def rope(vec, pos, inv, sgn=1.0):
+
+def rope(vec, pos, inv, sgn=1.0, ms=1.0):
     """Interleaved RoPE on the TRAILING len(inv)*2 channels; leading channels pass through."""
     rd = len(inv) * 2
     out = list(vec)
     base = len(vec) - rd
     for j in range(len(inv)):
         ang = pos * inv[j]
-        c, s = math.cos(ang), sgn * math.sin(ang)
+        c, s = math.cos(ang) * ms, sgn * math.sin(ang) * ms
         a, b = out[base + 2 * j], out[base + 2 * j + 1]
         out[base + 2 * j] = a * c - b * s
         out[base + 2 * j + 1] = b * c + a * s
@@ -291,7 +307,7 @@ def write_config(path):
                      "partial_rotary_factor": ROPE_DIM / HD},
             "compress": {"rope_type": "yarn", "rope_theta": THETA_COMP,
                          "factor": YARN_FACTOR, "beta_fast": BETA_FAST,
-                         "beta_slow": BETA_SLOW, "attention_factor": 1.0,
+                         "beta_slow": BETA_SLOW,
                          "original_max_position_embeddings": YARN_ORIG,
                          "partial_rotary_factor": ROPE_DIM / HD},
         },
@@ -374,7 +390,7 @@ def compress(W, prefix, hidden, m, dim, overlap, norm_key):
         for d in range(dim):
             p = softmax([sg[j][d] for j in range(slots)])
             ent.append(sum(p[j] * sk[j][d] for j in range(slots)))
-        out.append(rope(rms(ent, nw), w * m, INV_COMP))
+        out.append(rope(rms(ent, nw), w * m, INV_COMP, ms=MS_COMP))
     return out
 
 
@@ -382,6 +398,7 @@ def attention(W, i, hidden, positions):
     p = f"model.layers.{i}."
     lt = LAYER_TYPES[i]
     inv = INV_MAIN if lt == "sliding_attention" else INV_COMP
+    ms = MS_MAIN if lt == "sliding_attention" else MS_COMP
     n = len(hidden)
 
     qres = [rms(matvec(W[p + "self_attn.q_a_proj.weight"], h, QLORA, D),
@@ -389,10 +406,10 @@ def attention(W, i, hidden, positions):
     q = []
     for t in range(n):
         full = matvec(W[p + "self_attn.q_b_proj.weight"], qres[t], HEADS * HD, QLORA)
-        q.append([rope(rms_plain(full[h * HD:(h + 1) * HD]), positions[t], inv)
+        q.append([rope(rms_plain(full[h * HD:(h + 1) * HD]), positions[t], inv, ms=ms)
                   for h in range(HEADS)])
     kv = [rope(rms(matvec(W[p + "self_attn.kv_proj.weight"], h, HD, D),
-                   W[p + "self_attn.kv_norm.weight"]), positions[t], inv)
+                   W[p + "self_attn.kv_norm.weight"]), positions[t], inv, ms=ms)
           for t, h in enumerate(hidden)]
 
     comp, vis = [], [[] for _ in range(n)]
@@ -410,7 +427,7 @@ def attention(W, i, hidden, positions):
             wsc, ssc = IDX_HEADS ** -0.5, IDX_DIM ** -0.5
             for t in range(n):
                 iq = matvec(W[qi + "q_b_proj.weight"], qres[t], IDX_HEADS * IDX_DIM, QLORA)
-                iq = [rope(iq[h * IDX_DIM:(h + 1) * IDX_DIM], positions[t], INV_COMP)
+                iq = [rope(iq[h * IDX_DIM:(h + 1) * IDX_DIM], positions[t], INV_COMP, ms=MS_COMP)
                       for h in range(IDX_HEADS)]
                 iw = matvec(W[qi + "scorer.weights_proj.weight"], hidden[t], IDX_HEADS, D)
                 thr = (positions[t] + 1) // m
@@ -439,7 +456,7 @@ def attention(W, i, hidden, positions):
             ex = [math.exp(v - mx) for v in logits]
             den = sum(ex) + math.exp(sinks[h] - mx)          # the sink is dropped after
             ah = [sum(ex[j] / den * keys[j][0][d] for j in range(len(keys))) for d in range(HD)]
-            heads.append(rope(ah, pos, inv, sgn=-1.0))       # K == V: undo the value rotation
+            heads.append(rope(ah, pos, inv, sgn=-1.0, ms=ms))       # K == V: undo the value rotation
         flat = [v for hv in heads for v in hv]
         gin = HEADS * HD // O_GROUPS
         grp = []

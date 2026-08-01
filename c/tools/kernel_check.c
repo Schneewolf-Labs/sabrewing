@@ -153,6 +153,72 @@ int main(void) {
     ok &= report("MOE_Q8_F32 simd",    q8f, q8r, O, 1e-3);
     ok &= report("MOE_Q8_IDOT (int8a)", q8i, q8r, O, 3e-2);
 
+    /* --- fp4 matmul_fp4_k: e2m1 codes + per-32-block ue8m0 scales (DeepSeek-V4) ---
+     * The container stores the checkpoint's own fp4 bytes verbatim, so this checks
+     * the DECODE (LUT + 2^(e-127) block scale), not a quantizer. Weights are built
+     * here the way the reference quantizer does: power-of-2 block scale from amax,
+     * then round-to-nearest onto the e2m1 ladder. */
+    {
+        uint8_t *fp = malloc((size_t)O * (I / 2));
+        uint8_t *fes = malloc((size_t)O * (I / 32));
+        float *fr = malloc((size_t)O * 4), *ff = malloc((size_t)O * 4), *fe = malloc((size_t)O * 4);
+        for (int o = 0; o < O; o++) {
+            const float *w = W + (size_t)o * I;
+            for (int b = 0; b < I / 32; b++) {
+                float am = 0.f;
+                for (int i = 0; i < 32; i++) { float a = fabsf(w[b * 32 + i]); if (a > am) am = a; }
+                int e = (am > 0.f) ? (int)ceilf(log2f(am / 6.f)) + 127 : 127;
+                if (e < 1) e = 1; if (e > 254) e = 254;
+                fes[(size_t)o * (I / 32) + b] = (uint8_t)e;
+                float s = moe_ue8m0((uint8_t)e);
+                for (int i = 0; i < 32; i++) {
+                    int col = b * 32 + i;
+                    float v = w[col] / s;
+                    /* nearest e2m1 code by exhaustive search over the 16-entry ladder */
+                    int best = 0; float bd = 1e30f;
+                    for (int k = 0; k < 16; k++) {
+                        float d = fabsf(v - moe_fp4_lut[k]);
+                        if (d < bd) { bd = d; best = k; }
+                    }
+                    size_t byte = (size_t)o * (I / 2) + col / 2;
+                    if (col & 1) fp[byte] = (uint8_t)((fp[byte] & 0x0F) | (best << 4));
+                    else         fp[byte] = (uint8_t)((fp[byte] & 0xF0) | best);
+                }
+            }
+        }
+        for (int o = 0; o < O; o++) {   /* double reference over the decoded weights */
+            const uint8_t *p = fp + (size_t)o * (I / 2);
+            const uint8_t *es = fes + (size_t)o * (I / 32);
+            double s = 0;
+            for (int c = 0; c < I / 2; c++) {
+                double sc = moe_ue8m0(es[(2 * c) / 32]);
+                s += ((double)x[2*c] * moe_fp4_lut[p[c] & 0xF]
+                    + (double)x[2*c+1] * moe_fp4_lut[p[c] >> 4]) * sc;
+            }
+            fr[o] = (float)s;
+        }
+        matmul_fp4_k(fe, x, fp, fes, I, O, 1);   /* exact double path */
+        matmul_fp4_k(ff, x, fp, fes, I, O, 0);   /* AVX-512 LUT-permute + FMA */
+        printf("fp4 matmul_fp4_k [%d->%d] vs double dequant reference:\n", I, O);
+        ok &= report("exact (double)", fe, fr, O, 1e-9);
+        ok &= report("simd (avx512)",  ff, fr, O, 1e-3);
+        for (int o = 0; o < O; o++) if (fe[o] != fr[o]) { printf("  FAIL: fp4 exact path not bit-identical\n"); ok = 0; break; }
+        /* batched path must agree row-for-row with the S=1 kernel */
+        {
+            int S = 3;
+            float *xb = malloc((size_t)S * I * 4), *yb = malloc((size_t)S * O * 4);
+            for (int s = 0; s < S; s++) for (int i = 0; i < I; i++) xb[(size_t)s*I+i] = x[i];
+            matmul_fp4_kb(yb, xb, fp, fes, S, I, O, 0);
+            int same = 1;
+            for (int s = 0; s < S; s++) for (int o = 0; o < O; o++)
+                if (yb[(size_t)s*O+o] != ff[o]) { same = 0; break; }
+            printf("  batched matmul_fp4_kb S=%d vs S=1: %s\n", S, same ? "bit-identical OK" : "FAIL");
+            if (!same) ok = 0;
+            free(xb); free(yb);
+        }
+        free(fp); free(fes); free(fr); free(ff); free(fe);
+    }
+
     /* ---- attention: the SIMD generation path vs the double-accumulate contract ----
      * laguna's oracle runs MOE_QK_DBL, so the fast path used for generation needs its
      * own check: same scores, same weighted sum, to float noise. Long windows are the

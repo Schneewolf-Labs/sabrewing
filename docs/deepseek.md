@@ -1,12 +1,17 @@
 # DeepSeek-V4-Flash on sabrewing
 
-[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is 284B total /
+[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) is 284B total /
 13B active, 43 layers, 256 experts (top-6) + 1 shared, 1M context. It ships natively as
 FP4 routed experts + FP8 dense.
 
-Engine: `c/deepseek.c`. **Stage A: f32 CPU forward pass, dependency-free.** No quantized
-container and no CUDA tier yet — the same order laguna and qwen35 landed in (oracle first,
-then the container, then the GPU tier).
+Use **`DeepSeek-V4-Flash-0731`**, the official release; the unsuffixed repo is the earlier
+preview. 0731 ships a DSpark speculative-decoding module as an extra `mtp.*` stack (config
+`dspark_*`, 3 layers, 46 `compress_ratios` for 43 layers). It is opt-in even in vLLM, this
+engine does not implement it, and the converter skips it — the 43 main layers stand alone.
+
+Engine: `c/deepseek.c`. **Stage B: the shipped fp4 checkpoint runs on CPU.** Oracle-green
+against transformers, with an fp4 expert container and a bf16 resident tier. No CUDA tier,
+no batching yet — the same order laguna and qwen35 landed in.
 
 This is the first architecture here that shares almost nothing with the others. It is worth
 reading `c/deepseek.c`'s header comment before touching it; the summary below is the map.
@@ -85,7 +90,7 @@ guessed, and each produces plausible-looking activations when wrong:
 
 ## Validation
 
-Two harnesses. Both must be green; they answer different questions.
+Three harnesses. All must be green; they answer different questions.
 
 ### 1. Dependency-free cross-check — runs anywhere, in under a second
 
@@ -133,33 +138,240 @@ cd c && make deepseek-test        # or: python3 tools/make_tiny_deepseek.py /tmp
 SNAP=/tmp/tds ./deepseek /tmp/tds/ref_deepseek.json
 ```
 
-Needs torch and a transformers carrying `deepseek_v4`. The tiny config puts all three
-attention types and both router kinds in one 4-layer stack, with YaRN on the compress rope
-and plain RoPE on the main rope.
+Needs torch and a transformers carrying `deepseek_v4` (5.14.1 here; 5.3 has no such model).
+The tiny config puts all three attention types and both router kinds in one 4-layer stack,
+with YaRN on the compress rope and plain RoPE on the main rope.
 
-**This has not been run yet** — the container this landed in has no torch, no GPU and no
-model weights. It is the first thing to run on a box that has them.
+```
+logits: max|diff| 2.980e-08 over 64 (rel 1.50e-07 vs ref scale 0.199) — ok
+split prefill (6+7): max|diff| 0.000e+00 — ok
+teacher forcing: 21/21   greedy: 8/8   ppl 61.4384 (ref 61.4384, -0.00%)
+ORACLE PASS
+```
 
-## Known limits of Stage A
+**Its first run failed, and found two bugs the dependency-free harness could not see.**
+Both would have made the 284B checkpoint emit fluent-looking garbage:
 
-- **f32 only.** The real checkpoint is FP4 experts + FP8 dense, neither of which `st.h`
-  reads; a converter is the next piece of work. Today's engine loads F32/BF16 tensors, so
-  it runs tiny models and any bf16 re-export, not the shipped 284B container.
-- **Compressed KV grows without bound.** CSA keeps one f32 `head_dim` entry per 4 tokens per
-  CSA layer — inherent to the architecture (it *is* the long-range memory), but at 1M
-  context that is hundreds of GB in f32 and needs the quantized container to be practical.
-- **No batching, no serve mode, no CUDA tier.** Single stream only.
+1. **The output projection is `head.weight`, not `lm_head.weight`.** That is its name in
+   the shipped checkpoint *and* in what `save_pretrained` writes for this arch. The loader
+   looked only for `lm_head.weight`, found nothing, and silently fell back to the tied
+   embedding — on a model with `tie_word_embeddings: false`. Every layer matched
+   transformers activation-for-activation and only the logits were wrong, which is exactly
+   how a silent fallback fails. The fallback is now conditional on the config actually
+   tying, and a hard error otherwise.
+
+2. **YaRN's `attention_factor` was dropped.** A comment here asserted V4 pins it to 1.0.
+   It does not: transformers multiplies **both** cos and sin by `0.1*ln(factor)+1`, which
+   is **1.2773** for the compress rope (factor 16). Scaling cos and sin together makes it a
+   per-rotation *gain*, so RoPE stops being norm-preserving. Sliding layers use the main
+   rope (not YaRN, factor 1.0) and stayed exact while every CSA/HCA layer drifted — that
+   asymmetry is what localised it, after a per-layer activation diff showed the compressed
+   entries matching in their leading channels but not in norm.
+
+Why the pure-Python harness missed them: it writes its own snapshot, so it never exercised
+the checkpoint's tensor names, and it **pinned `"attention_factor": 1.0`** in the config it
+emitted, making the correct and incorrect behaviours coincide. It now computes the real
+mscale. This is the "shared misreading" failure the harness's own docs warn about.
+
+A third fixture bug surfaced on the way: `make_tiny_deepseek.py` used `index_n_heads=2`.
+The indexer score is `sum_h w_h * relu(q_h . k_e)`; with two heads a random model relus
+both to zero for most (query, entry) pairs, so whole score rows tie at exactly 0.0 and the
+fixture measured **`torch.topk`'s tie-break** rather than the architecture. torch does not
+define one (it returned the highest tied index; a stable index-ascending scan returns the
+lowest), so that comparison is unwinnable and meaningless. Real V4-Flash has 64 indexer
+heads, where an all-head tie is a 2^-64 event; the fixture now uses 8.
+
+### 3. fp4 container equivalence — `make deepseek-fp4`
+
+`tools/convert_deepseek_fp4.py`'s output can only be exercised by the 167 GB checkpoint, so
+this builds the same container shape from a tiny snapshot **plus a twin holding the
+dequantized values as plain f32**. Both describe identical weights, so the fp4 expert path
+and bf16 resident tier must agree with the f32 path exactly:
+
+```
+fp4 container : logits: max|diff| 1.933e+00 ... teacher forcing: 14/19 ... got: 22 51 45 32 37 60
+f32 twin      : logits: max|diff| 1.933e+00 ... teacher forcing: 14/19 ... got: 22 51 45 32 37 60
+FP4-CONTAINER PASS
+```
+
+Comparing against the *unquantized* model instead would only measure quantization loss on
+random weights (hence the large `max|diff|` both sides share, which is not the point). Any
+*difference between the two columns* is a real plumbing bug: fused gate/up row order,
+nibble order, block-scale stride, or the kernel's decode. Widths must be multiples of 32,
+so the fixture is built with `DSV4_D=64 DSV4_MOE_I=32`.
+
+`make kernel-check` separately proves `matmul_fp4_k` decodes correctly: the exact path is
+bit-identical to a double-precision dequant reference, the AVX-512 path matches it to
+2.1e-07, and the batched kernel is bit-identical to the S=1 kernel.
+
+## Running the real checkpoint
+
+```sh
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir /mnt/AZURA/DeepSeek-V4-Flash-0731
+cd c && python3 tools/convert_deepseek_fp4.py \
+    --indir /mnt/AZURA/DeepSeek-V4-Flash-0731 --outdir /mnt/AZURA/dsv4_fp4
+SNAP=/mnt/AZURA/dsv4_fp4 ./deepseek -f chat.txt -n 64
+```
+
+Download 167 GB, convert ~40 min (I/O bound, ~55 s/layer), container 162 GB.
+
+Runs on the box in CLAUDE.md (Ryzen 9 7900, **12 cores / 24 threads**, 187 GB RAM,
+RTX A6000 48 GB). Same prompt, same output tokens in all three arms:
+
+| | prefill 12 tok | decode | note |
+|---|---|---|---|
+| as first landed | 99.36 s | 0.10 tok/s | OpenMP team = 24 (SMT) |
+| `moe_omp_autotune()` | 2.89 s | 2.37 tok/s | team = 12 physical cores |
+| `+ CUDA=1` residents | 1.44 s | 7.13 tok/s | bf16 projections in VRAM |
+| `+ fp4 expert cache` | 1.44 s | 7.42 tok/s | 9 of 43 expert layers fit |
+
+```
+[deepseek] cuda: 50.6 GB free, budgeting 48.6 GB for bf16 residents
+[deepseek] 43 layers, 256 experts (top-6), hc_mult 4, loaded in 801.7s (rss 150.9 GB)
+[deepseek] prefill 12 tok in 1.44s (8.4 tok/s)
+A beam splits the night,
+Salt spray crashes on the rocks,
+A silent guide home.
+[deepseek] 18 tok in 2.53s (7.13 tok/s), rss 150.9 GB
+[prof] attn 0.84s (qkv 0.25 compressor 0.12 sdpa-loop 0.02 o_a 0.29 o_b 0.16) |
+       moe 2.84s (router 0.03 routed 2.63 shared 0.17)
+```
+
+**The 24x was a one-line bug, not an optimisation.** `deepseek.c` was the only engine
+here not calling `moe_omp_autotune()`, so its OpenMP team defaulted to one thread per
+*hardware* thread. `moe_util.h` already documents this exact cliff on this exact CPU
+(~28x for laguna), and V4 hit it just as hard. Measured on a 4-layer subset, one binary:
+12 tok prefill was **8.5 s at 24 threads, 0.32 s at 8**. Output is byte-identical — it
+is purely a scheduling fix.
+
+A caution learned the hard way here: the first profile run was contaminated (a
+`llama-server` and another agent's job were live), and an A/B "showed" CUDA doing
+nothing because `make deepseek-fp4` had silently **rebuilt the binary without
+`-DCOLI_CUDA`** between arms. Both are the failure modes CLAUDE.md's benchmarking rules
+name; the numbers above are from one binary per arm on an otherwise idle box.
+
+`DSV4_PROF=1` prints the phase breakdown (like laguna's `LAG_PROF`); `DSV4_NOCUDA=1`
+forces the CPU path on a CUDA build, so both arms are one binary.
+
+### CUDA tier
+
+`make deepseek CUDA=1 ARCH=native`. Only the **bf16 residents** go to VRAM — attention
+q/kv/o projections, the always-on shared expert, router, embed/head, ~14 GB of the 48 GB
+card. They were 66% of per-token matmul work, and this is a placement decision, not a
+numeric one: `lag_cuda_matmul_bf16` carries the same contract as the CPU kernel (weight
+expanded bf16→f32 exact, activations f32), host copies are kept so any failure degrades
+to CPU, and `EXACT=1` stays on the CPU double-accumulate reference. Budget with
+`DSV4_CUDA_GB`.
+
+The fp4 routed experts also have a CUDA path (`mm_fp4_kernel` +
+`lag_cuda_moe_experts_fp4`: all K experts of a layer in one submission and one sync,
+with V4's asymmetric SwiGLU clamp done on device). Whole layers are cached
+all-or-nothing — a partially resident layer would still pay a host round trip per
+token — and residents are uploaded first because they serve every token.
+
+**It helps far less than the kernel speed suggests, and the reason is capacity.** On a
+layer whose experts are resident it is a clean win — the 4-layer subset, whose experts
+fit entirely, goes 16.1 → 107.3 tok/s (routed 0.16 s → 0.06 s). On the real model only
+**9 of 43 layers fit** (45.3 GB on the card), so end-to-end it is 7.13 → 7.42 tok/s,
+about **+4%**:
+
+```
+[deepseek] cuda: 9/43 expert layers in VRAM (45.3 GB total on device)
+[deepseek] 18 tok in 2.43s (7.42 tok/s), rss 150.9 GB
+[prof] attn 0.86s (...) | moe 2.69s (router 0.04 routed 2.48 shared 0.18)
+```
+
+147 GB of experts against 48 GB of card is the whole story: ~21% coverage, and routing
+is near-uniform over 256 experts so no static subset is hot enough to bias the choice.
+Streaming the top-6 experts per layer per token instead would be ~75 MB over PCIe per
+layer — ~260 ms/token, far worse than just computing them on the CPU. This scales with
+VRAM rather than with cleverness.
+
+`DSV4_CUDA_TEST=1 ./deepseek` checks the GPU fp4 kernels against the CPU ones on random
+data with no model or snapshot (the cache only engages on a 162 GB container, so
+otherwise this path would have no test that runs anywhere): the bare matmul to 8.9e-04
+max relative, and the fused K-expert path to 2.8e-06 **L2** relative. That output is
+gated on L2, not max-abs: chained fp4 → clamped SiLU-GLU → fp4 spans a huge dynamic
+range, so per-element relative error explodes on near-zero outputs and an absolute bound
+is meaningless at |ref| ~ 3e4.
+
+Prompt built with the repo's own `encoding/encoding_dsv4.py` (`thinking_mode="chat"`);
+V4 ships **no jinja chat template**, so `-f` needs a file that encoder produced. The 12
+prefill tokens match `AutoTokenizer.encode` exactly, which is the check that the special
+tokens (`<｜begin▁of▁sentence｜>`, `<｜User｜>`, `<｜Assistant｜>`, `</think>`) survive
+`tok.h`. Generation stopped on EOS on its own.
+
+**0.10 tok/s is the honest number and it is slow** — single stream, CPU, per-token
+per-expert GEMV, nothing batched. That is the Known-limits list below, not a surprise.
+Peak RSS was ~171 GB during decode against the 130.6 GB reported after load (scratch,
+the growing compressed-KV series, and the sliding ring).
+
+**The conversion is lossless**, which is the whole point of the container choice:
+
+- **Routed experts are copied VERBATIM.** The checkpoint is already fp4 (e2m1) with a
+  per-32-block ue8m0 scale. sabrewing's existing int4 container is uniform 4-bit with one
+  scale per row, and re-gridding onto it is *not* free — measured on real layer-0 experts,
+  taking the shipped fp4 weights as ground truth:
+
+  | container | relative error |
+  |---|---|
+  | int4, per-row scale | 17.0% |
+  | int4, group-128 | 11.8% |
+  | int4, group-32 (same granularity!) | 9.7% |
+  | fp4 verbatim | 0% |
+
+  The loss is not dynamic range — the per-row ue8m0 exponent spread is only ~1 power of 2.
+  It is that e2m1's levels are non-uniform (`{0,.5,1,1.5,2,3,4,6}`), so mapping them onto
+  int4's uniform ladder quantizes a second time. Keeping the source format also makes
+  conversion a byte copy rather than a dequant/requant pass over 277B parameters. The
+  nibble convention already matches (low = even column), so `moe_quant.h` only needed a
+  new decode, not a new layout.
+- **Dense fp8 → bf16 is exact too.** e4m3 has 3 mantissa bits and the block scale is a
+  power of two, so bf16's 8 bits hold it exactly (verified: `rel=0.00e+00`).
+
+Memory, measured: **~151 GB resident**, which is why the bf16 tier exists. Projections are
+kept bf16 in RAM instead of expanded to f32 (`Wt` in `deepseek.c`, activations stay f32),
+halving residents from ~25 GB to ~12.5 GB. Loading is `pread` + `fadvise(DONTNEED)`, so
+page cache is not doubled. On the 187 GB box here that fits with ~25 GB spare — but only
+with nothing else running.
+
+The name mapping lives in `MAP`/`TOP_MAP` in the converter: the HF repo ships DeepSeek's
+own inference layout (`layers.0.attn.wq_a`), not the transformers layout the engine was
+written against (`model.layers.0.self_attn.q_a_proj`). Note the indexer nests the other
+way round in the two schemes — native `attn.indexer.compressor.*` vs transformers
+`compressor.indexer.*`.
+
+## Known limits
+
+- **CPU only, single stream.** No CUDA tier, no batching, no serve mode. Decode is a
+  per-token, per-expert loop; `matmul_fp4_kb` (the batched, read-the-weight-row-once
+  kernel) exists and is validated but nothing calls it yet — that is the group-by-expert
+  lever, and it is what a batched decode path would use first.
+- **Compressed KV grows without bound.** CSA keeps one f32 `head_dim` entry per 4 tokens
+  per CSA layer — inherent to the architecture (it *is* the long-range memory), but at 1M
+  context that is hundreds of GB in f32. This, not the weights, is what decides whether
+  long context is reachable on one box.
 - **Attention is O(window + compressed) per query, computed densely.** Correct, not fast:
   the indexer scores every compressed entry per query rather than exploiting sparsity.
+- **Prefill is slow.** ~5 tok/s on 24 AVX-512 cores at this stage; the expert GEMV
+  dominates and every routed expert is re-read per token.
+- **The DSpark / MTP module is not implemented.** `mtp.*` is skipped at conversion. The
+  main stack does not depend on it; it is speculative decoding, i.e. throughput, not
+  quality.
+- **The indexer's top-k tie-break is ours, not the reference's.** Ties go to the lowest
+  entry index; `torch.topk` defines no order. Unreachable in practice at 64 indexer heads
+  (see Validation), but it is a real, documented divergence rather than a proof of
+  equivalence.
 - `st.h` gained an `I64` dtype for the hash router's `tid2eid` table. Existing dtypes are
-  untouched.
+  untouched; the fp4 container reuses the existing `U8`/`I8` raw path.
 
 ## Next
 
-In order, and each blocked on the one before:
-1. Run `make deepseek-test` on a box with torch — nothing else is trustworthy until then.
-2. An int4/fp4 converter (`tools/convert_deepseek_int4.py`) so the 284B container loads.
-3. Quantize the compressed KV series, which is the thing that decides whether long context
-   is reachable at all on one box.
-4. CUDA tier + batched decode, reusing the grouped-expert GEMM from
-   `backend_cuda_laguna.{cu,h}` (arch-generic already).
+1. **CUDA tier + batched decode**, reusing the grouped-expert GEMM from
+   `backend_cuda_laguna.{cu,h}` (arch-generic already) and `matmul_fp4_kb` on the CPU
+   side. This is where the throughput is: 256 experts at top-6 is exactly the shape the
+   group-by-expert path was built for.
+2. **Quantize the compressed KV series** — the long-context blocker above.
+3. **Serve mode** (`KV_SLOTS`) once batching lands.
+4. A GPU fp4 kernel: the experts are already in a format Blackwell decodes natively, so
+   the container does not need re-converting for it.

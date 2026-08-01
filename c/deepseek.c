@@ -64,7 +64,12 @@
 #include "json.h"
 #include "moe_math.h"
 #include "moe_matmul.h"
+#include "moe_quant.h"         /* matmul_fp4_k: e2m1 + ue8m0 block scales (V4's native experts) */
 #include "moe_sample.h"
+#include "moe_util.h"     /* moe_omp_autotune: cap the OpenMP team to physical cores */
+#ifdef COLI_CUDA
+#include "backend_cuda_laguna.h"
+#endif
 #include "st.h"
 #include "tok.h"
 
@@ -72,7 +77,9 @@
 #define MAXHC  8
 #define MAXROT 512
 
-static int g_exact = 0;         /* double-accumulate GEMM: the oracle contract */
+static int g_exact = 0;
+static double g_t_attn, g_t_moe, g_t_shared, g_t_routed, g_t_route, g_t_comp, g_t_sdpa, g_t_proj, g_t_oproj, g_t_ob;
+static int g_prof;         /* double-accumulate GEMM: the oracle contract */
 
 /* ---------- config ---------- */
 typedef enum { ATT_SLIDING = 0, ATT_CSA = 1, ATT_HCA = 2 } AttType;
@@ -93,34 +100,54 @@ typedef struct {
     int hash[MAXL];                 /* mlp_layer_types[i] == "hash_moe" */
     int m_csa, m_hca;               /* compress rates */
     float inv_main[MAXROT], inv_comp[MAXROT];   /* rdim/2 entries each */
+    float ms_main, ms_comp;         /* YaRN attention_factor: scales cos AND sin */
     int ctx_max;
+    int tie_embed;                  /* tie_word_embeddings: lm_head IS the embedding */
     int eos[8], n_eos;
 } Cfg;
+
+/* A projection matrix as it is STORED. The oracle fixtures ship f32; the real
+ * container ships bf16, and keeping it bf16 in RAM instead of expanding on load
+ * halves the resident tier — ~25 GB -> ~12.5 GB across V4-Flash's 43 layers, which
+ * is the difference between fitting a 187 GB box and not. It is also lossless for
+ * this checkpoint: the dense tensors are fp8 e4m3 (3 mantissa bits) times a
+ * power-of-two block scale, which bf16's 8 mantissa bits represent exactly.
+ * Activations stay f32 (round_x=0), so this is weight-only. */
+typedef struct { const float *f; const uint16_t *b; void *d; } Wt;
 
 typedef struct {
     float *ln1, *ln2;
     /* attention */
-    float *q_a, *q_an, *q_b, *kv_w, *kv_n, *o_a, *o_b, *sinks;
+    Wt q_a, q_b, kv_w, o_a, o_b;
+    float *q_an, *kv_n, *sinks;
     /* compressor (CSA / HCA) */
-    float *c_kv, *c_gate, *c_bias, *c_norm;
+    Wt c_kv, c_gate;
+    float *c_bias, *c_norm;
     /* lightning indexer (CSA only) */
-    float *i_kv, *i_gate, *i_bias, *i_norm, *i_qb, *i_w;
+    Wt i_kv, i_gate, i_qb, i_w;
+    float *i_bias, *i_norm;
     /* mHC: attention site and ffn site */
     float *a_fn, *a_base, *a_scale;
     float *f_fn, *f_base, *f_scale;
     /* MoE */
-    float *router, *corr;
+    Wt router;
+    float *corr;
     int64_t *tid2eid;
-    float *e_gu, *e_dn;             /* [E, 2I, D] and [E, D, I] */
-    float *sg, *su, *sd;            /* shared expert */
+    float *e_gu, *e_dn;             /* f32 experts: [E, 2I, D] and [E, D, I] */
+    uint8_t *q_gu, *q_dn;           /* fp4 container: e2m1 nibbles [E*2I, D/2], [E*D, I/2] */
+    uint8_t *s_gu, *s_dn;           /* ...and their ue8m0 block scales [E*2I, D/32], [E*D, I/32] */
+    void *d_gu, *d_gu_es, *d_dn, *d_dn_es;   /* VRAM copies (NULL = this layer stays on CPU) */
+    Wt sg, su, sd;                  /* shared expert */
 } Layer;
 
 typedef struct {
     shards S;
     Cfg c;
     Layer L[MAXL];
-    float *embed, *lm_head, *norm;
+    Wt embed, lm_head;
+    float *norm;
     float *h_fn, *h_base, *h_scale; /* hc_head: final stream collapse */
+    int xq;                         /* 1 = fp4 routed-expert container */
 } Model;
 
 /* Per-layer sequence state. Two "entries" per layer share the compressor machinery:
@@ -139,11 +166,6 @@ typedef struct {
 
 typedef struct { LState *l; int len; } State;
 
-static float *falloc(int64_t n) {
-    float *p = malloc((size_t)n * sizeof(float));
-    if (!p) { fprintf(stderr, "OOM %lld floats\n", (long long)n); exit(1); }
-    return p;
-}
 static float *fzalloc(int64_t n) {
     float *p = calloc((size_t)n, sizeof(float));
     if (!p) { fprintf(stderr, "OOM %lld floats\n", (long long)n); exit(1); }
@@ -151,14 +173,15 @@ static float *fzalloc(int64_t n) {
 }
 
 /* ---------- config loading ---------- */
-static double jnum(jval *o, const char *k, double dflt) {
-    jval *v = json_get(o, k);
-    return (v && v->t == J_NUM) ? v->num : dflt;
-}
 
-/* YaRN inverse frequencies, matching transformers' _compute_yarn_parameters. V4 forces
- * attention_factor = 1.0 for the compress rope (the reference does not rescale cos/sin),
- * so only inv_freq is affected here. */
+/* YaRN inverse frequencies, matching transformers' _compute_yarn_parameters.
+ *
+ * YaRN also returns an `attention_factor` (mscale) that the rotary embedding multiplies
+ * into BOTH cos and sin. It is NOT 1.0 here: with no explicit override in the config it
+ * is 0.1*ln(factor)+1, which is 1.2773 for V4-Flash's compress rope (factor 16). An
+ * earlier note in this file claimed the reference pinned it to 1.0; it does not, and
+ * dropping it left every CSA/HCA layer subtly wrong while sliding layers stayed exact
+ * (the main rope is not YaRN, so its factor really is 1.0). */
 static void yarn_inv(float *inv, int dim, double base, double factor,
                      double beta_fast, double beta_slow, int orig_max) {
     double lo = dim * log((double)orig_max / (beta_fast * 2 * M_PI)) / (2 * log(base));
@@ -178,18 +201,31 @@ static void yarn_inv(float *inv, int dim, double base, double factor,
     }
 }
 
-static void rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
+/* 0.1*mscale*ln(scale)+1, transformers' get_mscale */
+static double get_mscale(double scale, double mscale) {
+    return scale <= 1.0 ? 1.0 : 0.1 * mscale * log(scale) + 1.0;
+}
+
+/* Fills `inv` and returns the attention_factor that scales cos/sin. */
+static float rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
     double theta = rp ? jnum(rp, "rope_theta", dflt_theta) : dflt_theta;
     jval *rt = rp ? json_get(rp, "rope_type") : NULL;
     if (!rt) rt = rp ? json_get(rp, "type") : NULL;
     if (rt && rt->t == J_STR && !strcmp(rt->str, "yarn")) {
-        double factor = jnum(rp, "factor", 1.0);
-        double bf = jnum(rp, "beta_fast", 32.0), bs = jnum(rp, "beta_slow", 1.0);
         int om = (int)jnum(rp, "original_max_position_embeddings", ctx_max);
+        double factor = jnum(rp, "factor", 0.0);
+        if (factor <= 0) factor = om ? (double)ctx_max / om : 1.0;   /* DeepSeek-V3 style */
+        double bf = jnum(rp, "beta_fast", 32.0), bs = jnum(rp, "beta_slow", 1.0);
         yarn_inv(inv, dim, theta, factor, bf, bs, om);
-    } else {
-        for (int j = 0; j < dim / 2; j++) inv[j] = (float)(1.0 / pow(theta, (double)(2 * j) / dim));
+        jval *af = json_get(rp, "attention_factor");
+        if (af && af->t == J_NUM) return (float)af->num;
+        jval *ms = json_get(rp, "mscale"), *msa = json_get(rp, "mscale_all_dim");
+        if (ms && ms->t == J_NUM && msa && msa->t == J_NUM && ms->num && msa->num)
+            return (float)(get_mscale(factor, ms->num) / get_mscale(factor, msa->num));
+        return (float)get_mscale(factor, 1.0);
     }
+    for (int j = 0; j < dim / 2; j++) inv[j] = (float)(1.0 / pow(theta, (double)(2 * j) / dim));
+    return 1.f;
 }
 
 static void cfg_load(Cfg *c, const char *dir) {
@@ -231,6 +267,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->hc_eps = (float)jnum(o, "hc_eps", 1e-6);
     c->eps = (float)jnum(o, "rms_norm_eps", 1e-6);
     c->ctx_max = (int)jnum(o, "max_position_embeddings", 4096);
+    { jval *t = json_get(o, "tie_word_embeddings");
+      c->tie_embed = t ? (t->t == J_BOOL ? t->boolean : (t->t == J_NUM ? (int)t->num : 0)) : 0; }
     if (c->hc_mult < 1 || c->hc_mult > MAXHC) {
         fprintf(stderr, "hc_mult %d out of range (max %d)\n", c->hc_mult, MAXHC); exit(1); }
     if (c->o_groups < 1 || (c->n_heads * c->head_dim) % c->o_groups) {
@@ -260,7 +298,12 @@ static void cfg_load(Cfg *c, const char *dir) {
             else if (!strcmp(s, "heavily_compressed_attention")) c->att[i] = ATT_HCA;
             else { fprintf(stderr, "unknown layer type '%s'\n", s); exit(1); }
         }
-    } else if (cro && cro->t == J_ARR && cro->len == c->n_layers) {
+    } else if (cro && cro->t == J_ARR && cro->len >= c->n_layers) {
+        /* >=, not ==: the shipped V4-Flash-0731 config carries 46 ratios for 43 layers —
+         * the trailing entries describe the DSpark speculative-decoding module, which is
+         * a separate `mtp.*` stack this engine does not run. Demanding an exact length
+         * silently fell through to the default interleave, which is NOT this checkpoint's
+         * layout (it opens with two SLIDING layers, not two HCA). */
         for (int i = 0; i < c->n_layers; i++) {
             int r = (int)cro->kids[i]->num;
             c->att[i] = r == 0 ? ATT_SLIDING : (r == c->m_hca ? ATT_HCA : ATT_CSA);
@@ -294,8 +337,8 @@ static void cfg_load(Cfg *c, const char *dir) {
     c->rdim = (int)(c->head_dim * prf) & ~1;
     if (c->rdim < 2 || c->rdim / 2 > MAXROT) {
         fprintf(stderr, "rotary dim %d unsupported\n", c->rdim); exit(1); }
-    rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
-    rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
+    c->ms_main = rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
+    c->ms_comp = rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
 
     c->n_eos = 0;
     for (int pass = 0; pass < 2 && !c->n_eos; pass++) {
@@ -329,6 +372,167 @@ static float *load_t(Model *m, const char *name) {
 static float *load_opt(Model *m, const char *name) {
     return st_numel(&m->S, name) < 0 ? NULL : load_t(m, name);
 }
+#ifdef COLI_CUDA
+/* Residents in VRAM. The routed experts are 147 GB of fp4 and are never a candidate;
+ * the bf16 projections are ~12.5 GB and DO fit, and they are just over half the
+ * per-token matmul work (attention q/kv/o + the always-on shared expert). Budget in
+ * GB via DSV4_CUDA_GB, default = whatever is free minus a 2 GB margin. Host copies
+ * are kept, so any upload failure or a full GPU degrades to the CPU path. */
+static size_t g_cuda_left, g_cuda_used;
+static int g_cuda_on;
+static void cuda_budget_init(void) {
+    if (getenv("DSV4_NOCUDA")) return;
+    if (lag_cuda_init(0) != 0) { fprintf(stderr, "[deepseek] cuda: init failed, CPU only\n"); return; }
+    size_t freeb = lag_cuda_free_bytes();
+    double gb = getenv("DSV4_CUDA_GB") ? atof(getenv("DSV4_CUDA_GB")) : 0.0;
+    g_cuda_left = gb > 0 ? (size_t)(gb * 1e9)
+                         : (freeb > (size_t)2e9 ? freeb - (size_t)2e9 : 0);
+    g_cuda_on = g_cuda_left > 0;
+    if (g_cuda_on)
+        fprintf(stderr, "[deepseek] cuda: %.1f GB free, budgeting %.1f GB for bf16 residents\n",
+                freeb / 1e9, g_cuda_left / 1e9);
+}
+static void cuda_try_upload(Wt *w, size_t nbytes) {
+    if (!g_cuda_on || nbytes > g_cuda_left) return;
+    void *d = lag_cuda_upload(w->b, nbytes);
+    if (!d) { g_cuda_left = 0; return; }        /* out of VRAM: stop trying */
+    w->d = d; g_cuda_left -= nbytes; g_cuda_used += nbytes;
+}
+
+/* Routed-expert VRAM cache. Residents are uploaded first, during model_load: they
+ * are ~14 GB, serve EVERY token, and are the better bytes-per-flop trade. Whatever
+ * is left then buys whole layers of fp4 experts, all-or-nothing per layer (3.4 GB
+ * each for V4-Flash) — a partially resident layer would still pay a host round trip
+ * per token, so there is nothing to gain from splitting one. Host copies are kept,
+ * so an upload failure or a full card just leaves that layer on the CPU.
+ *
+ * Front-to-back is deliberate rather than clever: expert selection is data-dependent
+ * and roughly uniform over 256 experts, so no static subset is "hot" — with ~23% of
+ * the set resident, which layers are chosen matters far less than how many. */
+static int cuda_cache_experts(Model *m) {
+    if (!g_cuda_on || !m->xq) return 0;
+    Cfg *c = &m->c;
+    size_t gu_n  = (size_t)c->E * 2 * c->moe_I * (c->D / 2);
+    size_t gue_n = (size_t)c->E * 2 * c->moe_I * (c->D / 32);
+    size_t dn_n  = (size_t)c->E * c->D * (c->moe_I / 2);
+    size_t dne_n = (size_t)c->E * c->D * (c->moe_I / 32);
+    size_t per   = gu_n + gue_n + dn_n + dne_n;
+    int cached = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *L = &m->L[i];
+        if (!L->q_gu || per > g_cuda_left) continue;
+        void *a = lag_cuda_upload(L->q_gu, gu_n);
+        void *b = a ? lag_cuda_upload(L->s_gu, gue_n) : NULL;
+        void *d = b ? lag_cuda_upload(L->q_dn, dn_n) : NULL;
+        void *e = d ? lag_cuda_upload(L->s_dn, dne_n) : NULL;
+        if (!e) {                                  /* partial: roll back, stop trying */
+            lag_cuda_free(a); lag_cuda_free(b); lag_cuda_free(d);
+            g_cuda_left = 0; break;
+        }
+        L->d_gu = a; L->d_gu_es = b; L->d_dn = d; L->d_dn_es = e;
+        g_cuda_left -= per; g_cuda_used += per; cached++;
+    }
+    fprintf(stderr, "[deepseek] cuda: %d/%d expert layers in VRAM (%.1f GB total on device)\n",
+            cached, c->n_layers, g_cuda_used / 1e9);
+    return cached;
+}
+#endif
+
+/* A projection: kept bf16 when the file stores bf16, expanded to f32 otherwise.
+ * st.h dtype 0 == BF16. */
+static Wt load_w(Model *m, const char *name) {
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    Wt w = {NULL, NULL, NULL};
+    if (t->dtype == 0) {
+        uint16_t *p = malloc((size_t)t->numel * sizeof(uint16_t));
+        if (!p) { fprintf(stderr, "OOM %lld bf16 for %s\n", (long long)t->numel, name); exit(1); }
+        st_read_raw(&m->S, name, p, 1);
+        w.b = p;
+#ifdef COLI_CUDA
+        cuda_try_upload(&w, (size_t)t->numel * sizeof(uint16_t));
+#endif
+    } else {
+        w.f = load_t(m, name);
+    }
+    return w;
+}
+static Wt load_w_opt(Model *m, const char *name) {
+    Wt z = {NULL, NULL, NULL};
+    return st_numel(&m->S, name) < 0 ? z : load_w(m, name);
+}
+static int wt_null(Wt w) { return !w.f && !w.b; }
+
+/* raw bytes of an already-quantized tensor (fp4 nibbles, ue8m0 scales) */
+static uint8_t *load_u8(Model *m, const char *name) {
+    int64_t nb = st_nbytes(&m->S, name);
+    if (nb < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
+    uint8_t *p = malloc((size_t)nb);
+    if (!p) { fprintf(stderr, "OOM %lld bytes for %s\n", (long long)nb, name); exit(1); }
+    st_read_raw(&m->S, name, p, 1);
+    return p;
+}
+
+/* Routed experts ship in three shapes; take whichever the snapshot has.
+ *
+ *  1. fp4 container (a `.es` block-scale sidecar next to the packed tensor) —
+ *     what tools/convert_deepseek_fp4.py emits, and the only one that fits the
+ *     real 284B checkpoint. Stored verbatim from the checkpoint's own e2m1 bytes.
+ *  2. fused f32 `gate_up_proj` [E,2I,D] / `down_proj` [E,D,I] — what the pure-python
+ *     harness (tools/dsv4_ref.py) writes, and what transformers <= 5.7 saved.
+ *  3. per-expert f32 `experts.{e}.w1/w2/w3` — what transformers saves TODAY, and
+ *     the layout the real checkpoint uses. Fused here at load time.
+ *
+ * gate_up is block-concatenated per expert (all I gate rows, then all I up rows),
+ * matching F.linear(x, gate_up_proj[e]).chunk(2). */
+static void load_experts(Model *m, Layer *L, int i) {
+    Cfg *c = &m->c;
+    char n[256], es[256];
+    snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.gate_up_proj", i);
+    snprintf(es, sizeof(es), "model.layers.%d.mlp.experts.gate_up_proj.es", i);
+
+    if (st_numel(&m->S, es) >= 0) {                       /* 1. fp4 container */
+        m->xq = 1;
+        if (c->moe_I <= 0) {
+            fprintf(stderr, "fp4 container needs moe_intermediate_size in config.json\n"); exit(1); }
+        int64_t want = (int64_t)c->E * 2 * c->moe_I * (c->D / 2);
+        if (st_nbytes(&m->S, n) != want) {
+            fprintf(stderr, "layer %d gate_up_proj: %lld bytes, expected %lld (E=%d I=%d D=%d)\n",
+                    i, (long long)st_nbytes(&m->S, n), (long long)want, c->E, c->moe_I, c->D); exit(1); }
+        L->q_gu = load_u8(m, n);
+        L->s_gu = load_u8(m, es);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.down_proj", i);
+        snprintf(es, sizeof(es), "model.layers.%d.mlp.experts.down_proj.es", i);
+        L->q_dn = load_u8(m, n);
+        L->s_dn = load_u8(m, es);
+        return;
+    }
+    if (st_numel(&m->S, n) >= 0) {                        /* 2. fused f32 */
+        L->e_gu = load_t(m, n);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.down_proj", i);
+        L->e_dn = load_t(m, n);
+        return;
+    }
+    /* 3. per-expert f32 w1/w2/w3 -> fuse */
+    snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.0.w1.weight", i);
+    int64_t w1n = st_numel(&m->S, n);
+    if (w1n < 0) { fprintf(stderr, "layer %d: no routed experts in any known layout\n", i); exit(1); }
+    int I = (int)(w1n / c->D);
+    if (c->moe_I <= 0) c->moe_I = I;
+    if (I != c->moe_I) {
+        fprintf(stderr, "layer %d expert width %d disagrees with moe_intermediate_size %d\n",
+                i, I, c->moe_I); exit(1); }
+    L->e_gu = falloc((int64_t)c->E * 2 * I * c->D);
+    L->e_dn = falloc((int64_t)c->E * c->D * I);
+    for (int e = 0; e < c->E; e++) {
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w1.weight", i, e);   /* gate */
+        st_read_f32_cap(&m->S, n, L->e_gu + (int64_t)e * 2 * I * c->D, (int64_t)I * c->D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w3.weight", i, e);   /* up */
+        st_read_f32_cap(&m->S, n, L->e_gu + ((int64_t)e * 2 * I + I) * c->D, (int64_t)I * c->D, 0);
+        snprintf(n, sizeof(n), "model.layers.%d.mlp.experts.%d.w2.weight", i, e);   /* down */
+        st_read_f32_cap(&m->S, n, L->e_dn + (int64_t)e * c->D * I, (int64_t)c->D * I, 0);
+    }
+}
 
 static void model_load(Model *m, const char *snap) {
     st_init(&m->S, snap);
@@ -336,10 +540,22 @@ static void model_load(Model *m, const char *snap) {
     Cfg *c = &m->c;
     char n[256];
 
-    m->embed = load_t(m, "model.embed_tokens.weight");
+    m->embed = load_w(m, "model.embed_tokens.weight");
     m->norm = load_t(m, "model.norm.weight");
-    m->lm_head = load_opt(m, "lm_head.weight");
-    if (!m->lm_head) m->lm_head = m->embed;         /* tie_word_embeddings */
+    /* Output projection. V4 calls it `head.weight` — both in the shipped checkpoint and
+     * in what transformers' save_pretrained writes for this arch — while other engines
+     * here see `lm_head.weight`. Take either. Falling back to the embedding is ONLY
+     * correct when the config actually ties them; doing it silently on a missing tensor
+     * turned an untied model into a tied one and cost a full oracle failure (the whole
+     * stack matched transformers layer-for-layer, and only the logits were wrong). */
+    m->lm_head = load_w_opt(m, "lm_head.weight");
+    if (wt_null(m->lm_head)) m->lm_head = load_w_opt(m, "head.weight");
+    if (wt_null(m->lm_head)) {
+        if (!c->tie_embed) {
+            fprintf(stderr, "no output projection (lm_head.weight / head.weight) and "
+                            "tie_word_embeddings is false\n"); exit(1); }
+        m->lm_head = m->embed;
+    }
     m->h_fn = load_t(m, "model.hc_head.hc_fn");
     m->h_base = load_t(m, "model.hc_head.hc_base");
     m->h_scale = load_t(m, "model.hc_head.hc_scale");
@@ -348,15 +564,16 @@ static void model_load(Model *m, const char *snap) {
         Layer *L = &m->L[i];
 #define LT(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_t(m, n); } while (0)
 #define LO(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_opt(m, n); } while (0)
+#define LW(dst, fmt) do { snprintf(n, sizeof(n), fmt, i); L->dst = load_w(m, n); } while (0)
         LT(ln1, "model.layers.%d.input_layernorm.weight");
         LT(ln2, "model.layers.%d.post_attention_layernorm.weight");
-        LT(q_a, "model.layers.%d.self_attn.q_a_proj.weight");
+        LW(q_a, "model.layers.%d.self_attn.q_a_proj.weight");
         LT(q_an, "model.layers.%d.self_attn.q_a_norm.weight");
-        LT(q_b, "model.layers.%d.self_attn.q_b_proj.weight");
-        LT(kv_w, "model.layers.%d.self_attn.kv_proj.weight");
+        LW(q_b, "model.layers.%d.self_attn.q_b_proj.weight");
+        LW(kv_w, "model.layers.%d.self_attn.kv_proj.weight");
         LT(kv_n, "model.layers.%d.self_attn.kv_norm.weight");
-        LT(o_a, "model.layers.%d.self_attn.o_a_proj.weight");
-        LT(o_b, "model.layers.%d.self_attn.o_b_proj.weight");
+        LW(o_a, "model.layers.%d.self_attn.o_a_proj.weight");
+        LW(o_b, "model.layers.%d.self_attn.o_b_proj.weight");
         LT(sinks, "model.layers.%d.self_attn.sinks");
         LT(a_fn, "model.layers.%d.attn_hc.fn");
         LT(a_base, "model.layers.%d.attn_hc.base");
@@ -364,27 +581,26 @@ static void model_load(Model *m, const char *snap) {
         LT(f_fn, "model.layers.%d.ffn_hc.fn");
         LT(f_base, "model.layers.%d.ffn_hc.base");
         LT(f_scale, "model.layers.%d.ffn_hc.scale");
-        LT(router, "model.layers.%d.mlp.gate.weight");
+        LW(router, "model.layers.%d.mlp.gate.weight");
         LO(corr, "model.layers.%d.mlp.gate.e_score_correction_bias");
-        LT(e_gu, "model.layers.%d.mlp.experts.gate_up_proj");
-        LT(e_dn, "model.layers.%d.mlp.experts.down_proj");
-        LT(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
-        LT(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
-        LT(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
+        load_experts(m, L, i);
+        LW(sg, "model.layers.%d.mlp.shared_experts.gate_proj.weight");
+        LW(su, "model.layers.%d.mlp.shared_experts.up_proj.weight");
+        LW(sd, "model.layers.%d.mlp.shared_experts.down_proj.weight");
 
         if (c->att[i] != ATT_SLIDING) {
-            LT(c_kv, "model.layers.%d.self_attn.compressor.kv_proj.weight");
-            LT(c_gate, "model.layers.%d.self_attn.compressor.gate_proj.weight");
+            LW(c_kv, "model.layers.%d.self_attn.compressor.kv_proj.weight");
+            LW(c_gate, "model.layers.%d.self_attn.compressor.gate_proj.weight");
             LT(c_bias, "model.layers.%d.self_attn.compressor.position_bias");
             LT(c_norm, "model.layers.%d.self_attn.compressor.kv_norm.weight");
         }
         if (c->att[i] == ATT_CSA) {
-            LT(i_kv, "model.layers.%d.self_attn.compressor.indexer.kv_proj.weight");
-            LT(i_gate, "model.layers.%d.self_attn.compressor.indexer.gate_proj.weight");
+            LW(i_kv, "model.layers.%d.self_attn.compressor.indexer.kv_proj.weight");
+            LW(i_gate, "model.layers.%d.self_attn.compressor.indexer.gate_proj.weight");
             LT(i_bias, "model.layers.%d.self_attn.compressor.indexer.position_bias");
             LT(i_norm, "model.layers.%d.self_attn.compressor.indexer.kv_norm.weight");
-            LT(i_qb, "model.layers.%d.self_attn.compressor.indexer.q_b_proj.weight");
-            LT(i_w, "model.layers.%d.self_attn.compressor.indexer.scorer.weights_proj.weight");
+            LW(i_qb, "model.layers.%d.self_attn.compressor.indexer.q_b_proj.weight");
+            LW(i_w, "model.layers.%d.self_attn.compressor.indexer.scorer.weights_proj.weight");
         }
         if (c->hash[i]) {
             snprintf(n, sizeof(n), "model.layers.%d.mlp.gate.tid2eid", i);
@@ -398,17 +614,23 @@ static void model_load(Model *m, const char *snap) {
         }
 #undef LT
 #undef LO
+#undef LW
     }
     /* Shared-expert width is whatever the checkpoint ships (the reference reads it from
      * `intermediate_size`, which attribute-maps onto moe_intermediate_size). Derive it
      * rather than assume, so a checkpoint with a wider shared expert still loads. */
     c->shared_I = (int)(st_numel(&m->S, "model.layers.0.mlp.shared_experts.gate_proj.weight") / c->D);
+    /* load_experts() already cross-checked the routed width against the config for
+     * the fp4 and per-expert layouts; the fused f32 tensor is the remaining case. */
     int64_t egu = st_numel(&m->S, "model.layers.0.mlp.experts.gate_up_proj");
-    int derived = (int)(egu / ((int64_t)c->E * 2 * c->D));
-    if (c->moe_I <= 0) c->moe_I = derived;
-    if (derived != c->moe_I) {
-        fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n", derived, c->moe_I);
-        exit(1); }
+    if (!m->xq && egu >= 0) {
+        int derived = (int)(egu / ((int64_t)c->E * 2 * c->D));
+        if (c->moe_I <= 0) c->moe_I = derived;
+        if (derived != c->moe_I) {
+            fprintf(stderr, "expert width %d disagrees with moe_intermediate_size %d\n", derived, c->moe_I);
+            exit(1); }
+    }
+    if (c->moe_I <= 0) { fprintf(stderr, "could not determine routed expert width\n"); exit(1); }
 }
 
 /* ---------- per-sequence state ---------- */
@@ -453,6 +675,26 @@ static void mm(float *y, const float *x, const float *W, int S, int I, int O) {
     matmul_f32(y, x, W, S, I, O, g_exact);
 }
 
+static void mmw(float *y, const float *x, Wt w, int S, int I, int O) {
+#ifdef COLI_CUDA
+    /* VRAM-resident bf16: same contract as the CPU kernel (weight expanded bf16->f32
+     * exact, activations stay f32), so this is a placement decision, not a numeric
+     * one. Falls back to the host copy if the call fails for any reason. EXACT=1 means
+     * "use the reference path", so it stays on the CPU double-accumulate kernel. */
+    if (w.d && !g_exact && lag_cuda_matmul_bf16(y, x, w.d, S, I, O) == 0) return;
+#endif
+    if (w.b) matmul_bf16_k(y, x, w.b, S, I, O, 0, g_exact);
+    else     matmul_f32(y, x, w.f, S, I, O, g_exact);
+}
+static inline const float *wt_row_f32(Wt w, int64_t off, float *tmp, int n) {
+    if (!w.b) return w.f + off;
+    for (int i = 0; i < n; i++) {                    /* bf16 -> f32 for a raw row read */
+        uint32_t u = (uint32_t)w.b[off + i] << 16;
+        memcpy(&tmp[i], &u, 4);
+    }
+    return tmp;
+}
+
 /* RMSNorm with no learned weight (DeepseekV4UnweightedRMSNorm). */
 static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
     double ss = 0; for (int i = 0; i < D; i++) ss += (double)x[i] * x[i];
@@ -462,15 +704,53 @@ static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
 
 /* Interleaved partial RoPE on the TRAILING rdim channels of one head. sgn = -1 applies
  * the conjugate rotation (used to un-rotate the attention output, since K == V). */
-static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn) {
+static void rope_head(float *x, int hd, int rdim, const float *inv, int pos, float sgn, float ms) {
     float *r = x + hd - rdim;
     for (int j = 0; j < rdim / 2; j++) {
         float ang = (float)pos * inv[j];
-        float cs = cosf(ang), sn = sgn * sinf(ang);
+        float cs = cosf(ang) * ms, sn = sgn * sinf(ang) * ms;
         float a = r[2 * j], b = r[2 * j + 1];
         r[2 * j]     = a * cs - b * sn;
         r[2 * j + 1] = b * cs + a * sn;
     }
+}
+
+
+/* ---------- SDPA inner kernels ----------
+ * The attention loop was plain scalar C: 64 heads x (window + selected compressed)
+ * x head_dim 512 per token, single-threaded, and gcc will not vectorise a float
+ * reduction without -ffast-math. It cost as much as the routed experts despite ~36x
+ * fewer FLOPs. Two fixes, and only one of them touches numerics:
+ *   dot   changes the summation order, so it is guarded by g_exact like every other
+ *         SIMD path here (EXACT=1 keeps the scalar reference).
+ *   axpy  accumulates over j in the SAME order, vectorising only across the head_dim
+ *         lanes, each of which reduces independently -> bit-identical either way. */
+static inline float sdpa_dot(const float *a, const float *b, int n, int exact) {
+#if defined(__AVX512F__)
+    if (!exact) {
+        __m512 acc = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16)
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+        float s = _mm512_reduce_add_ps(acc);
+        for (; i < n; i++) s += a[i] * b[i];
+        return s;
+    }
+#endif
+    float s = 0;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+static inline void sdpa_axpy(float *y, const float *v, float w, int n) {
+#if defined(__AVX512F__)
+    __m512 vw = _mm512_set1_ps(w);
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        _mm512_storeu_ps(y + i, _mm512_fmadd_ps(vw, _mm512_loadu_ps(v + i), _mm512_loadu_ps(y + i)));
+    for (; i < n; i++) y[i] += w * v[i];
+#else
+    for (int i = 0; i < n; i++) y[i] += w * v[i];
+#endif
 }
 
 /* ---------- Manifold-Constrained Hyper-Connections ----------
@@ -535,17 +815,29 @@ static void hc_merge(const Cfg *c, float *streams, const float *post, const floa
 }
 
 /* ---------- MoE ---------- */
-static void swiglu_expert(const Cfg *c, const float *gu, const float *dn, const float *x,
+/* One routed expert: clamped SwiGLU over the fused gate_up, then down. Reads either
+ * the f32 tensors or the fp4 container — same arithmetic, different weight decode. */
+static void swiglu_expert(const Model *m, const Layer *L, int e, const float *x,
                           float *out, float *h, int I) {
+    const Cfg *c = &m->c;
+    int D = c->D;
     float lim = c->swiglu_limit;
     float *g = h, *u = h + I;
-    mm(g, x, gu, 1, c->D, 2 * I);                       /* rows [0,I) gate, [I,2I) up */
+    if (m->xq)                                          /* rows [0,I) gate, [I,2I) up */
+        matmul_fp4_k(g, x, L->q_gu + (int64_t)e * 2 * I * (D / 2),
+                     L->s_gu + (int64_t)e * 2 * I * (D / 32), D, 2 * I, g_exact);
+    else
+        mm(g, x, L->e_gu + (int64_t)e * 2 * I * D, 1, D, 2 * I);
     for (int i = 0; i < I; i++) {
         float gi = g[i] > lim ? lim : g[i];
         float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
         g[i] = siluf(gi) * ui;
     }
-    mm(out, g, dn, 1, I, c->D);
+    if (m->xq)
+        matmul_fp4_k(out, g, L->q_dn + (int64_t)e * D * (I / 2),
+                     L->s_dn + (int64_t)e * D * (I / 32), I, D, g_exact);
+    else
+        mm(out, g, L->e_dn + (int64_t)e * D * I, 1, I, D);
 }
 
 static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *out,
@@ -557,7 +849,8 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
     int sel[64];
     if (K > 64) { fprintf(stderr, "top-k %d exceeds 64\n", K); exit(1); }
 
-    mm(logits, x, L->router, 1, D, E);
+    double _t0 = g_prof ? now_s() : 0;
+    mmw(logits, x, L->router, 1, D, E);
     for (int e = 0; e < E; e++) score[e] = sqrtf(softplusf(logits[e]));
 
     if (c->hash[li]) {
@@ -599,25 +892,38 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
             if (sel[b] < sel[a]) { int t = sel[a]; sel[a] = sel[b]; sel[b] = t;
                                    float tw = w[a]; w[a] = w[b]; w[b] = tw; }
 
-    for (int i = 0; i < D; i++) acc[i] = 0;
-    for (int a = 0; a < K; a++) {
-        swiglu_expert(c, L->e_gu + (int64_t)sel[a] * 2 * I * D, L->e_dn + (int64_t)sel[a] * D * I,
-                      x, tmp, h, I);
-        for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
+    if (g_prof) { g_t_route += now_s() - _t0; _t0 = now_s(); }
+    int done = 0;
+#ifdef COLI_CUDA
+    /* Whole layer resident: all K experts in ONE submission and one sync. sel/w are
+     * already sorted ascending above, so the device combine order matches the CPU's. */
+    if (L->d_gu && !g_exact &&
+        lag_cuda_moe_experts_fp4(acc, x, L->d_gu, L->d_gu_es, L->d_dn, L->d_dn_es,
+                                 sel, w, K, I, D, c->swiglu_limit) == 0)
+        done = 1;
+#endif
+    if (!done) {
+        for (int i = 0; i < D; i++) acc[i] = 0;
+        for (int a = 0; a < K; a++) {
+            swiglu_expert(m, L, sel[a], x, tmp, h, I);
+            for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
+        }
     }
+    if (g_prof) { g_t_routed += now_s() - _t0; _t0 = now_s(); }
 
     /* shared expert: separate gate/up/down tensors, same clamped SwiGLU */
     int SI = c->shared_I; float lim = c->swiglu_limit;
     float *g = h, *u = h + SI;
-    mm(g, x, L->sg, 1, D, SI);
-    mm(u, x, L->su, 1, D, SI);
+    mmw(g, x, L->sg, 1, D, SI);
+    mmw(u, x, L->su, 1, D, SI);
     for (int i = 0; i < SI; i++) {
         float gi = g[i] > lim ? lim : g[i];
         float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
         g[i] = siluf(gi) * ui;
     }
-    mm(tmp, g, L->sd, 1, SI, D);
+    mmw(tmp, g, L->sd, 1, SI, D);
     for (int i = 0; i < D; i++) out[i] = acc[i] + tmp[i];
+    if (g_prof) g_t_shared += now_s() - _t0;
 }
 
 /* ---------- compressors ----------
@@ -705,7 +1011,7 @@ static int compress_push(const Cfg *c, LState *ls, int slot, const float *kv, co
             dst[d] = a;
         }
         rmsnorm_row(dst, dst, norm_w, dim, c->eps);
-        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f);
+        rope_head(dst, dim, c->rdim, c->inv_comp, wnd * m_r + first_pos, 1.f, c->ms_comp);
     }
     /* persist this call's last full window's Ca slice for the next call's window 0 */
     if (overlap) {
@@ -733,30 +1039,32 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     LState *ls = &s->l[li];
     int D = c->D, H = c->n_heads, hd = c->head_dim, R = c->rdim;
     const float *inv = c->att[li] == ATT_SLIDING ? c->inv_main : c->inv_comp;
+    float ms = c->att[li] == ATT_SLIDING ? c->ms_main : c->ms_comp;
 
+    double _p0 = g_prof ? now_s() : 0;
     /* queries: q_a -> q_a_norm -> q_b -> per-head unweighted RMSNorm -> rope */
     float *qres = falloc((int64_t)n * c->q_lora);
     float *qtmp = falloc((int64_t)n * c->q_lora);
-    mm(qtmp, xn, L->q_a, n, D, c->q_lora);
+    mmw(qtmp, xn, L->q_a, n, D, c->q_lora);
     for (int t = 0; t < n; t++)
         rmsnorm_row(qres + (int64_t)t * c->q_lora, qtmp + (int64_t)t * c->q_lora, L->q_an, c->q_lora, c->eps);
     free(qtmp);
     float *q = falloc((int64_t)n * H * hd);
-    mm(q, qres, L->q_b, n, c->q_lora, H * hd);
+    mmw(q, qres, L->q_b, n, c->q_lora, H * hd);
     for (int t = 0; t < n; t++)
         for (int h = 0; h < H; h++) {
             float *qh = q + ((int64_t)t * H + h) * hd;
             rmsnorm_plain(qh, qh, hd, c->eps);
-            rope_head(qh, hd, R, inv, pos0 + t, 1.f);
+            rope_head(qh, hd, R, inv, pos0 + t, 1.f, ms);
         }
 
     /* the single shared KV head: kv_proj -> kv_norm -> rope. K IS V. */
     float *knew = falloc((int64_t)n * hd);
     { float *raw = falloc((int64_t)n * hd);
-      mm(raw, xn, L->kv_w, n, D, hd);
+      mmw(raw, xn, L->kv_w, n, D, hd);
       for (int t = 0; t < n; t++) {
           rmsnorm_row(knew + (int64_t)t * hd, raw + (int64_t)t * hd, L->kv_n, hd, c->eps);
-          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f);
+          rope_head(knew + (int64_t)t * hd, hd, R, inv, pos0 + t, 1.f, ms);
       }
       free(raw); }
 
@@ -772,6 +1080,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     memcpy(kall + (int64_t)nc * hd, knew, (size_t)n * hd * sizeof(float));
     for (int t = 0; t < n; t++) kpos[nc + t] = pos0 + t;
 
+    if (g_prof) { g_t_proj += now_s() - _p0; _p0 = now_s(); }
     /* compressed long-range entries, plus per-query visibility */
     int ncomp = 0, m_r = 0;
     const float *comp = NULL;
@@ -780,8 +1089,8 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         m_r = c->att[li] == ATT_CSA ? c->m_csa : c->m_hca;
         int wid = c->att[li] == ATT_CSA ? 2 * hd : hd;
         float *ckv = falloc((int64_t)n * wid), *cgt = falloc((int64_t)n * wid);
-        mm(ckv, xn, L->c_kv, n, D, wid);
-        mm(cgt, xn, L->c_gate, n, D, wid);
+        mmw(ckv, xn, L->c_kv, n, D, wid);
+        mmw(cgt, xn, L->c_gate, n, D, wid);
         compress_push(c, ls, 0, ckv, cgt, n, m_r, hd, c->att[li] == ATT_CSA, L->c_bias, L->c_norm);
         free(ckv); free(cgt);
         ncomp = ls->ncomp[0];
@@ -800,24 +1109,24 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
              * aligned across calls, so this cannot be skipped when ncomp == 0. */
             int idim = c->idx_dim, IH = c->idx_heads;
             float *ikv = falloc((int64_t)n * 2 * idim), *igt = falloc((int64_t)n * 2 * idim);
-            mm(ikv, xn, L->i_kv, n, D, 2 * idim);
-            mm(igt, xn, L->i_gate, n, D, 2 * idim);
+            mmw(ikv, xn, L->i_kv, n, D, 2 * idim);
+            mmw(igt, xn, L->i_gate, n, D, 2 * idim);
             compress_push(c, ls, 1, ikv, igt, n, m_r, idim, 1, L->i_bias, L->i_norm);
             free(ikv); free(igt);
             int nic = ls->ncomp[1];
             const float *ic = ls->comp[1];
             if (ncomp > 0) {
             float *iq = falloc((int64_t)n * IH * idim);
-            mm(iq, qres, L->i_qb, n, c->q_lora, IH * idim);
+            mmw(iq, qres, L->i_qb, n, c->q_lora, IH * idim);
             float *iw = falloc((int64_t)n * IH);
-            mm(iw, xn, L->i_w, n, D, IH);
+            mmw(iw, xn, L->i_w, n, D, IH);
             float wsc = 1.f / sqrtf((float)IH), ssc = 1.f / sqrtf((float)idim);
 
             int cand = nic < ncomp ? nic : ncomp;
             float *sc = falloc(cand > 0 ? cand : 1);
             for (int t = 0; t < n; t++) {
                 for (int h = 0; h < IH; h++)
-                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f);
+                    rope_head(iq + ((int64_t)t * IH + h) * idim, idim, R, c->inv_comp, pos0 + t, 1.f, c->ms_comp);
                 int thr = (pos0 + t + 1) / m_r;
                 for (int e = 0; e < cand; e++) {
                     float a = 0;
@@ -829,6 +1138,13 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
                     }
                     sc[e] = e < thr ? a : -INFINITY;
                 }
+                /* top-k by score. Ties go to the LOWEST entry index (strict >, stable
+                 * scan). torch.topk defines no tie-break — it was observed returning the
+                 * highest tied index — so an exactly-tied row is unmatchable by
+                 * construction, not a bug on either side. It only arises when relu()
+                 * zeroes the score across EVERY indexer head at once: a 2^-64 event at
+                 * V4-Flash's 64 heads, but near-certain in a 2-head toy, which is why
+                 * make_tiny_deepseek.py uses 8. */
                 int kk = c->idx_topk < cand ? c->idx_topk : cand;
                 for (int a = 0; a < kk; a++) {
                     int best = -1; float bv = -INFINITY;
@@ -845,24 +1161,41 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
         }
     }
 
+    if (g_prof) { g_t_comp += now_s() - _p0; _p0 = now_s(); }
     /* per-query softmax attention over [sliding window ++ selected compressed], with the
      * per-head learnable sink as an extra logit that is dropped after normalization */
     float scale = 1.f / sqrtf((float)hd);
     int gin = H * hd / c->o_groups;
     float *acc = falloc((int64_t)H * hd);
-    float *lg = falloc(nk + (ncomp > 0 ? ncomp : 1));
-    int *src = malloc(sizeof(int) * (nk + (ncomp > 0 ? ncomp : 1)));
+    /* Per-THREAD logit scratch (not per-head): the head loop below runs in parallel,
+     * and threads are capped at the core count while H is 64. */
+    int nth = 1;
+#ifdef _OPENMP
+    nth = omp_get_max_threads();
+#endif
+    int64_t lcap = nk + (ncomp > 0 ? ncomp : 1);
+    float *lgs = falloc((int64_t)nth * lcap);
+    int *srcs = malloc(sizeof(int) * (size_t)nth * lcap);
+    if (!srcs) { fprintf(stderr, "OOM sdpa scratch\n"); exit(1); }
     float *grp = falloc((int64_t)c->o_groups * c->o_rank);
     for (int t = 0; t < n; t++) {
         int p = pos0 + t;
+        /* heads are fully independent (own logits, own output slice), so this is a
+         * pure parallelisation: no numerics change from the schedule. */
+        #pragma omp parallel for schedule(static)
         for (int h = 0; h < H; h++) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *lg = lgs + (int64_t)tid * lcap;
+            int *src = srcs + (int64_t)tid * lcap;
             const float *qh = q + ((int64_t)t * H + h) * hd;
             int nl = 0;
             float mx = L->sinks[h];
             for (int j = 0; j < nk; j++) {
                 if (kpos[j] > p || p - kpos[j] >= c->win) continue;
-                float d = 0;
-                for (int i = 0; i < hd; i++) d += qh[i] * kall[(int64_t)j * hd + i];
+                float d = sdpa_dot(qh, kall + (int64_t)j * hd, hd, g_exact);
                 d *= scale;
                 lg[nl] = d; if (d > mx) mx = d;
                 src[nl] = j;
@@ -871,8 +1204,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
             int nsl = nl;
             for (int e = 0; e < ncomp; e++) {
                 if (!vis[(int64_t)t * ncomp + e]) continue;
-                float d = 0;
-                for (int i = 0; i < hd; i++) d += qh[i] * comp[(int64_t)e * hd + i];
+                float d = sdpa_dot(qh, comp + (int64_t)e * hd, hd, g_exact);
                 d *= scale;
                 lg[nl] = d; if (d > mx) mx = d;
                 src[nl] = e;
@@ -884,19 +1216,24 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
             float *ah = acc + (int64_t)h * hd;
             for (int i = 0; i < hd; i++) ah[i] = 0;
             for (int j = 0; j < nl; j++) {
-                float w = lg[j] * rd;
                 const float *v = j < nsl ? kall + (int64_t)src[j] * hd
                                          : comp + (int64_t)src[j] * hd;
-                for (int i = 0; i < hd; i++) ah[i] += w * v[i];
+                sdpa_axpy(ah, v, lg[j] * rd, hd);
             }
             /* K == V, so the value carried RoPE: undo it at the QUERY position */
-            rope_head(ah, hd, R, inv, p, -1.f);
+            rope_head(ah, hd, R, inv, p, -1.f, ms);
         }
+        if (g_prof) { g_t_sdpa += now_s() - _p0; _p0 = now_s(); }
         /* grouped low-rank output projection: g blocks of gin -> o_rank, then mixed to D */
         for (int g = 0; g < c->o_groups; g++)
-            mm(grp + (int64_t)g * c->o_rank, acc + (int64_t)g * gin,
-               L->o_a + (int64_t)g * c->o_rank * gin, 1, gin, c->o_rank);
-        mm(out + (int64_t)t * D, grp, L->o_b, 1, c->o_groups * c->o_rank, D);
+        {   Wt oa = L->o_a;
+            int64_t off = (int64_t)g * c->o_rank * gin;
+            Wt g_oa = { oa.f ? oa.f + off : NULL, oa.b ? oa.b + off : NULL, NULL };
+            if (oa.d) g_oa.d = (char *)oa.d + off * sizeof(uint16_t);
+            mmw(grp + (int64_t)g * c->o_rank, acc + (int64_t)g * gin, g_oa, 1, gin, c->o_rank); }
+        if (g_prof) { g_t_oproj += now_s() - _p0; _p0 = now_s(); }
+        mmw(out + (int64_t)t * D, grp, L->o_b, 1, c->o_groups * c->o_rank, D);
+        if (g_prof) { g_t_ob += now_s() - _p0; _p0 = now_s(); }
     }
 
     /* keep the last win-1 sliding entries */
@@ -909,7 +1246,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     ls->nkv = keep > 0 ? keep : 0;
 
     free(qres); free(q); free(knew); free(kall); free(kpos);
-    free(acc); free(lg); free(src); free(grp); free(vis);
+    free(acc); free(lgs); free(srcs); free(grp); free(vis);
 }
 
 /* ---------- forward ---------- */
@@ -919,10 +1256,13 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     int D = c->D, V = c->V, hc = c->hc_mult;
 
     float *hs = falloc((int64_t)n * hc * D);            /* the hc parallel residual streams */
-    for (int t = 0; t < n; t++)
+    float *erow = falloc(D);
+    for (int t = 0; t < n; t++) {
+        const float *e = wt_row_f32(m->embed, (int64_t)ids[t] * D, erow, D);
         for (int k = 0; k < hc; k++)
-            memcpy(hs + ((int64_t)t * hc + k) * D, m->embed + (int64_t)ids[t] * D,
-                   (size_t)D * sizeof(float));
+            memcpy(hs + ((int64_t)t * hc + k) * D, e, (size_t)D * sizeof(float));
+    }
+    free(erow);
 
     int mixn = (2 + hc) * hc;
     float *coll = falloc((int64_t)n * D), *xn = falloc((int64_t)n * D);
@@ -943,7 +1283,9 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
                     coll + (int64_t)t * D, flat, mix);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln1, D, c->eps);
-        attn_forward(m, L, s, li, xn, n, pos0, sub);
+        { double _a = g_prof ? now_s() : 0;
+          attn_forward(m, L, s, li, xn, n, pos0, sub);
+          if (g_prof) g_t_attn += now_s() - _a; }
         for (int t = 0; t < n; t++)
             hc_merge(c, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
                      comb + (int64_t)t * hc * hc, sub + (int64_t)t * D, tmp);
@@ -955,8 +1297,10 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
                     coll + (int64_t)t * D, flat, mix);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln2, D, c->eps);
-        for (int t = 0; t < n; t++)
+        { double _a = g_prof ? now_s() : 0;
+          for (int t = 0; t < n; t++)
             moe_row(m, L, li, xn + (int64_t)t * D, ids[t], sub + (int64_t)t * D, scratch);
+          if (g_prof) g_t_moe += now_s() - _a; }
         for (int t = 0; t < n; t++)
             hc_merge(c, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
                      comb + (int64_t)t * hc * hc, sub + (int64_t)t * D, tmp);
@@ -976,7 +1320,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
             for (int i = 0; i < D; i++) hv[i] += pre * st[(int64_t)k * D + i];
         }
         rmsnorm_row(hv, hv, m->norm, D, c->eps);
-        mm(logits + (int64_t)(logits_all ? t : 0) * V, hv, m->lm_head, 1, D, V);
+        mmw(logits + (int64_t)(logits_all ? t : 0) * V, hv, m->lm_head, 1, D, V);
     }
     free(hs); free(coll); free(xn); free(sub); free(post); free(comb);
     free(flat); free(mix); free(tmp); free(scratch); free(hv);
@@ -1145,10 +1489,107 @@ static void generate(Model *m, Tok *T, const char *text, int n_gen, float temp, 
     state_free(m, &s); free(lg); free(ids);
 }
 
+
+#ifdef COLI_CUDA
+/* DSV4_CUDA_TEST=1 ./deepseek — GPU fp4 kernels vs the CPU ones on random data.
+ * No model, no snapshot: the expert cache only engages on a 162 GB container, so
+ * without this the fp4 CUDA path would have no test that runs anywhere. Checks the
+ * bare matmul and the fused K-expert path (including V4's asymmetric SwiGLU clamp,
+ * which is the easiest thing here to get silently wrong). */
+static int cuda_selftest(void) {
+    if (lag_cuda_init(0) != 0) { fprintf(stderr, "[cuda-test] no device\n"); return 1; }
+    srand(1234);
+    int I = 2048, D = 4096, E = 4, K = 3;
+    float lim = 10.f;
+    size_t gu_n = (size_t)E * 2 * I * (D / 2), gue_n = (size_t)E * 2 * I * (D / 32);
+    size_t dn_n = (size_t)E * D * (I / 2),     dne_n = (size_t)E * D * (I / 32);
+    uint8_t *gu = malloc(gu_n), *gue = malloc(gue_n), *dn = malloc(dn_n), *dne = malloc(dne_n);
+    float *x = falloc(D), *yc = falloc(D), *yg = falloc(D);
+    if (!gu || !gue || !dn || !dne) { fprintf(stderr, "[cuda-test] OOM\n"); return 1; }
+    for (size_t i = 0; i < gu_n; i++)  gu[i]  = (uint8_t)(rand() & 0xFF);
+    for (size_t i = 0; i < dn_n; i++)  dn[i]  = (uint8_t)(rand() & 0xFF);
+    /* exponents near 127 so the products land in a normal range */
+    for (size_t i = 0; i < gue_n; i++) gue[i] = (uint8_t)(120 + (rand() % 12));
+    for (size_t i = 0; i < dne_n; i++) dne[i] = (uint8_t)(120 + (rand() % 12));
+    for (int i = 0; i < D; i++) x[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+
+    int bad = 0;
+    /* --- bare fp4 matmul, one expert's gate_up rows --- */
+    {
+        float *ref = falloc(2 * I), *got = falloc(2 * I);
+        matmul_fp4_k(ref, x, gu, gue, D, 2 * I, 0);
+        void *dq = lag_cuda_upload(gu, gu_n), *de = lag_cuda_upload(gue, gue_n);
+        if (!dq || !de || lag_cuda_matmul_fp4(got, x, dq, de, 1, D, 2 * I) != 0) {
+            fprintf(stderr, "[cuda-test] matmul_fp4 call failed\n"); return 1; }
+        double md = 0, mr = 0;
+        for (int i = 0; i < 2 * I; i++) {
+            double d = fabs((double)ref[i] - got[i]); if (d > md) md = d;
+            double r = d / (fabs((double)ref[i]) + 1e-6); if (r > mr) mr = r;
+        }
+        printf("[cuda-test] matmul_fp4  [%d->%d]  max|abs|=%.3e  max_rel=%.3e  %s\n",
+               D, 2 * I, md, mr, mr < 1e-3 ? "OK" : "FAIL");
+        bad |= !(mr < 1e-3);
+        lag_cuda_free(dq); lag_cuda_free(de); free(ref); free(got);
+    }
+    /* --- fused K-expert path vs the CPU expert loop --- */
+    {
+        int sel[3] = {0, 2, 3};
+        float w[3] = {0.5f, 0.3f, 0.2f};
+        float *h = falloc(2 * I), *tmp = falloc(D);
+        for (int i = 0; i < D; i++) yc[i] = 0;
+        for (int a = 0; a < K; a++) {                 /* CPU reference: same as moe_row */
+            int e = sel[a];
+            float *g = h, *u = h + I;
+            matmul_fp4_k(g, x, gu + (size_t)e * 2 * I * (D / 2),
+                         gue + (size_t)e * 2 * I * (D / 32), D, 2 * I, 0);
+            for (int i = 0; i < I; i++) {
+                float gi = g[i] > lim ? lim : g[i];
+                float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
+                g[i] = siluf(gi) * ui;
+            }
+            matmul_fp4_k(tmp, g, dn + (size_t)e * D * (I / 2),
+                         dne + (size_t)e * D * (I / 32), I, D, 0);
+            for (int i = 0; i < D; i++) yc[i] += w[a] * tmp[i];
+        }
+        void *a1 = lag_cuda_upload(gu, gu_n),  *a2 = lag_cuda_upload(gue, gue_n);
+        void *a3 = lag_cuda_upload(dn, dn_n),  *a4 = lag_cuda_upload(dne, dne_n);
+        if (!a1 || !a2 || !a3 || !a4 ||
+            lag_cuda_moe_experts_fp4(yg, x, a1, a2, a3, a4, sel, w, K, I, D, lim) != 0) {
+            fprintf(stderr, "[cuda-test] moe_experts_fp4 call failed\n"); return 1; }
+        /* Chained fp4 -> clamped SiLU-GLU -> fp4 spans a huge dynamic range, so a
+         * per-element relative error explodes on near-zero outputs and a bare
+         * absolute bound is meaningless (these outputs are ~1e6). Gate on the
+         * scale-free L2 relative error, like tools/kernel_check.c's report(). */
+        double md = 0, ss = 0, sr = 0;
+        for (int i = 0; i < D; i++) {
+            double d = fabs((double)yc[i] - yg[i]); if (d > md) md = d;
+            ss += d * d; sr += (double)yc[i] * yc[i];
+        }
+        double l2 = sqrt(ss) / (sqrt(sr) + 1e-30);
+        printf("[cuda-test] moe_experts_fp4 [K=%d I=%d D=%d] max|abs|=%.3e |ref|max=%.3e "
+               "L2rel=%.3e  %s\n", K, I, D, md, sqrt(sr / D), l2, l2 < 1e-5 ? "OK" : "FAIL");
+        bad |= !(l2 < 1e-5);
+        free(h); free(tmp);
+    }
+    printf(bad ? "DSV4-CUDA-TEST FAIL\n" : "DSV4-CUDA-TEST PASS\n");
+    return bad;
+}
+#endif
+
 int main(int argc, char **argv) {
+    /* Cap the OpenMP team to PHYSICAL cores. Without this the default team is one
+     * thread per hardware thread, and on an SMT part that is catastrophic here, not
+     * merely suboptimal — moe_util.h records ~28x for laguna on this same Ryzen 9
+     * 7900 (12c/24t). deepseek.c was the only engine not calling it: measured 12 tok
+     * prefill 8.5s at 24 threads vs 0.32s at 8. OMP_NUM_THREADS still wins. */
+    moe_omp_autotune();
+#ifdef COLI_CUDA
+    if (getenv("DSV4_CUDA_TEST")) return cuda_selftest();
+#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("EXACT")) g_exact = 1;
+    if (getenv("DSV4_PROF")) g_prof = 1;
 
     const char *ref = NULL, *pfile = NULL, *prompt = NULL;
     int n_gen = 64;
@@ -1164,7 +1605,13 @@ int main(int argc, char **argv) {
     Model m;
     memset(&m, 0, sizeof(m));
     double t0 = now_s();
+#ifdef COLI_CUDA
+    cuda_budget_init();
+#endif
     model_load(&m, snap);
+#ifdef COLI_CUDA
+    cuda_cache_experts(&m);
+#endif
     fprintf(stderr, "[deepseek] %d layers, %d experts (top-%d), hc_mult %d, "
             "loaded in %.1fs (rss %.1f GB)\n",
             m.c.n_layers, m.c.E, m.c.K, m.c.hc_mult, now_s() - t0, rss_gb());
@@ -1178,6 +1625,10 @@ int main(int argc, char **argv) {
     char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
     Tok T; tok_load(&T, tkp);
     generate(&m, &T, txt, n_gen, temp, top_p);
+    if (g_prof) fprintf(stderr,
+        "[prof] attn %.2fs (qkv %.2f compressor %.2f sdpa-loop %.2f o_a %.2f o_b %.2f) | "
+        "moe %.2fs (router %.2f routed %.2f shared %.2f)\n",
+        g_t_attn, g_t_proj, g_t_comp, g_t_sdpa, g_t_oproj, g_t_ob, g_t_moe, g_t_route, g_t_routed, g_t_shared);
     free(txt);
     return 0;
 }

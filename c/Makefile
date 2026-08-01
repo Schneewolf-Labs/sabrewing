@@ -300,8 +300,8 @@ qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_q
 	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
 # DeepSeek-V4-Flash: mHC hyper-connections + CSA/HCA compressed attention. Stage-A f32 CPU.
-deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_sample.h
-	$(CC) $(CFLAGS) deepseek.c -o deepseek$(EXE) $(LDFLAGS)
+deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
 deepseek-test: deepseek$(EXE)
@@ -315,6 +315,22 @@ deepseek-test: deepseek$(EXE)
 deepseek-ref: deepseek$(EXE)
 	$(PYTHON) tools/dsv4_ref.py tiny_dsv4_py
 	SNAP=tiny_dsv4_py ./deepseek$(EXE) tiny_dsv4_py/ref_deepseek.json
+
+# fp4 container equivalence. tools/convert_deepseek_fp4.py's output can only be
+# exercised by the 167 GB checkpoint, so build the same container shape from a tiny
+# snapshot, plus a twin holding the DEQUANTIZED values as f32. Both describe identical
+# weights, so the fp4 expert path + bf16 resident tier must agree with the plain f32
+# path exactly; a difference is a plumbing bug (row order, nibble order, scale stride).
+# Comparing against the UNquantized model instead would only measure quantization loss
+# on random weights. Widths must be multiples of 32 (the block-scale size).
+deepseek-fp4: deepseek$(EXE)
+	DSV4_D=64 DSV4_MOE_I=32 $(PYTHON) tools/dsv4_ref.py tiny_dsv4_32
+	$(PYTHON) tools/make_tiny_dsv4_fp4.py tiny_dsv4_32 tiny_dsv4_fp4 tiny_dsv4_deq
+	@a=`SNAP=tiny_dsv4_fp4 ./deepseek$(EXE) tiny_dsv4_fp4/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
+	 b=`SNAP=tiny_dsv4_deq ./deepseek$(EXE) tiny_dsv4_deq/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
+	 echo "fp4 container : $$a"; echo "f32 twin      : $$b"; \
+	 if [ "$$a" = "$$b" ]; then echo "FP4-CONTAINER PASS (fp4+bf16 path identical to f32 on the same weights)"; \
+	 else echo "FP4-CONTAINER FAIL"; exit 1; fi
 
 # Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)
 qwen35-test: qwen35$(EXE)
@@ -500,4 +516,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test deepseek-ref glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
+.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test deepseek-ref deepseek-fp4 glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
