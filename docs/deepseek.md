@@ -223,6 +223,7 @@ RTX A6000 48 GB). Same prompt, same output tokens in all three arms:
 | as first landed | 99.36 s | 0.10 tok/s | OpenMP team = 24 (SMT) |
 | `moe_omp_autotune()` | 2.89 s | 2.37 tok/s | team = 12 physical cores |
 | `+ CUDA=1` residents | 1.44 s | 7.13 tok/s | bf16 projections in VRAM |
+| `+ fp4 expert cache` | 1.44 s | 7.42 tok/s | 9 of 43 expert layers fit |
 
 ```
 [deepseek] cuda: 50.6 GB free, budgeting 48.6 GB for bf16 residents
@@ -262,10 +263,37 @@ expanded bf16→f32 exact, activations f32), host copies are kept so any failure
 to CPU, and `EXACT=1` stays on the CPU double-accumulate reference. Budget with
 `DSV4_CUDA_GB`.
 
-The 147 GB of fp4 routed experts stay on the CPU and are now **71% of decode time**
-(2.63 s of 3.68 s above). That is the next lever, and it needs an fp4 (e2m1 + ue8m0)
-CUDA kernel plus a VRAM expert cache — ~34 GB of the card is free after residents, which
-is 23% of the expert set.
+The fp4 routed experts also have a CUDA path (`mm_fp4_kernel` +
+`lag_cuda_moe_experts_fp4`: all K experts of a layer in one submission and one sync,
+with V4's asymmetric SwiGLU clamp done on device). Whole layers are cached
+all-or-nothing — a partially resident layer would still pay a host round trip per
+token — and residents are uploaded first because they serve every token.
+
+**It helps far less than the kernel speed suggests, and the reason is capacity.** On a
+layer whose experts are resident it is a clean win — the 4-layer subset, whose experts
+fit entirely, goes 16.1 → 107.3 tok/s (routed 0.16 s → 0.06 s). On the real model only
+**9 of 43 layers fit** (45.3 GB on the card), so end-to-end it is 7.13 → 7.42 tok/s,
+about **+4%**:
+
+```
+[deepseek] cuda: 9/43 expert layers in VRAM (45.3 GB total on device)
+[deepseek] 18 tok in 2.43s (7.42 tok/s), rss 150.9 GB
+[prof] attn 0.86s (...) | moe 2.69s (router 0.04 routed 2.48 shared 0.18)
+```
+
+147 GB of experts against 48 GB of card is the whole story: ~21% coverage, and routing
+is near-uniform over 256 experts so no static subset is hot enough to bias the choice.
+Streaming the top-6 experts per layer per token instead would be ~75 MB over PCIe per
+layer — ~260 ms/token, far worse than just computing them on the CPU. This scales with
+VRAM rather than with cleverness.
+
+`DSV4_CUDA_TEST=1 ./deepseek` checks the GPU fp4 kernels against the CPU ones on random
+data with no model or snapshot (the cache only engages on a 162 GB container, so
+otherwise this path would have no test that runs anywhere): the bare matmul to 8.9e-04
+max relative, and the fused K-expert path to 2.8e-06 **L2** relative. That output is
+gated on L2, not max-abs: chained fp4 → clamped SiLU-GLU → fp4 spans a huge dynamic
+range, so per-element relative error explodes on near-zero outputs and an absolute bound
+is meaningless at |ref| ~ 3e4.
 
 Prompt built with the repo's own `encoding/encoding_dsv4.py` (`thinking_mode="chat"`);
 V4 ships **no jinja chat template**, so `-f` needs a file that encoder produced. The 12

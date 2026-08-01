@@ -74,6 +74,26 @@ int    lag_cuda_moe_group(float *acc, const float *x,
                           const int *grow, const int *rowof, const float *w,
                           int S, int K, int I, int D);
 
+/* ---------------- fp4 (e2m1 + per-32-block ue8m0 scale) ----------------
+ * DeepSeek-V4's native expert format, kept verbatim by the container (see
+ * moe_quant.h). Layout matches the int4 kernels' nibble convention (low = even
+ * column); only the value mapping differs — int4 is (nibble-8) * row_scale, fp4
+ * is LUT[nibble] * 2^(es[col/32]-127). Matches CPU matmul_fp4_k up to reduction
+ * order, exactly like the int4 pair above. */
+int    lag_cuda_matmul_fp4(float *y, const float *x, const void *packed,
+                           const void *es, int S, int I, int O);
+/* Batched routed experts for one VRAM-resident fp4 MoE layer (S=1 decode):
+ * out[D] = sum_k w[k] * expert(sel[k], x) in ONE submission / one sync.
+ * `limit` is V4's ASYMMETRIC SwiGLU clamp — gate.clamp(max=limit),
+ * up.clamp(-limit, limit) — which is why this cannot reuse the int4 expert path.
+ * Experts are applied in the order given, so passing sel/w sorted by expert id
+ * reproduces the CPU combine order. */
+int    lag_cuda_moe_experts_fp4(float *out, const float *x,
+                                const void *gu_q, const void *gu_es,
+                                const void *dn_q, const void *dn_es,
+                                const int *sel, const float *w, int K,
+                                int I, int D, float limit);
+
 #ifdef __cplusplus
 }
 #endif

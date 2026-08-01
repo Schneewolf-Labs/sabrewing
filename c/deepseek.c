@@ -136,6 +136,7 @@ typedef struct {
     float *e_gu, *e_dn;             /* f32 experts: [E, 2I, D] and [E, D, I] */
     uint8_t *q_gu, *q_dn;           /* fp4 container: e2m1 nibbles [E*2I, D/2], [E*D, I/2] */
     uint8_t *s_gu, *s_dn;           /* ...and their ue8m0 block scales [E*2I, D/32], [E*D, I/32] */
+    void *d_gu, *d_gu_es, *d_dn, *d_dn_es;   /* VRAM copies (NULL = this layer stays on CPU) */
     Wt sg, su, sd;                  /* shared expert */
 } Layer;
 
@@ -396,6 +397,44 @@ static void cuda_try_upload(Wt *w, size_t nbytes) {
     void *d = lag_cuda_upload(w->b, nbytes);
     if (!d) { g_cuda_left = 0; return; }        /* out of VRAM: stop trying */
     w->d = d; g_cuda_left -= nbytes; g_cuda_used += nbytes;
+}
+
+/* Routed-expert VRAM cache. Residents are uploaded first, during model_load: they
+ * are ~14 GB, serve EVERY token, and are the better bytes-per-flop trade. Whatever
+ * is left then buys whole layers of fp4 experts, all-or-nothing per layer (3.4 GB
+ * each for V4-Flash) — a partially resident layer would still pay a host round trip
+ * per token, so there is nothing to gain from splitting one. Host copies are kept,
+ * so an upload failure or a full card just leaves that layer on the CPU.
+ *
+ * Front-to-back is deliberate rather than clever: expert selection is data-dependent
+ * and roughly uniform over 256 experts, so no static subset is "hot" — with ~23% of
+ * the set resident, which layers are chosen matters far less than how many. */
+static int cuda_cache_experts(Model *m) {
+    if (!g_cuda_on || !m->xq) return 0;
+    Cfg *c = &m->c;
+    size_t gu_n  = (size_t)c->E * 2 * c->moe_I * (c->D / 2);
+    size_t gue_n = (size_t)c->E * 2 * c->moe_I * (c->D / 32);
+    size_t dn_n  = (size_t)c->E * c->D * (c->moe_I / 2);
+    size_t dne_n = (size_t)c->E * c->D * (c->moe_I / 32);
+    size_t per   = gu_n + gue_n + dn_n + dne_n;
+    int cached = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *L = &m->L[i];
+        if (!L->q_gu || per > g_cuda_left) continue;
+        void *a = lag_cuda_upload(L->q_gu, gu_n);
+        void *b = a ? lag_cuda_upload(L->s_gu, gue_n) : NULL;
+        void *d = b ? lag_cuda_upload(L->q_dn, dn_n) : NULL;
+        void *e = d ? lag_cuda_upload(L->s_dn, dne_n) : NULL;
+        if (!e) {                                  /* partial: roll back, stop trying */
+            lag_cuda_free(a); lag_cuda_free(b); lag_cuda_free(d);
+            g_cuda_left = 0; break;
+        }
+        L->d_gu = a; L->d_gu_es = b; L->d_dn = d; L->d_dn_es = e;
+        g_cuda_left -= per; g_cuda_used += per; cached++;
+    }
+    fprintf(stderr, "[deepseek] cuda: %d/%d expert layers in VRAM (%.1f GB total on device)\n",
+            cached, c->n_layers, g_cuda_used / 1e9);
+    return cached;
 }
 #endif
 
@@ -854,10 +893,21 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
                                    float tw = w[a]; w[a] = w[b]; w[b] = tw; }
 
     if (g_prof) { g_t_route += now_s() - _t0; _t0 = now_s(); }
-    for (int i = 0; i < D; i++) acc[i] = 0;
-    for (int a = 0; a < K; a++) {
-        swiglu_expert(m, L, sel[a], x, tmp, h, I);
-        for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
+    int done = 0;
+#ifdef COLI_CUDA
+    /* Whole layer resident: all K experts in ONE submission and one sync. sel/w are
+     * already sorted ascending above, so the device combine order matches the CPU's. */
+    if (L->d_gu && !g_exact &&
+        lag_cuda_moe_experts_fp4(acc, x, L->d_gu, L->d_gu_es, L->d_dn, L->d_dn_es,
+                                 sel, w, K, I, D, c->swiglu_limit) == 0)
+        done = 1;
+#endif
+    if (!done) {
+        for (int i = 0; i < D; i++) acc[i] = 0;
+        for (int a = 0; a < K; a++) {
+            swiglu_expert(m, L, sel[a], x, tmp, h, I);
+            for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
+        }
     }
     if (g_prof) { g_t_routed += now_s() - _t0; _t0 = now_s(); }
 
@@ -1439,6 +1489,93 @@ static void generate(Model *m, Tok *T, const char *text, int n_gen, float temp, 
     state_free(m, &s); free(lg); free(ids);
 }
 
+
+#ifdef COLI_CUDA
+/* DSV4_CUDA_TEST=1 ./deepseek — GPU fp4 kernels vs the CPU ones on random data.
+ * No model, no snapshot: the expert cache only engages on a 162 GB container, so
+ * without this the fp4 CUDA path would have no test that runs anywhere. Checks the
+ * bare matmul and the fused K-expert path (including V4's asymmetric SwiGLU clamp,
+ * which is the easiest thing here to get silently wrong). */
+static int cuda_selftest(void) {
+    if (lag_cuda_init(0) != 0) { fprintf(stderr, "[cuda-test] no device\n"); return 1; }
+    srand(1234);
+    int I = 2048, D = 4096, E = 4, K = 3;
+    float lim = 10.f;
+    size_t gu_n = (size_t)E * 2 * I * (D / 2), gue_n = (size_t)E * 2 * I * (D / 32);
+    size_t dn_n = (size_t)E * D * (I / 2),     dne_n = (size_t)E * D * (I / 32);
+    uint8_t *gu = malloc(gu_n), *gue = malloc(gue_n), *dn = malloc(dn_n), *dne = malloc(dne_n);
+    float *x = falloc(D), *yc = falloc(D), *yg = falloc(D);
+    if (!gu || !gue || !dn || !dne) { fprintf(stderr, "[cuda-test] OOM\n"); return 1; }
+    for (size_t i = 0; i < gu_n; i++)  gu[i]  = (uint8_t)(rand() & 0xFF);
+    for (size_t i = 0; i < dn_n; i++)  dn[i]  = (uint8_t)(rand() & 0xFF);
+    /* exponents near 127 so the products land in a normal range */
+    for (size_t i = 0; i < gue_n; i++) gue[i] = (uint8_t)(120 + (rand() % 12));
+    for (size_t i = 0; i < dne_n; i++) dne[i] = (uint8_t)(120 + (rand() % 12));
+    for (int i = 0; i < D; i++) x[i] = (rand() / (float)RAND_MAX) * 2.f - 1.f;
+
+    int bad = 0;
+    /* --- bare fp4 matmul, one expert's gate_up rows --- */
+    {
+        float *ref = falloc(2 * I), *got = falloc(2 * I);
+        matmul_fp4_k(ref, x, gu, gue, D, 2 * I, 0);
+        void *dq = lag_cuda_upload(gu, gu_n), *de = lag_cuda_upload(gue, gue_n);
+        if (!dq || !de || lag_cuda_matmul_fp4(got, x, dq, de, 1, D, 2 * I) != 0) {
+            fprintf(stderr, "[cuda-test] matmul_fp4 call failed\n"); return 1; }
+        double md = 0, mr = 0;
+        for (int i = 0; i < 2 * I; i++) {
+            double d = fabs((double)ref[i] - got[i]); if (d > md) md = d;
+            double r = d / (fabs((double)ref[i]) + 1e-6); if (r > mr) mr = r;
+        }
+        printf("[cuda-test] matmul_fp4  [%d->%d]  max|abs|=%.3e  max_rel=%.3e  %s\n",
+               D, 2 * I, md, mr, mr < 1e-3 ? "OK" : "FAIL");
+        bad |= !(mr < 1e-3);
+        lag_cuda_free(dq); lag_cuda_free(de); free(ref); free(got);
+    }
+    /* --- fused K-expert path vs the CPU expert loop --- */
+    {
+        int sel[3] = {0, 2, 3};
+        float w[3] = {0.5f, 0.3f, 0.2f};
+        float *h = falloc(2 * I), *tmp = falloc(D);
+        for (int i = 0; i < D; i++) yc[i] = 0;
+        for (int a = 0; a < K; a++) {                 /* CPU reference: same as moe_row */
+            int e = sel[a];
+            float *g = h, *u = h + I;
+            matmul_fp4_k(g, x, gu + (size_t)e * 2 * I * (D / 2),
+                         gue + (size_t)e * 2 * I * (D / 32), D, 2 * I, 0);
+            for (int i = 0; i < I; i++) {
+                float gi = g[i] > lim ? lim : g[i];
+                float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
+                g[i] = siluf(gi) * ui;
+            }
+            matmul_fp4_k(tmp, g, dn + (size_t)e * D * (I / 2),
+                         dne + (size_t)e * D * (I / 32), I, D, 0);
+            for (int i = 0; i < D; i++) yc[i] += w[a] * tmp[i];
+        }
+        void *a1 = lag_cuda_upload(gu, gu_n),  *a2 = lag_cuda_upload(gue, gue_n);
+        void *a3 = lag_cuda_upload(dn, dn_n),  *a4 = lag_cuda_upload(dne, dne_n);
+        if (!a1 || !a2 || !a3 || !a4 ||
+            lag_cuda_moe_experts_fp4(yg, x, a1, a2, a3, a4, sel, w, K, I, D, lim) != 0) {
+            fprintf(stderr, "[cuda-test] moe_experts_fp4 call failed\n"); return 1; }
+        /* Chained fp4 -> clamped SiLU-GLU -> fp4 spans a huge dynamic range, so a
+         * per-element relative error explodes on near-zero outputs and a bare
+         * absolute bound is meaningless (these outputs are ~1e6). Gate on the
+         * scale-free L2 relative error, like tools/kernel_check.c's report(). */
+        double md = 0, ss = 0, sr = 0;
+        for (int i = 0; i < D; i++) {
+            double d = fabs((double)yc[i] - yg[i]); if (d > md) md = d;
+            ss += d * d; sr += (double)yc[i] * yc[i];
+        }
+        double l2 = sqrt(ss) / (sqrt(sr) + 1e-30);
+        printf("[cuda-test] moe_experts_fp4 [K=%d I=%d D=%d] max|abs|=%.3e |ref|max=%.3e "
+               "L2rel=%.3e  %s\n", K, I, D, md, sqrt(sr / D), l2, l2 < 1e-5 ? "OK" : "FAIL");
+        bad |= !(l2 < 1e-5);
+        free(h); free(tmp);
+    }
+    printf(bad ? "DSV4-CUDA-TEST FAIL\n" : "DSV4-CUDA-TEST PASS\n");
+    return bad;
+}
+#endif
+
 int main(int argc, char **argv) {
     /* Cap the OpenMP team to PHYSICAL cores. Without this the default team is one
      * thread per hardware thread, and on an SMT part that is catastrophic here, not
@@ -1446,6 +1583,9 @@ int main(int argc, char **argv) {
      * 7900 (12c/24t). deepseek.c was the only engine not calling it: measured 12 tok
      * prefill 8.5s at 24 threads vs 0.32s at 8. OMP_NUM_THREADS still wins. */
     moe_omp_autotune();
+#ifdef COLI_CUDA
+    if (getenv("DSV4_CUDA_TEST")) return cuda_selftest();
+#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     if (getenv("EXACT")) g_exact = 1;
@@ -1469,6 +1609,9 @@ int main(int argc, char **argv) {
     cuda_budget_init();
 #endif
     model_load(&m, snap);
+#ifdef COLI_CUDA
+    cuda_cache_experts(&m);
+#endif
     fprintf(stderr, "[deepseek] %d layers, %d experts (top-%d), hc_mult %d, "
             "loaded in %.1fs (rss %.1f GB)\n",
             m.c.n_layers, m.c.E, m.c.K, m.c.hc_mult, now_s() - t0, rss_gb());

@@ -58,13 +58,20 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   moe_util.h's comment already documented the cliff; V4 just never got the call.
   0.10 -> 2.37 tok/s on the 284B checkpoint, byte-identical output. **Worth grepping
   every future engine for this call before benchmarking it.**
-- [ ] **DeepSeek-V4 routed experts are still CPU-only** — with the CUDA tier holding the
-  bf16 residents (~14 GB VRAM, 2.37 -> 7.13 tok/s), the 147 GB of fp4 experts are now
-  **71% of decode** (2.63 s of 3.68 s). Needs an fp4 (e2m1 + per-32-block ue8m0) CUDA
-  kernel plus a VRAM expert cache; ~34 GB is free after residents, which covers 23% of
-  the expert set. `matmul_fp4_kb` (batched, one weight-row read per expert group) is
-  written and validated but **nothing calls it** — that is the CPU-side half of the
-  same lever, and 256 experts at top-6 is exactly the shape it was built for.
+- [x] **fp4 CUDA kernel + VRAM expert cache** — `mm_fp4_kernel` /
+  `lag_cuda_moe_experts_fp4` (K experts per layer in one submission, V4's asymmetric
+  SwiGLU clamp on device), whole-layer all-or-nothing caching after residents.
+  Validated by `DSV4_CUDA_TEST=1 ./deepseek` (no model needed).
+- [ ] **The expert cache is capacity-bound, not kernel-bound** — a resident layer is a
+  clean win (4-layer subset, experts fully cached: 16.1 -> 107.3 tok/s), but only 9 of
+  43 layers fit on a 48 GB card, so the 284B model gains ~4% (7.13 -> 7.42 tok/s).
+  147 GB of experts vs 48 GB of VRAM is the whole story; routing is near-uniform over
+  256 experts so no static subset is hot, and streaming top-6 per layer per token is
+  ~75 MB of PCIe (~260 ms/token), worse than computing on the CPU. Real fixes are
+  fewer expert bytes or more card. **Batched decode is the better next lever**:
+  `matmul_fp4_kb` (one weight-row read per expert group) is written and validated but
+  **nothing calls it**, and with B streams sharing experts the cached layers amortise
+  much better. 256 experts at top-6 is exactly the shape it was built for.
 - [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
   entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
   the actual blocker on long context, not the weights.
