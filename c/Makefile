@@ -300,8 +300,16 @@ qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_q
 	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
 # DeepSeek-V4-Flash: mHC hyper-connections + CSA/HCA compressed attention. Stage-A f32 CPU.
-deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h $(LAG_CUDA_OBJ)
+deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h moe_hc.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
+
+glm53$(EXE): glm53.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h moe_hc.h moe_linattn.h moe_serve.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) glm53.c $(LAG_CUDA_OBJ) -o glm53$(EXE) $(LDFLAGS)
+
+# GLM-5.3-Flash oracle vs transformers' glm5_next (needs torch + transformers >= 5.16)
+glm53-test: glm53$(EXE)
+	@if [ ! -f tiny_glm53/ref_glm53.json ]; then $(PYTHON) tools/make_tiny_glm53.py tiny_glm53; fi
+	SNAP=tiny_glm53 ./glm53$(EXE) tiny_glm53/ref_glm53.json
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
 # Two fixtures: the nested rope_parameters config save_pretrained writes, and the flat
@@ -524,4 +532,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test deepseek-ref deepseek-fp4 glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
+.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test glm53 glm53-test deepseek-ref deepseek-fp4 glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
