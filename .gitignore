@@ -72,6 +72,7 @@ c/tiny_qwen35/
 c/deepseek
 c/deepseek.exe
 c/tiny_deepseek/
+c/tiny_deepseek_flat/
 c/tiny_dsv4_py/
 c/tiny_dsv4_32/
 c/tiny_dsv4_fp4/

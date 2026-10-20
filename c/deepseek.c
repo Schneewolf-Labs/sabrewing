@@ -177,11 +177,11 @@ static float *fzalloc(int64_t n) {
 /* YaRN inverse frequencies, matching transformers' _compute_yarn_parameters.
  *
  * YaRN also returns an `attention_factor` (mscale) that the rotary embedding multiplies
- * into BOTH cos and sin. It is NOT 1.0 here: with no explicit override in the config it
- * is 0.1*ln(factor)+1, which is 1.2773 for V4-Flash's compress rope (factor 16). An
- * earlier note in this file claimed the reference pinned it to 1.0; it does not, and
- * dropping it left every CSA/HCA layer subtly wrong while sliding layers stayed exact
- * (the main rope is not YaRN, so its factor really is 1.0). */
+ * into BOTH cos and sin. Which value applies depends on the config SHAPE (cfg_load): a
+ * flat rope_scaling block — what DeepSeek ships — defaults it to 1.0; a nested
+ * rope_parameters.compress block without the key derives 0.1*ln(factor)+1 (1.2773 at
+ * factor 16). Getting either side wrong leaves every CSA/HCA layer subtly off while the
+ * sliding layers (main rope, never YaRN) stay exact. */
 static void yarn_inv(float *inv, int dim, double base, double factor,
                      double beta_fast, double beta_slow, int orig_max) {
     double lo = dim * log((double)orig_max / (beta_fast * 2 * M_PI)) / (2 * log(base));
@@ -206,9 +206,11 @@ static double get_mscale(double scale, double mscale) {
     return scale <= 1.0 ? 1.0 : 0.1 * mscale * log(scale) + 1.0;
 }
 
-/* Fills `inv` and returns the attention_factor that scales cos/sin. */
-static float rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max) {
-    double theta = rp ? jnum(rp, "rope_theta", dflt_theta) : dflt_theta;
+/* Fills `inv` and returns the attention_factor that scales cos/sin. `flat` = rp is a
+ * top-level rope_scaling block rather than a nested per-type entry: its theta is the
+ * caller's, and a yarn block without attention_factor gets 1.0 (see cfg_load). */
+static float rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ctx_max, int flat) {
+    double theta = rp && !flat ? jnum(rp, "rope_theta", dflt_theta) : dflt_theta;
     jval *rt = rp ? json_get(rp, "rope_type") : NULL;
     if (!rt) rt = rp ? json_get(rp, "type") : NULL;
     if (rt && rt->t == J_STR && !strcmp(rt->str, "yarn")) {
@@ -219,6 +221,7 @@ static float rope_table(float *inv, int dim, jval *rp, double dflt_theta, int ct
         yarn_inv(inv, dim, theta, factor, bf, bs, om);
         jval *af = json_get(rp, "attention_factor");
         if (af && af->t == J_NUM) return (float)af->num;
+        if (flat) return 1.f;
         jval *ms = json_get(rp, "mscale"), *msa = json_get(rp, "mscale_all_dim");
         if (ms && ms->t == J_NUM && msa && msa->t == J_NUM && ms->num && msa->num)
             return (float)(get_mscale(factor, ms->num) / get_mscale(factor, msa->num));
@@ -322,12 +325,27 @@ static void cfg_load(Cfg *c, const char *dir) {
         for (int i = 0; i < c->n_layers; i++) c->hash[i] = i < nh;
     }
 
-    /* Partial interleaved rotary. rope_parameters is keyed by rope TYPE (main / compress),
-     * not by layer type: sliding layers use main (theta 10000, no scaling), CSA/HCA layers
-     * and every compressor use compress (theta 160000, usually YaRN). */
+    /* Partial interleaved rotary. Rope is keyed by rope TYPE (main / compress), not by
+     * layer type: sliding layers use main (theta 10000, no scaling), CSA/HCA layers and
+     * every compressor use compress (theta 160000, usually YaRN).
+     *
+     * Two config shapes, normalized the way transformers' DeepseekV4Config does it:
+     *   nested  rope_parameters = {main, compress} (what save_pretrained writes) — used
+     *           verbatim, so a yarn block without attention_factor gets YaRN's derived
+     *           gain 0.1*ln(factor)+1.
+     *   flat    a top-level rope_scaling (DeepSeek's shipped config.json) or a flat
+     *           rope_parameters. main is plain RoPE at rope_theta; compress takes the
+     *           yarn keys at compress_rope_theta with attention_factor DEFAULTING TO 1.0
+     *           (V4's reference does not rescale cos/sin; DeepInfer hard-codes mscale off).
+     * This used to read only the nested shape, so the shipped checkpoint got NO YaRN on
+     * its compress rope at all; tools/make_tiny_deepseek.py now builds both shapes. */
     jval *rp = json_get(o, "rope_parameters");
+    if (!rp || rp->t != J_OBJ) rp = json_get(o, "rope_scaling");
+    if (rp && rp->t != J_OBJ) rp = NULL;
     jval *rmain = rp ? json_get(rp, "main") : NULL;
     jval *rcomp = rp ? json_get(rp, "compress") : NULL;
+    int flat = !(rmain && rmain->t == J_OBJ && rcomp && rcomp->t == J_OBJ);
+    if (flat) { rmain = NULL; rcomp = rp; }
     double prf = rmain ? jnum(rmain, "partial_rotary_factor", 0) : 0;
     if (prf <= 0) prf = jnum(o, "partial_rotary_factor", 0);
     if (prf <= 0) {
@@ -335,10 +353,11 @@ static void cfg_load(Cfg *c, const char *dir) {
         prf = qk > 0 ? qk / c->head_dim : 64.0 / 512.0;
     }
     c->rdim = (int)(c->head_dim * prf) & ~1;
-    if (c->rdim < 2 || c->rdim / 2 > MAXROT) {
-        fprintf(stderr, "rotary dim %d unsupported\n", c->rdim); exit(1); }
-    c->ms_main = rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max);
-    c->ms_comp = rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max);
+    if (c->rdim < 2 || c->rdim / 2 > MAXROT || c->rdim > c->head_dim || (c->idx_dim && c->rdim > c->idx_dim)) {
+        fprintf(stderr, "rotary dim %d unsupported (head_dim %d, index_head_dim %d)\n",
+                c->rdim, c->head_dim, c->idx_dim); exit(1); }
+    c->ms_main = rope_table(c->inv_main, c->rdim, rmain, jnum(o, "rope_theta", 10000.0), c->ctx_max, 0);
+    c->ms_comp = rope_table(c->inv_comp, c->rdim, rcomp, jnum(o, "compress_rope_theta", 160000.0), c->ctx_max, flat);
 
     c->n_eos = 0;
     for (int pass = 0; pass < 2 && !c->n_eos; pass++) {

@@ -304,9 +304,13 @@ deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h mo
 	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
+# Two fixtures: the nested rope_parameters config save_pretrained writes, and the flat
+# rope_scaling config DeepSeek ships (transformers gives them different YaRN gains).
 deepseek-test: deepseek$(EXE)
 	@if [ ! -f tiny_deepseek/ref_deepseek.json ]; then $(PYTHON) tools/make_tiny_deepseek.py tiny_deepseek; fi
+	@if [ ! -f tiny_deepseek_flat/ref_deepseek.json ]; then DSV4_ROPE=flat $(PYTHON) tools/make_tiny_deepseek.py tiny_deepseek_flat; fi
 	SNAP=tiny_deepseek ./deepseek$(EXE) tiny_deepseek/ref_deepseek.json
+	SNAP=tiny_deepseek_flat ./deepseek$(EXE) tiny_deepseek_flat/ref_deepseek.json
 
 # Dependency-free cross-check: a pure-Python reference model (no torch, no weights, no GPU)
 # that the engine must reproduce — mHC/Sinkhorn, CSA overlap windowing, HCA compression,

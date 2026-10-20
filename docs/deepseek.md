@@ -67,8 +67,14 @@ The compressed entries are concatenated onto the sliding keys and masked per que
 attention is one softmax over `[window ++ selected compressed]` with the per-head sink as an
 extra logit that is normalized in and then dropped.
 
-Both CSA/HCA layers and every compressor use the *compress* rope (θ=160000, YaRN factor 16
-with `attention_factor` pinned to 1.0 — the reference does not rescale cos/sin).
+Both CSA/HCA layers and every compressor use the *compress* rope (θ=160000, YaRN factor 16).
+Its cos/sin gain depends on the **config shape**, exactly as transformers normalizes it:
+DeepSeek's shipped `config.json` carries a flat top-level `rope_scaling`, for which
+`DeepseekV4Config` `setdefault`s `attention_factor = 1.0` (the reference does not rescale
+cos/sin; DeepInfer hard-codes `mscale=False` for V4.1). A nested
+`rope_parameters = {main, compress}` block without `attention_factor` — what
+`save_pretrained` writes for a config built that way — instead gets YaRN's derived
+`0.1*ln(factor)+1` (1.2773 at factor 16). See "The flat-config bug" below.
 
 ### The traps
 
@@ -172,6 +178,19 @@ Why the pure-Python harness missed them: it writes its own snapshot, so it never
 the checkpoint's tensor names, and it **pinned `"attention_factor": 1.0`** in the config it
 emitted, making the correct and incorrect behaviours coincide. It now computes the real
 mscale. This is the "shared misreading" failure the harness's own docs warn about.
+
+**The flat-config bug (found 2026-10, reading DeepInfer).** Bug 2's fix was right for the
+fixture and wrong for the checkpoint. `make_tiny_deepseek.py` only ever built the *nested*
+config shape, and the engine only ever read `rope_parameters.{main,compress}`. DeepSeek
+ships a flat `rope_scaling` block, so on the real 284B config the engine found no compress
+entry and ran the compress rope as **plain RoPE — no YaRN at all** (7 of 32 rotary pairs at
+the wrong frequency; worst at long context, invisible on short prompts). transformers, the
+vendor reference and DeepInfer all apply YaRN there with gain 1.0. The engine now normalizes
+both shapes the way `DeepseekV4Config` does, and `DSV4_ROPE=flat make_tiny_deepseek.py`
+builds a flat-config fixture (`make deepseek-test` runs both). That fixture uses a low
+compress θ (500), because at θ=160000 an engine that skipped YaRN entirely still passed the
+1e-3 logits gate (rel 2.9e-4); at θ=500 the old engine fails it (rel 5.9e-3) and the fixed
+one passes at rel 2.3e-7.
 
 A third fixture bug surfaced on the way: `make_tiny_deepseek.py` used `index_n_heads=2`.
 The indexer score is `sum_h w_h * relu(q_h . k_e)`; with two heads a random model relus
