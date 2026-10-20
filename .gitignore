@@ -75,6 +75,10 @@ c/deepseek
 c/deepseek.exe
 c/tiny_deepseek/
 c/tiny_deepseek_flat/
+c/glm53
+c/glm53.exe
+c/tiny_glm53/
+c/tiny_glm53_*/
 c/tiny_dsv4_py/
 c/tiny_dsv4_32/
 c/tiny_dsv4_fp4/

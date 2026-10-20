@@ -25,6 +25,7 @@ tiny-model `transformers` oracle.
 | `inkling` | [Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) | ~266B / ~10B | Same engine, no code changes — a pure scale-down. 131 GiB int4 fits in RAM |
 | `colibri` | GLM-5.2 (and the upstream arch family) | — | The multi-arch engine sabrewing forks from; MLA + DSA indexer |
 | `olmoe` | [OLMoE-1B-7B](https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct) | 7B / 1B | Softmax router, whole-vector QK-norm |
+| `glm53` | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | 321B / 18B | KDA linear attention (34 of 45 layers) + NoPE MLA behind a pooled sparse indexer, mHC. 33 KB/token of KV. New: oracle-green and container-checked on fixtures, not yet run on the real checkpoint ([docs](docs/glm53.md)) |
 | `deepseek` | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 284B / 13B | mHC hyper-connections, CSA/HCA compressed attention + Lightning Indexer, hash-MoE. Runs the shipped fp4 checkpoint (CPU + a VRAM expert cache); no batching yet ([docs](docs/deepseek.md)) |
 
 Pre-converted int4 weights on the Hub:

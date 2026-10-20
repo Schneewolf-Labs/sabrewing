@@ -67,6 +67,7 @@
 #include "moe_quant.h"         /* matmul_fp4_k: e2m1 + ue8m0 block scales (V4's native experts) */
 #include "moe_sample.h"
 #include "moe_util.h"     /* moe_omp_autotune: cap the OpenMP team to physical cores */
+#include "moe_hc.h"       /* mHC: shared with glm53.c */
 #ifdef COLI_CUDA
 #include "backend_cuda_laguna.h"
 #endif
@@ -74,7 +75,7 @@
 #include "tok.h"
 
 #define MAXL   128
-#define MAXHC  8
+#define MAXHC  MOE_HC_MAX
 #define MAXROT 512
 
 static int g_exact = 0;
@@ -715,11 +716,6 @@ static inline const float *wt_row_f32(Wt w, int64_t off, float *tmp, int n) {
 }
 
 /* RMSNorm with no learned weight (DeepseekV4UnweightedRMSNorm). */
-static void rmsnorm_plain(float *out, const float *x, int D, float eps) {
-    double ss = 0; for (int i = 0; i < D; i++) ss += (double)x[i] * x[i];
-    float inv = 1.f / sqrtf((float)(ss / D) + eps);
-    for (int i = 0; i < D; i++) out[i] = x[i] * inv;
-}
 
 /* Interleaved partial RoPE on the TRAILING rdim channels of one head. sgn = -1 applies
  * the conjugate rotation (used to un-rotate the attention output, since K == V). */
@@ -770,83 +766,6 @@ static inline void sdpa_axpy(float *y, const float *v, float w, int n) {
 #else
     for (int i = 0; i < n; i++) y[i] += w * v[i];
 #endif
-}
-
-/* ---------- Manifold-Constrained Hyper-Connections ----------
- * One site (attention or ffn). Reads the hc_mult residual streams for one token, returns
- * `post` (where the sublayer output lands), `comb` (the doubly-stochastic stream mixer)
- * and `collapsed` (the single vector the sublayer actually consumes). */
-/* (pre, post, comb) from one token's mix logits, then collapse its streams with pre.
- * `mix` = fn . rmsnorm_plain(streams), computed for the whole chunk by hc_sites. */
-static void hc_site(const Cfg *c, const float *base, const float *scale,
-                    const float *streams, float *post, float *comb, float *collapsed,
-                    const float *mix) {
-    int hc = c->hc_mult, D = c->D;
-    float eps = c->hc_eps, pre[MAXHC] = {0};
-    for (int k = 0; k < hc; k++)
-        pre[k] = 1.f / (1.f + expf(-(mix[k] * scale[0] + base[k]))) + eps;
-    for (int k = 0; k < hc; k++)
-        post[k] = 2.f / (1.f + expf(-(mix[hc + k] * scale[1] + base[hc + k])));
-
-    /* comb: softmax rows, then Sinkhorn-Knopp onto the doubly-stochastic manifold.
-     * The first normalization is over COLUMNS (dim=-2), then iters-1 x (rows, columns). */
-    for (int j = 0; j < hc; j++) {
-        float *row = comb + j * hc;
-        for (int k = 0; k < hc; k++)
-            row[k] = mix[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
-        softmax_row(row, hc);
-        for (int k = 0; k < hc; k++) row[k] += eps;
-    }
-    for (int k = 0; k < hc; k++) {
-        float s = 0; for (int j = 0; j < hc; j++) s += comb[j * hc + k];
-        s += eps; for (int j = 0; j < hc; j++) comb[j * hc + k] /= s;
-    }
-    for (int it = 0; it < c->hc_iters - 1; it++) {
-        for (int j = 0; j < hc; j++) {
-            float s = 0; for (int k = 0; k < hc; k++) s += comb[j * hc + k];
-            s += eps; for (int k = 0; k < hc; k++) comb[j * hc + k] /= s;
-        }
-        for (int k = 0; k < hc; k++) {
-            float s = 0; for (int j = 0; j < hc; j++) s += comb[j * hc + k];
-            s += eps; for (int j = 0; j < hc; j++) comb[j * hc + k] /= s;
-        }
-    }
-    for (int i = 0; i < D; i++) {
-        float a = 0; for (int k = 0; k < hc; k++) a += pre[k] * streams[k * D + i];
-        collapsed[i] = a;
-    }
-}
-
-/* One mHC site for n tokens. The fn projection ([mixn, hc*D], 24 x 16384 on V4-Flash)
- * runs as ONE S=n GEMM instead of n single-row ones — bit-identical per row (moe_matmul.h),
- * and it was single-threaded at S=1 (24 outputs is under the OpenMP threshold). */
-static void hc_sites(const Cfg *c, const float *fn, const float *base, const float *scale,
-                     const float *hs, int n, float *post, float *comb, float *coll,
-                     float *flat, float *mix) {
-    int hc = c->hc_mult, D = c->D, mixn = (2 + hc) * hc;
-    #pragma omp parallel for schedule(static) if(n > 1)
-    for (int t = 0; t < n; t++)
-        rmsnorm_plain(flat + (int64_t)t * hc * D, hs + (int64_t)t * hc * D, hc * D, c->eps);
-    mm(mix, flat, fn, n, hc * D, mixn);
-    #pragma omp parallel for schedule(static) if(n > 1)
-    for (int t = 0; t < n; t++)
-        hc_site(c, base, scale, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
-                comb + (int64_t)t * hc * hc, coll + (int64_t)t * D, mix + (int64_t)t * mixn);
-}
-
-/* streams[k] = post[k]*y + sum_j comb[j][k]*streams[j]   (comb consumed TRANSPOSED) */
-static void hc_merge(const Cfg *c, float *streams, const float *post, const float *comb,
-                     const float *y, float *tmp) {
-    int hc = c->hc_mult, D = c->D;
-    memcpy(tmp, streams, (size_t)hc * D * sizeof(float));
-    for (int k = 0; k < hc; k++) {
-        float *dst = streams + (int64_t)k * D;
-        for (int i = 0; i < D; i++) {
-            float a = post[k] * y[i];
-            for (int j = 0; j < hc; j++) a += comb[j * hc + k] * tmp[j * D + i];
-            dst[i] = a;
-        }
-    }
 }
 
 /* ---------- MoE ---------- */
@@ -1133,7 +1052,7 @@ static void attn_forward(Model *m, Layer *L, State *s, int li, const float *xn, 
     for (int t = 0; t < n; t++)
         for (int h = 0; h < H; h++) {
             float *qh = q + ((int64_t)t * H + h) * hd;
-            rmsnorm_plain(qh, qh, hd, c->eps);
+            moe_rmsnorm_plain(qh, qh, hd, c->eps);
             rope_head(qh, hd, R, inv, pos0 + t, 1.f, ms);
         }
 
@@ -1344,6 +1263,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     free(erow);
 
     int mixn = (2 + hc) * hc;
+    MoeHC H = { hc, D, c->hc_iters, c->hc_eps, c->eps };
     float *coll = falloc((int64_t)n * D), *xn = falloc((int64_t)n * D);
     float *sub = falloc((int64_t)n * D);
     float *post = falloc((int64_t)n * hc), *comb = falloc((int64_t)n * hc * hc);
@@ -1353,25 +1273,25 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     for (int li = 0; li < c->n_layers; li++) {
         Layer *L = &m->L[li];
         /* --- attention site --- */
-        hc_sites(c, L->a_fn, L->a_base, L->a_scale, hs, n, post, comb, coll, flat, mix);
+        moe_hc_sites(&H, L->a_fn, L->a_base, L->a_scale, hs, n, post, comb, coll, flat, mix, g_exact);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln1, D, c->eps);
         { double _a = g_prof ? now_s() : 0;
           attn_forward(m, L, s, li, xn, n, pos0, sub);
           if (g_prof) g_t_attn += now_s() - _a; }
         for (int t = 0; t < n; t++)
-            hc_merge(c, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
+            moe_hc_merge(&H, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
                      comb + (int64_t)t * hc * hc, sub + (int64_t)t * D, tmp);
 
         /* --- ffn site --- */
-        hc_sites(c, L->f_fn, L->f_base, L->f_scale, hs, n, post, comb, coll, flat, mix);
+        moe_hc_sites(&H, L->f_fn, L->f_base, L->f_scale, hs, n, post, comb, coll, flat, mix, g_exact);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln2, D, c->eps);
         { double _a = g_prof ? now_s() : 0;
           moe_rows(m, L, li, xn, ids, n, sub);
           if (g_prof) g_t_moe += now_s() - _a; }
         for (int t = 0; t < n; t++)
-            hc_merge(c, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
+            moe_hc_merge(&H, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
                      comb + (int64_t)t * hc * hc, sub + (int64_t)t * D, tmp);
     }
     s->len = pos0 + n;
@@ -1381,7 +1301,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     float *hv = falloc(D);
     for (int t = t0; t < n; t++) {
         const float *st = hs + (int64_t)t * hc * D;
-        rmsnorm_plain(flat, st, hc * D, c->eps);
+        moe_rmsnorm_plain(flat, st, hc * D, c->eps);
         mm(mix, flat, m->h_fn, 1, hc * D, hc);
         for (int i = 0; i < D; i++) hv[i] = 0;
         for (int k = 0; k < hc; k++) {

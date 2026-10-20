@@ -16,6 +16,9 @@ FILES = [
     # not the .npz fixture: regenerating it needs torch, and `make check` cleans first
     "linattn-check", "linattn-check.exe",
     "qwen35", "qwen35.exe",
+    "laguna", "laguna.exe", "inkling", "inkling.exe",
+    "deepseek", "deepseek.exe", "glm53", "glm53.exe",
+    "kernel-check", "kernel-check.exe",
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",

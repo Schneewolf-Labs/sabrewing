@@ -300,8 +300,33 @@ qwen35$(EXE): qwen35.c st.h tok.h json.h compat.h moe_linattn.h moe_attn.h moe_q
 	$(CC) $(CFLAGS) qwen35.c $(LAG_CUDA_OBJ) -o qwen35$(EXE) $(LDFLAGS)
 
 # DeepSeek-V4-Flash: mHC hyper-connections + CSA/HCA compressed attention. Stage-A f32 CPU.
-deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h $(LAG_CUDA_OBJ)
+deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h moe_hc.h $(LAG_CUDA_OBJ)
 	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
+
+glm53$(EXE): glm53.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h moe_quant.h moe_sample.h moe_util.h moe_hc.h moe_linattn.h moe_serve.h $(LAG_CUDA_OBJ)
+	$(CC) $(CFLAGS) glm53.c $(LAG_CUDA_OBJ) -o glm53$(EXE) $(LDFLAGS)
+
+# GLM-5.3-Flash oracle vs transformers' glm5_next (needs torch + transformers >= 5.16)
+glm53-test: glm53$(EXE)
+	@if [ ! -f tiny_glm53/ref_glm53.json ]; then $(PYTHON) tools/make_tiny_glm53.py tiny_glm53; fi
+	SNAP=tiny_glm53 ./glm53$(EXE) tiny_glm53/ref_glm53.json
+
+# Container check: an FP8-checkpoint-shaped tiny model through the real converter.
+# --xbits 0 is lossless by construction, so it must pass the transformers oracle computed
+# on the same weights; the int4 container must match the f32 path on its int4 round-trip
+# twin (plumbing), and its distance from the oracle is int4 error (reported, not gated).
+glm53-container: glm53$(EXE)
+	@if [ ! -f tiny_glm53/ref_glm53.json ]; then $(PYTHON) tools/make_tiny_glm53.py tiny_glm53; fi
+	$(PYTHON) tools/make_tiny_glm53_fp8.py tiny_glm53 tiny_glm53_fp8 tiny_glm53_twin tiny_glm53_twin_i4
+	$(PYTHON) tools/convert_glm53_int4.py --indir tiny_glm53_fp8 --outdir tiny_glm53_c0 --xbits 0
+	$(PYTHON) tools/convert_glm53_int4.py --indir tiny_glm53_fp8 --outdir tiny_glm53_i4 --xbits 4
+	cp tiny_glm53_fp8/ref_glm53.json tiny_glm53_c0/ && cp tiny_glm53_fp8/ref_glm53.json tiny_glm53_i4/
+	SNAP=tiny_glm53_c0 ./glm53$(EXE) tiny_glm53_c0/ref_glm53.json
+	@a=`SNAP=tiny_glm53_i4 ./glm53$(EXE) tiny_glm53_i4/ref_glm53.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
+	 b=`SNAP=tiny_glm53_twin_i4 ./glm53$(EXE) tiny_glm53_twin_i4/ref_glm53.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
+	 echo "int4 container : $$a"; echo "f32 i4 twin    : $$b"; \
+	 if [ -n "$$a" ] && [ "$$a" = "$$b" ]; then echo "GLM53-CONTAINER PASS (int4 plumbing identical to f32 on the same weights)"; \
+	 else echo "GLM53-CONTAINER FAIL"; exit 1; fi
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
 # Two fixtures: the nested rope_parameters config save_pretrained writes, and the flat
@@ -524,4 +549,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test deepseek-ref deepseek-fp4 glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
+.PHONY: all colibri qwen35 qwen35-test deepseek deepseek-test glm53 glm53-test glm53-container deepseek-ref deepseek-fp4 glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench linattn-test
