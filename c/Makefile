@@ -344,7 +344,7 @@ qwen35-test: qwen35$(EXE)
 # MoE-runtime shared-kernel harness: validates moe_quant.h against a double
 # dequant reference (the quant kernels the f32 oracle can't cover). See
 # docs/moe-runtime-plan.md.
-kernel-check$(EXE): tools/kernel_check.c moe_quant.h
+kernel-check$(EXE): tools/kernel_check.c moe_quant.h moe_matmul.h moe_attn.h moe_sample.h
 	$(CC) $(CFLAGS) tools/kernel_check.c -o kernel-check$(EXE) $(LDFLAGS)
 	./kernel-check$(EXE)
 

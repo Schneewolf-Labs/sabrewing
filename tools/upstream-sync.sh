@@ -22,7 +22,7 @@ BRANCH=dev
 
 VENDORED=(
   c/colibri.c c/quant.h c/sample.h c/kv_persist.h c/telemetry.h c/uring.h
-  c/olmoe.c c/st.h c/json.h c/tok.h c/tok_unicode.h c/compat.h c/tier.h
+  c/olmoe.c c/json.h c/tok.h c/tok_unicode.h c/compat.h c/tier.h
   c/grammar.h c/schema_gbnf.h c/decode_batch.h c/backend_cuda.cu c/backend_cuda.h
   c/backend_metal.h c/backend_metal.mm c/backend_loader.c c/iobench.c
   c/coli c/version.py c/doctor.py c/resource_plan.py c/setup.sh
@@ -46,8 +46,11 @@ VENDORED=(
   c/tools/eval_glm.py c/tools/quant_ablation.py
 )
 # we modified these; a pending upstream PR may supersede our change
-MERGED=( c/Makefile c/openai_server.py )
+MERGED=( c/Makefile c/openai_server.py c/st.h )
 # note: tok.h moved to VENDORED after upstream #330 (o200k) merged.
+# note: st.h moved to MERGED 2026-10: upstream renumbered its dtype codes
+# (F8_E4M3=4, F8_E8M0=5, I64=6) where deepseek.c reads I64=4, and its st.h now
+# needs load_fail.h. Its hardening fixes were cherry-picked instead of pulled.
 # note: openai_server.py carries the fork's inkling gateway (ARCH detect,
 # reasoning-channel rendering) + profiling on top of upstream. Re-sync it by
 # 3-way merge (base = the colibri commit it forked from, ours = here, theirs =
