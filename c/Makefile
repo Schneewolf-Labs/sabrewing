@@ -333,7 +333,7 @@ deepseek-fp4: deepseek$(EXE)
 	@a=`SNAP=tiny_dsv4_fp4 ./deepseek$(EXE) tiny_dsv4_fp4/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
 	 b=`SNAP=tiny_dsv4_deq ./deepseek$(EXE) tiny_dsv4_deq/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
 	 echo "fp4 container : $$a"; echo "f32 twin      : $$b"; \
-	 if [ "$$a" = "$$b" ]; then echo "FP4-CONTAINER PASS (fp4+bf16 path identical to f32 on the same weights)"; \
+	 if [ -n "$$a" ] && [ "$$a" = "$$b" ]; then echo "FP4-CONTAINER PASS (fp4+bf16 path identical to f32 on the same weights)"; \
 	 else echo "FP4-CONTAINER FAIL"; exit 1; fi
 
 # Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)

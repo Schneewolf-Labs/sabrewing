@@ -72,6 +72,9 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   `matmul_fp4_kb` (one weight-row read per expert group) is written and validated but
   **nothing calls it**, and with B streams sharing experts the cached layers amortise
   much better. 256 experts at top-6 is exactly the shape it was built for.
+  *(2026-10: prefill now calls it — `moe_rows` groups a prefill chunk's routed rows by
+  expert, bit-identical, 2.3-2.5x prefill on a 64-expert synthetic V4. Batched DECODE is
+  still the open item.)*
 - [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
   entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
   the actual blocker on long context, not the weights.

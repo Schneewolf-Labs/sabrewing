@@ -776,14 +776,13 @@ static inline void sdpa_axpy(float *y, const float *v, float w, int n) {
  * One site (attention or ffn). Reads the hc_mult residual streams for one token, returns
  * `post` (where the sublayer output lands), `comb` (the doubly-stochastic stream mixer)
  * and `collapsed` (the single vector the sublayer actually consumes). */
-static void hc_site(const Cfg *c, const float *fn, const float *base, const float *scale,
+/* (pre, post, comb) from one token's mix logits, then collapse its streams with pre.
+ * `mix` = fn . rmsnorm_plain(streams), computed for the whole chunk by hc_sites. */
+static void hc_site(const Cfg *c, const float *base, const float *scale,
                     const float *streams, float *post, float *comb, float *collapsed,
-                    float *flat, float *mix) {
-    int hc = c->hc_mult, D = c->D, mixn = (2 + hc) * hc;
-    rmsnorm_plain(flat, streams, hc * D, c->eps);
-    mm(mix, flat, fn, 1, hc * D, mixn);
-
-    float eps = c->hc_eps, pre[MAXHC];
+                    const float *mix) {
+    int hc = c->hc_mult, D = c->D;
+    float eps = c->hc_eps, pre[MAXHC] = {0};
     for (int k = 0; k < hc; k++)
         pre[k] = 1.f / (1.f + expf(-(mix[k] * scale[0] + base[k]))) + eps;
     for (int k = 0; k < hc; k++)
@@ -818,6 +817,23 @@ static void hc_site(const Cfg *c, const float *fn, const float *base, const floa
     }
 }
 
+/* One mHC site for n tokens. The fn projection ([mixn, hc*D], 24 x 16384 on V4-Flash)
+ * runs as ONE S=n GEMM instead of n single-row ones — bit-identical per row (moe_matmul.h),
+ * and it was single-threaded at S=1 (24 outputs is under the OpenMP threshold). */
+static void hc_sites(const Cfg *c, const float *fn, const float *base, const float *scale,
+                     const float *hs, int n, float *post, float *comb, float *coll,
+                     float *flat, float *mix) {
+    int hc = c->hc_mult, D = c->D, mixn = (2 + hc) * hc;
+    #pragma omp parallel for schedule(static) if(n > 1)
+    for (int t = 0; t < n; t++)
+        rmsnorm_plain(flat + (int64_t)t * hc * D, hs + (int64_t)t * hc * D, hc * D, c->eps);
+    mm(mix, flat, fn, n, hc * D, mixn);
+    #pragma omp parallel for schedule(static) if(n > 1)
+    for (int t = 0; t < n; t++)
+        hc_site(c, base, scale, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
+                comb + (int64_t)t * hc * hc, coll + (int64_t)t * D, mix + (int64_t)t * mixn);
+}
+
 /* streams[k] = post[k]*y + sum_j comb[j][k]*streams[j]   (comb consumed TRANSPOSED) */
 static void hc_merge(const Cfg *c, float *streams, const float *post, const float *comb,
                      const float *y, float *tmp) {
@@ -834,42 +850,11 @@ static void hc_merge(const Cfg *c, float *streams, const float *post, const floa
 }
 
 /* ---------- MoE ---------- */
-/* One routed expert: clamped SwiGLU over the fused gate_up, then down. Reads either
- * the f32 tensors or the fp4 container — same arithmetic, different weight decode. */
-static void swiglu_expert(const Model *m, const Layer *L, int e, const float *x,
-                          float *out, float *h, int I) {
+/* Route one token: sel[K] (ascending expert id) and their combine weights w[K]. */
+static void route_token(const Model *m, const Layer *L, int li, const float *logits, int tok,
+                        float *score, int *sel, float *w) {
     const Cfg *c = &m->c;
-    int D = c->D;
-    float lim = c->swiglu_limit;
-    float *g = h, *u = h + I;
-    if (m->xq)                                          /* rows [0,I) gate, [I,2I) up */
-        matmul_fp4_k(g, x, L->q_gu + (int64_t)e * 2 * I * (D / 2),
-                     L->s_gu + (int64_t)e * 2 * I * (D / 32), D, 2 * I, g_exact);
-    else
-        mm(g, x, L->e_gu + (int64_t)e * 2 * I * D, 1, D, 2 * I);
-    for (int i = 0; i < I; i++) {
-        float gi = g[i] > lim ? lim : g[i];
-        float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
-        g[i] = siluf(gi) * ui;
-    }
-    if (m->xq)
-        matmul_fp4_k(out, g, L->q_dn + (int64_t)e * D * (I / 2),
-                     L->s_dn + (int64_t)e * D * (I / 32), I, D, g_exact);
-    else
-        mm(out, g, L->e_dn + (int64_t)e * D * I, 1, I, D);
-}
-
-static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *out,
-                    float *scratch) {
-    Cfg *c = &m->c;
-    int E = c->E, K = c->K, D = c->D, I = c->moe_I;
-    float *logits = scratch, *score = logits + E, *w = score + E;
-    float *acc = w + K, *tmp = acc + D, *h = tmp + D;    /* h needs 2*max(I, shared_I) */
-    int sel[64];
-    if (K > 64) { fprintf(stderr, "top-k %d exceeds 64\n", K); exit(1); }
-
-    double _t0 = g_prof ? now_s() : 0;
-    mmw(logits, x, L->router, 1, D, E);
+    int E = c->E, K = c->K;
     for (int e = 0; e < E; e++) score[e] = sqrtf(softplusf(logits[e]));
 
     if (c->hash[li]) {
@@ -910,39 +895,114 @@ static void moe_row(Model *m, Layer *L, int li, const float *x, int tok, float *
         for (int b = a + 1; b < K; b++)
             if (sel[b] < sel[a]) { int t = sel[a]; sel[a] = sel[b]; sel[b] = t;
                                    float tw = w[a]; w[a] = w[b]; w[b] = tw; }
+}
 
+/* clamped SwiGLU in place over n rows of [gate | up] (row stride 2I) -> gate half */
+static void swiglu_rows(float *h, int n, int I, float lim) {
+    for (int t = 0; t < n; t++) {
+        float *g = h + (int64_t)t * 2 * I, *u = g + I;
+        for (int i = 0; i < I; i++) {
+            float gi = g[i] > lim ? lim : g[i];
+            float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
+            g[i] = siluf(gi) * ui;
+        }
+    }
+}
+
+/* The MoE sublayer for n tokens (a prefill chunk, or one decode token).
+ *
+ * Routing is per token. The routed experts then run GROUPED: each selected expert's
+ * weights are read once for all the tokens routed to it (an S=n_e GEMM), instead of once
+ * per token — at top-6 of 256 a 512-token prefill chunk touches each expert ~12 times.
+ * Bit-identical: the batched GEMMs reproduce the S=1 kernels row for row, and experts are
+ * visited in ascending id, so every token still accumulates its experts in the ascending
+ * order the reference's index_add_ uses. The shared expert is one S=n GEMM per matrix. */
+static void moe_rows(Model *m, Layer *L, int li, const float *x, const int *ids, int n,
+                     float *out) {
+    Cfg *c = &m->c;
+    int E = c->E, K = c->K, D = c->D, I = c->moe_I, SI = c->shared_I;
+    if (K > 64) { fprintf(stderr, "top-k %d exceeds 64\n", K); exit(1); }
+    int HI = I > SI ? I : SI;
+    float *logits = falloc((int64_t)n * E), *score = falloc((int64_t)n * E);
+    float *w = falloc((int64_t)n * K), *acc = falloc((int64_t)n * D);
+    /* one expert can own up to n*K rows: a hash layer's tid2eid row may repeat an expert */
+    int64_t R = (int64_t)n * K;
+    float *xg = falloc(R * D), *h = falloc(R * 2 * HI), *yg = falloc(R * D);
+    int *sel = malloc((size_t)n * K * sizeof(int));
+    int *cnt = calloc(E, sizeof(int)), *start = malloc((size_t)(E + 1) * sizeof(int));
+    int *rows = malloc((size_t)n * K * sizeof(int));      /* (token*K + rank) by expert */
+
+    double _t0 = g_prof ? now_s() : 0;
+    mmw(logits, x, L->router, n, D, E);
+    for (int t = 0; t < n; t++)
+        route_token(m, L, li, logits + (int64_t)t * E, ids[t], score + (int64_t)t * E,
+                    sel + (int64_t)t * K, w + (int64_t)t * K);
     if (g_prof) { g_t_route += now_s() - _t0; _t0 = now_s(); }
+
+    memset(acc, 0, (size_t)n * D * sizeof(float));
     int done = 0;
 #ifdef COLI_CUDA
-    /* Whole layer resident: all K experts in ONE submission and one sync. sel/w are
-     * already sorted ascending above, so the device combine order matches the CPU's. */
-    if (L->d_gu && !g_exact &&
-        lag_cuda_moe_experts_fp4(acc, x, L->d_gu, L->d_gu_es, L->d_dn, L->d_dn_es,
-                                 sel, w, K, I, D, c->swiglu_limit) == 0)
+    /* Whole layer resident: all K experts of a token in ONE submission and one sync. sel/w
+     * are sorted ascending, so the device combine order matches the CPU's. */
+    if (L->d_gu && !g_exact) {
         done = 1;
+        for (int t = 0; t < n && done; t++)
+            done = lag_cuda_moe_experts_fp4(acc + (int64_t)t * D, x + (int64_t)t * D,
+                                            L->d_gu, L->d_gu_es, L->d_dn, L->d_dn_es,
+                                            sel + (int64_t)t * K, w + (int64_t)t * K,
+                                            K, I, D, c->swiglu_limit) == 0;
+        if (!done) memset(acc, 0, (size_t)n * D * sizeof(float));
+    }
 #endif
     if (!done) {
-        for (int i = 0; i < D; i++) acc[i] = 0;
-        for (int a = 0; a < K; a++) {
-            swiglu_expert(m, L, sel[a], x, tmp, h, I);
-            for (int i = 0; i < D; i++) acc[i] += w[a] * tmp[i];
+        for (int i = 0; i < n * K; i++) cnt[sel[i]]++;
+        start[0] = 0;
+        for (int e = 0; e < E; e++) start[e + 1] = start[e] + cnt[e];
+        memset(cnt, 0, E * sizeof(int));
+        for (int i = 0; i < n * K; i++) rows[start[sel[i]] + cnt[sel[i]]++] = i;  /* token-ascending */
+        for (int e = 0; e < E; e++) {
+            int ne = cnt[e];
+            if (!ne) continue;
+            const int *r = rows + start[e];
+            for (int j = 0; j < ne; j++)
+                memcpy(xg + (int64_t)j * D, x + (int64_t)(r[j] / K) * D, (size_t)D * sizeof(float));
+            if (m->xq)                                  /* rows [0,I) gate, [I,2I) up */
+                matmul_fp4_kb(h, xg, L->q_gu + (int64_t)e * 2 * I * (D / 2),
+                              L->s_gu + (int64_t)e * 2 * I * (D / 32), ne, D, 2 * I, g_exact);
+            else
+                mm(h, xg, L->e_gu + (int64_t)e * 2 * I * D, ne, D, 2 * I);
+            swiglu_rows(h, ne, I, c->swiglu_limit);
+            for (int j = 0; j < ne; j++)                /* pack the gate halves contiguously */
+                memmove(h + (int64_t)j * I, h + (int64_t)j * 2 * I, (size_t)I * sizeof(float));
+            if (m->xq)
+                matmul_fp4_kb(yg, h, L->q_dn + (int64_t)e * D * (I / 2),
+                              L->s_dn + (int64_t)e * D * (I / 32), ne, I, D, g_exact);
+            else
+                mm(yg, h, L->e_dn + (int64_t)e * D * I, ne, I, D);
+            for (int j = 0; j < ne; j++) {
+                float *a = acc + (int64_t)(r[j] / K) * D, wt = w[r[j]];
+                const float *y = yg + (int64_t)j * D;
+                for (int i = 0; i < D; i++) a[i] += wt * y[i];
+            }
         }
     }
     if (g_prof) { g_t_routed += now_s() - _t0; _t0 = now_s(); }
 
     /* shared expert: separate gate/up/down tensors, same clamped SwiGLU */
-    int SI = c->shared_I; float lim = c->swiglu_limit;
-    float *g = h, *u = h + SI;
-    mmw(g, x, L->sg, 1, D, SI);
-    mmw(u, x, L->su, 1, D, SI);
-    for (int i = 0; i < SI; i++) {
+    float *g = h, *u = h + (int64_t)n * SI;
+    mmw(g, x, L->sg, n, D, SI);
+    mmw(u, x, L->su, n, D, SI);
+    float lim = c->swiglu_limit;
+    for (int64_t i = 0; i < (int64_t)n * SI; i++) {
         float gi = g[i] > lim ? lim : g[i];
         float ui = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
         g[i] = siluf(gi) * ui;
     }
-    mmw(tmp, g, L->sd, 1, SI, D);
-    for (int i = 0; i < D; i++) out[i] = acc[i] + tmp[i];
+    mmw(yg, g, L->sd, n, SI, D);
+    for (int64_t i = 0; i < (int64_t)n * D; i++) out[i] = acc[i] + yg[i];
     if (g_prof) g_t_shared += now_s() - _t0;
+    free(logits); free(score); free(w); free(acc); free(xg); free(h); free(yg);
+    free(sel); free(cnt); free(start); free(rows);
 }
 
 /* ---------- compressors ----------
@@ -1287,19 +1347,13 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
     float *coll = falloc((int64_t)n * D), *xn = falloc((int64_t)n * D);
     float *sub = falloc((int64_t)n * D);
     float *post = falloc((int64_t)n * hc), *comb = falloc((int64_t)n * hc * hc);
-    float *flat = falloc((int64_t)hc * D), *mix = falloc(mixn);
+    float *flat = falloc((int64_t)n * hc * D), *mix = falloc((int64_t)n * mixn);
     float *tmp = falloc((int64_t)hc * D);
-    int64_t scr = (int64_t)2 * c->E + c->K + 2 * D +
-                  2 * (c->moe_I > c->shared_I ? c->moe_I : c->shared_I) + 16;
-    float *scratch = falloc(scr);
 
     for (int li = 0; li < c->n_layers; li++) {
         Layer *L = &m->L[li];
         /* --- attention site --- */
-        for (int t = 0; t < n; t++)
-            hc_site(c, L->a_fn, L->a_base, L->a_scale, hs + (int64_t)t * hc * D,
-                    post + (int64_t)t * hc, comb + (int64_t)t * hc * hc,
-                    coll + (int64_t)t * D, flat, mix);
+        hc_sites(c, L->a_fn, L->a_base, L->a_scale, hs, n, post, comb, coll, flat, mix);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln1, D, c->eps);
         { double _a = g_prof ? now_s() : 0;
@@ -1310,15 +1364,11 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
                      comb + (int64_t)t * hc * hc, sub + (int64_t)t * D, tmp);
 
         /* --- ffn site --- */
-        for (int t = 0; t < n; t++)
-            hc_site(c, L->f_fn, L->f_base, L->f_scale, hs + (int64_t)t * hc * D,
-                    post + (int64_t)t * hc, comb + (int64_t)t * hc * hc,
-                    coll + (int64_t)t * D, flat, mix);
+        hc_sites(c, L->f_fn, L->f_base, L->f_scale, hs, n, post, comb, coll, flat, mix);
         for (int t = 0; t < n; t++)
             rmsnorm_row(xn + (int64_t)t * D, coll + (int64_t)t * D, L->ln2, D, c->eps);
         { double _a = g_prof ? now_s() : 0;
-          for (int t = 0; t < n; t++)
-            moe_row(m, L, li, xn + (int64_t)t * D, ids[t], sub + (int64_t)t * D, scratch);
+          moe_rows(m, L, li, xn, ids, n, sub);
           if (g_prof) g_t_moe += now_s() - _a; }
         for (int t = 0; t < n; t++)
             hc_merge(c, hs + (int64_t)t * hc * D, post + (int64_t)t * hc,
@@ -1342,7 +1392,7 @@ static void forward(Model *m, State *s, const int *ids, int n, int pos0, float *
         mmw(logits + (int64_t)(logits_all ? t : 0) * V, hv, m->lm_head, 1, D, V);
     }
     free(hs); free(coll); free(xn); free(sub); free(post); free(comb);
-    free(flat); free(mix); free(tmp); free(scratch); free(hv);
+    free(flat); free(mix); free(tmp); free(hv);
 }
 
 /* ---------- oracle ---------- */
