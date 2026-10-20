@@ -39,7 +39,7 @@ VENDORED=(
   c/tests/bench_tensor_core.cu c/tests/test_backend_cuda.cu c/tests/test_backend_metal.mm
   c/tests/test_benchmark_cuda_fixture.py c/tests/test_decode_batch.c
   c/tests/test_env_defaults.py c/tests/test_pipe_cuda.cu c/tests/test_resource_plan.py
-  c/tests/test_openai_server.py c/tests/test_openai_tools_e2e.py
+  c/tests/test_openai_tools_e2e.py
   c/tests/test_anthropic_messages.py
   c/tools/convert_olmoe_merged.py c/tools/diag_harness.py c/tools/efficiency.py
   c/tools/iq3_pack.py c/tools/iq3xxs_grid.json c/tools/make_olmoe_real_oracle.py
@@ -48,7 +48,7 @@ VENDORED=(
   c/tools/eval_glm.py c/tools/quant_ablation.py
 )
 # we modified these; a pending upstream PR may supersede our change
-MERGED=( c/Makefile c/openai_server.py c/st.h )
+MERGED=( c/Makefile c/openai_server.py c/st.h c/tests/test_openai_server.py )
 # note: tok.h moved to VENDORED after upstream #330 (o200k) merged.
 # note: st.h moved to MERGED 2026-10: upstream renumbered its dtype codes
 # (F8_E4M3=4, F8_E8M0=5, I64=6) where deepseek.c reads I64=4, and its st.h now

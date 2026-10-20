@@ -122,36 +122,22 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if (self.active >= self.capacity or self.queue) and len(self.queue) >= self.max_queue:
+            # A free, unreserved slot means we will not queue, so max_queue (even 0)
+            # does not apply; counting `active` alone rejected requests with a free slot.
+            if self._available_slot(slot) is None and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
             self.queue.append(entry)
             deadline = queued_at + self.queue_timeout
             while True:
+                # closed -> cancelled -> deadline -> slot: a cancelled or expired waiter
+                # must not grab a slot that happened to free up on this wakeup.
                 if self.closed:
                     self.queue.remove(entry)
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
-                available = min(self.free_slots) if slot is None and self.free_slots else slot
-                # (#B2) Admit as soon as our target slot is free AND no strictly-earlier
-                # waiter also wants it (an earlier waiter "wants" it if it is any-slot or
-                # pinned to the same slot). This replaces the old strict FIFO-head rule,
-                # which let a head pinned to a busy slot block every request behind it —
-                # even ones targeting a currently-free slot (head-of-line blocking).
-                # ponytail: O(queue) scan per wakeup — negligible at the default max_queue;
-                # switch to per-slot wait sets if max_queue is ever raised to thousands.
-                can_admit = available in self.free_slots
-                if can_admit:
-                    for t2, s2 in self.queue:
-                        if t2 is ticket:
-                            break
-                        if s2 is None or s2 == available:
-                            can_admit = False
-                            break
-                if can_admit:
-                    break
                 if cancelled and cancelled():
                     self.queue.remove(entry)
                     self.cancelled += 1
@@ -164,20 +150,44 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
+                available = self._available_slot(slot, ticket)
+                if available is not None:
+                    break
                 self.condition.wait(min(remaining, 0.25))
             self.queue.remove(entry)
             self.free_slots.remove(available)
             self.active += 1
             self.admitted += 1
             wait_seconds = time.monotonic() - queued_at
+        outcome = "completed"
         try:
             yield wait_seconds, available
+        except ClientCancelled:
+            outcome = "cancelled"       # released normally, but not a completed generation
+            raise
         finally:
             with self.condition:
                 self.active -= 1
                 self.free_slots.add(available)
-                self.completed += 1
+                setattr(self, outcome, getattr(self, outcome) + 1)
                 self.condition.notify_all()
+
+    def _available_slot(self, slot, ticket=None):
+        """(#B2) The slot this waiter may take now, or None. Caller holds the lock.
+
+        Earlier waiters pinned to a slot reserve only that slot; an earlier any-slot waiter
+        has priority over every free slot. (The old rule only ever considered min(free_slots),
+        so an any-slot waiter could stall behind a pinned waiter while other slots sat idle.)
+        With ticket=None the whole queue counts as earlier (used for the queue-full check).
+        ponytail: O(queue) scan per wakeup -- negligible at the default max_queue."""
+        candidates = self.free_slots.copy() if slot is None else self.free_slots & {slot}
+        for earlier_ticket, earlier_slot in self.queue:
+            if earlier_ticket is ticket:
+                break
+            if earlier_slot is None:
+                return None
+            candidates.discard(earlier_slot)
+        return min(candidates, default=None)
 
     def snapshot(self):
         with self.condition:
@@ -1192,6 +1202,25 @@ def read_engine_turn(stream, sentinel, on_bytes):
     }
 
 
+def _write_all(stream, data, frame):
+    """Write all of `data` to the engine's stdin. It is an unbuffered pipe (bufsize=0), whose
+    write() is one os.write() and may be short; a dropped tail would desync the engine's
+    framing. A dead engine (EPIPE) or no progress becomes a named RuntimeError, so it reaches
+    the client as a 500 instead of do_POST's silent client-hangup path (BrokenPipeError is a
+    ConnectionError)."""
+    written = 0
+    try:
+        while written < len(data):
+            sent = stream.write(data[written:] if written else data)
+            if not sent:                     # None/0: no progress, would spin forever
+                raise RuntimeError(f"failed to write {frame} to the engine "
+                                   f"(stdin took {written} of {len(data)} bytes)")
+            written += sent
+        stream.flush()
+    except OSError as error:
+        raise RuntimeError(f"failed to write {frame} to the engine ({error})") from error
+
+
 class Engine:
     def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
         self.model = model            # snapshot dir; /tokenize reads its tokenizer.json
@@ -1359,24 +1388,40 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
-                self.process.stdin.write(header + payload + gpayload + b"\n")
-                self.process.stdin.flush()
+                _write_all(self.process.stdin, header + payload + gpayload + b"\n", "SUBMIT")
         except Exception:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
             raise
 
+        def send_cancel():
+            try:
+                with self.write_lock:
+                    _write_all(self.process.stdin, f"CANCEL {request_id}\n".encode(), "CANCEL")
+            except Exception:
+                # No DONE/ERROR will ever answer a CANCEL that never reached the engine.
+                with self.pending_lock:
+                    self.pending.pop(request_id, None)
+                raise
+
         cancel_sent = False
         while True:
-            kind, value = events.get()
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                # Poll while idle too: during prefill no DATA frame arrives, so a client that
+                # disconnected there would otherwise never send CANCEL and the turn would run
+                # to its token limit holding the slot.
+                if not cancel_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    send_cancel()
+                continue
             if kind == "data":
                 if not cancel_sent:
                     decode(value)
                     if cancelled and cancelled():
                         cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
+                        send_cancel()
             elif kind == "done":
                 tail = decoder.decode(b"", final=True)
                 if tail:
@@ -1445,20 +1490,135 @@ class APIServer(ThreadingHTTPServer):
         return self._tok
 
 
+def _content_length(value):
+    # int() also accepts signs, spaces and underscores; HTTP lengths are 1*DIGIT, and
+    # read_json and the drain must agree on exactly where the body ends.
+    value = value.strip()
+    if not value.isascii() or not value.isdigit():
+        raise ValueError("invalid Content-Length")
+    return int(value)
+
+
+class _DeadlineReader:
+    """rfile wrapper with a CUMULATIVE deadline for reading one request. The socket timeout
+    is per recv(), so a client dripping a byte every 29 s renews it forever (slowloris).
+    Every read here does at most one recv (peek/read1), each bounded by the time left."""
+
+    def __init__(self, raw, sock, per_read, budget):
+        self._raw, self._sock, self._per_read = raw, sock, per_read
+        self._expires = time.monotonic() + budget
+
+    def _arm(self):
+        left = self._expires - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request read deadline exceeded")
+        self._sock.settimeout(min(self._per_read, left))
+
+    def readline(self, limit=-1):
+        out = bytearray()
+        while limit < 0 or len(out) < limit:
+            self._arm()
+            ahead = self._raw.peek(1)
+            if not ahead:
+                break
+            end = ahead.find(b"\n")
+            take = len(ahead) if end < 0 else end + 1
+            if limit >= 0:
+                take = min(take, limit - len(out))
+            out += self._raw.read(take)          # already buffered: no further recv
+            if out.endswith(b"\n"):
+                break
+        return bytes(out)
+
+    def read(self, size=-1):
+        out = bytearray()
+        while size < 0 or len(out) < size:
+            self._arm()
+            chunk = self._raw.read1(65536 if size < 0 else size - len(out))
+            if not chunk:
+                break
+            out += chunk
+        return bytes(out)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
-                   # request line/body can't pin a worker thread (and a slot) forever
+    timeout = 30   # per socket operation; renewed by every byte, so READ_DEADLINE is the
+                   # cumulative bound that actually stops a slowloris request read
+    READ_DEADLINE = 30
     server_version = "colibri"
+    _committed = False    # status line already on the wire (reset per request)
+    _body_read = False    # request body fully consumed, nothing left to drain
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
+
+    def setup(self):
+        super().setup()
+        self._raw_rfile = self.rfile
+
+    def handle_one_request(self):
+        """One handler serves every request on a keep-alive connection, so per-request state
+        resets here. The drain afterwards fixes keep-alive desync: an early 401/403/400
+        returns before read_json(), leaving the body in the socket, and the next readline()
+        would parse it as a request line (`Bad request syntax ('{...}POST ...')`)."""
+        self._committed = False
+        self._body_read = False
+        self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
+                                     self.timeout, self.READ_DEADLINE)
+        super().handle_one_request()
+        if not self.close_connection:
+            self._drain_request_body()
+
+    def send_response(self, code, message=None):
+        self._committed = True
+        try:
+            # The request is read; generation may take minutes, so drop the read deadline.
+            self.connection.settimeout(self.timeout)
+        except OSError:
+            pass
+        super().send_response(code, message)
+
+    def _drain_request_body(self):
+        """Consume an unread body so the next request line is at the head of the stream.
+        Where it can't be swallowed safely, close: an unreusable connection is correct,
+        a desynchronised one is not."""
+        if self._body_read or getattr(self, "headers", None) is None:
+            return
+        self._body_read = True
+        if (self.headers.get_all("Transfer-Encoding")
+                or len(self.headers.get_all("Content-Length", [])) > 1):
+            self.close_connection = True       # not framed by one Content-Length
+            return
+        try:
+            remaining = _content_length(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if remaining > MAX_BODY:
+            self.close_connection = True       # don't read megabytes to keep a socket warm
+            return
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:                        # incl. the read deadline
+            pass
+        if remaining:
+            self.close_connection = True
 
     def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if request_id:
             self.send_header("x-request-id", request_id)
         for name, value in (headers or {}).items():
@@ -1520,16 +1680,38 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(403, "Host header not allowed.", None, "forbidden")
 
     def read_json(self):
+        # There is no de-chunker here, and two Content-Lengths are not a boundary to guess
+        # (TE would take precedence over CL per RFC 9112 6.3): refuse, and close.
+        if self.headers.get_all("Transfer-Encoding"):
+            self.close_connection = True
+            raise APIError(400, "Transfer-Encoding is not supported; send one Content-Length.")
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            self.close_connection = True
+            raise APIError(400, "Multiple Content-Length headers are not supported.")
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = _content_length(self.headers.get("Content-Length", "0"))
         except ValueError:
+            self.close_connection = True
             raise APIError(400, "Invalid Content-Length header.")
         if length < 1 or length > MAX_BODY:
             raise APIError(400, f"Request body must be between 1 and {MAX_BODY} bytes.")
         try:
-            body = json.loads(self.rfile.read(length))
+            raw = self.rfile.read(length)
+        except TimeoutError:
+            self.close_connection = True
+            raise APIError(408, "Timed out reading the request body.", None, "request_timeout")
+        self._body_read = len(raw) == length   # a short read: the drain sees EOF and closes
+        try:
+            body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        try:
+            # An escaped lone surrogate ("\ud83d") parses, but no UTF-8 can carry it and every
+            # prompt is sent to the engine as UTF-8: a 400 here, not a 500 from generate().
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            raise APIError(400, "Request body contains an unpaired UTF-16 surrogate escape; "
+                                "strings must be valid Unicode.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body
@@ -1625,9 +1807,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                # (#SEC-8) same gate as /health and /experts: per-turn token counts and timings
+                # are telemetry; the web UI already sends its key here.
                 eng = self.server.engine
-                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
-                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
+                payload = {"seq": 0, "turns": []}
+                if self._is_authed() and eng:
+                    payload["seq"] = getattr(eng, "profile_seq", 0)
+                    payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -1675,19 +1861,26 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, self.error_body(error), request_id, error.headers)
+            self._fail(error, request_id)
         except ClientCancelled:
             pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as error:
             self.log_error("request failed: %s", error)
-            api_error = APIError(500, "The colibri engine failed to process the request.",
-                                 None, "engine_error", "server_error")
             try:
-                self.send_json(500, self.error_body(api_error), request_id)
+                self._fail(APIError(500, "The colibri engine failed to process the request.",
+                                    None, "engine_error", "server_error"), request_id)
             except OSError:
                 pass
+
+    def _fail(self, error, request_id):
+        """Report an error unless a response is already on the wire: after a streaming 200,
+        a second status line would land inside the SSE body. Then all we can do is close."""
+        if self._committed:
+            self.close_connection = True
+            return
+        self.send_json(error.status, self.error_body(error), request_id, error.headers)
 
     def error_body(self, error):
         """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
@@ -1733,7 +1926,8 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+                contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
@@ -1777,6 +1971,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
+            # SSE has no Content-Length: the close IS the end of the message, so say so now --
+            # if generation raises after this 200, the socket must still not be reused.
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.send_header("x-request-id", request_id)
             for name, value in queue_headers.items(): self.send_header(name, value)
             self.send_cors_headers()
@@ -1840,6 +2038,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
+            # Stop the pump on every exit (engine error, cancel), not just success.
+            stream_cleanup.callback(ka_thread.join, timeout=2)
+            stream_cleanup.callback(ka_stop.set)
+            # `connected` only flips on a failed write; also poll the socket so a client
+            # that leaves during the silent prefill is cancelled promptly.
+            gone = lambda: not connected or self.client_disconnected()
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -1867,7 +2071,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    gone, grammar=grammar)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
@@ -1885,7 +2089,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     (splitter.feed if splitter else emit)(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    gone, grammar=grammar)
                 if splitter:
                     splitter.close()
                 finish = "length" if stats["length_limited"] else "stop"
@@ -1904,7 +2108,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except OSError:
                         pass
-            self.close_connection = True
 
     def client_disconnected(self):
         try:
@@ -2016,7 +2219,8 @@ class APIHandler(BaseHTTPRequestHandler):
             reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             return content, self.ANTHROPIC_STOP[reason]
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+                contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
@@ -2038,6 +2242,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")   # see the OpenAI path: SSE is close-framed
+            self.close_connection = True
             self.send_header("x-request-id", request_id)
             for name, value in queue_headers.items():
                 self.send_header(name, value)
@@ -2084,6 +2290,8 @@ class APIHandler(BaseHTTPRequestHandler):
                                                    "content_block": {"type": "text", "text": ""}})
             ka_thread = threading.Thread(target=keepalive, daemon=True)
             ka_thread.start()
+            stream_cleanup.callback(ka_thread.join, timeout=2)
+            stream_cleanup.callback(ka_stop.set)
 
             raw = []
             state = {"buf": "", "in_tool": False}
@@ -2140,7 +2348,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, on_text, cache_slot,
-                lambda: not connected[0], grammar=grammar)
+                lambda: not connected[0] or self.client_disconnected(), grammar=grammar)
             if split:
                 split.finish()
                 close_thinking()               # budget exhaustion before </think>
@@ -2169,7 +2377,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                 "usage": {"output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
-            self.close_connection = True
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")

@@ -486,8 +486,10 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
+    def test_profile_reports_recent_turns_only_when_authed(self):
+        # /profile is served before require_auth(); like /experts it hides telemetry
+        # (per-turn token counts and timings) from unauthenticated callers.
+        with self.request("/profile") as response:
             self.assertEqual(json.load(response), {"seq": 0, "turns": []})
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
@@ -495,8 +497,12 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile = [turn]
         self.engine.profile_seq = 1
         try:
-            with urlopen(self.base + "/profile", timeout=2) as response:
+            with self.request("/profile") as response:
                 self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+            for key in (None, "wrong"):
+                headers = {} if key is None else {"Authorization": f"Bearer {key}"}
+                with urlopen(Request(self.base + "/profile", headers=headers), timeout=2) as response:
+                    self.assertEqual(json.load(response), {"seq": 0, "turns": []})
         finally:
             del self.engine.profile, self.engine.profile_seq
 
