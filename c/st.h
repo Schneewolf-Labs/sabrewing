@@ -293,10 +293,13 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
-        char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* checked parse: a truncated or malformed header is refused instead of being
+         * read as a partial tree, and an embedded NUL (a hidden suffix) is refused too */
+        if (memchr(hdr, 0, hlen)) {
+            fprintf(stderr, "%s: safetensors header contains a NUL byte\n", files[fi]); exit(1); }
+        jval *root = json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            fprintf(stderr, "%s: safetensors header is not a well-formed JSON object\n", files[fi]); exit(1); }
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
             if (!strcmp(name, "__metadata__")) continue;
@@ -332,7 +335,10 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             if (bad_shape) {
                 fprintf(stderr, "%s: tensor '%s' shape overflows int64 — refusing (hostile or corrupt file)\n",
                         files[fi], name); exit(1); }
-            if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
+            if (S->n == S->cap) {
+                st_tensor *nt = realloc(S->t, (size_t)S->cap * 2 * sizeof(st_tensor));
+                if (!nt) { fprintf(stderr, "OOM indexing safetensors\n"); exit(1); }
+                S->t = nt; S->cap *= 2; }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
@@ -346,7 +352,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        json_free(root);
         free(hdr);
     }
     /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
@@ -464,8 +470,10 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->dtype > 2) {   /* the float readers only: U8/I64 are not 2-byte floats */
+        fprintf(stderr, "slice %s: dtype %d is not a float tensor\n", name, t->dtype); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
-    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* overflow-safe bound */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;

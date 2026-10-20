@@ -171,7 +171,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_tok_o200k$(EXE) tests/test_tok_deepseek$(EXE) tests/test_tok_gpt2$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -304,9 +304,13 @@ deepseek$(EXE): deepseek.c st.h tok.h json.h compat.h moe_math.h moe_matmul.h mo
 	$(CC) $(CFLAGS) deepseek.c $(LAG_CUDA_OBJ) -o deepseek$(EXE) $(LDFLAGS)
 
 # Token-exact oracle vs transformers (needs torch + a transformers with deepseek_v4)
+# Two fixtures: the nested rope_parameters config save_pretrained writes, and the flat
+# rope_scaling config DeepSeek ships (transformers gives them different YaRN gains).
 deepseek-test: deepseek$(EXE)
 	@if [ ! -f tiny_deepseek/ref_deepseek.json ]; then $(PYTHON) tools/make_tiny_deepseek.py tiny_deepseek; fi
+	@if [ ! -f tiny_deepseek_flat/ref_deepseek.json ]; then DSV4_ROPE=flat $(PYTHON) tools/make_tiny_deepseek.py tiny_deepseek_flat; fi
 	SNAP=tiny_deepseek ./deepseek$(EXE) tiny_deepseek/ref_deepseek.json
+	SNAP=tiny_deepseek_flat ./deepseek$(EXE) tiny_deepseek_flat/ref_deepseek.json
 
 # Dependency-free cross-check: a pure-Python reference model (no torch, no weights, no GPU)
 # that the engine must reproduce — mHC/Sinkhorn, CSA overlap windowing, HCA compression,
@@ -329,7 +333,7 @@ deepseek-fp4: deepseek$(EXE)
 	@a=`SNAP=tiny_dsv4_fp4 ./deepseek$(EXE) tiny_dsv4_fp4/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
 	 b=`SNAP=tiny_dsv4_deq ./deepseek$(EXE) tiny_dsv4_deq/ref_deepseek.json 2>&1 | grep -E '^logits|teacher forcing|  got:'`; \
 	 echo "fp4 container : $$a"; echo "f32 twin      : $$b"; \
-	 if [ "$$a" = "$$b" ]; then echo "FP4-CONTAINER PASS (fp4+bf16 path identical to f32 on the same weights)"; \
+	 if [ -n "$$a" ] && [ "$$a" = "$$b" ]; then echo "FP4-CONTAINER PASS (fp4+bf16 path identical to f32 on the same weights)"; \
 	 else echo "FP4-CONTAINER FAIL"; exit 1; fi
 
 # Token-exact oracle vs transformers (needs torch + transformers>=5.3 to build the tiny model)
@@ -340,7 +344,7 @@ qwen35-test: qwen35$(EXE)
 # MoE-runtime shared-kernel harness: validates moe_quant.h against a double
 # dequant reference (the quant kernels the f32 oracle can't cover). See
 # docs/moe-runtime-plan.md.
-kernel-check$(EXE): tools/kernel_check.c moe_quant.h
+kernel-check$(EXE): tools/kernel_check.c moe_quant.h moe_matmul.h moe_attn.h moe_sample.h
 	$(CC) $(CFLAGS) tools/kernel_check.c -o kernel-check$(EXE) $(LDFLAGS)
 	./kernel-check$(EXE)
 
@@ -381,6 +385,10 @@ tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_deepseek$(EXE): tests/test_tok_deepseek.c tok.h tok_unicode.h tok_unicode_deepseek.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_tok_gpt2$(EXE): tests/test_tok_gpt2.c tok.h tok_unicode.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)

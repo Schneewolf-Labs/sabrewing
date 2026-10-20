@@ -183,7 +183,7 @@ static void cfg_load(Cfg *c, const char *dir) {
             fprintf(stderr, "layer_types has %d entries, expected %d\n", lt->len, c->n_layers);
             exit(1); }
         for (int i = 0; i < c->n_layers; i++)
-            c->is_linear[i] = !strcmp(lt->kids[i]->str, "linear_attention");
+            c->is_linear[i] = lt->kids[i]->t == J_STR && !strcmp(lt->kids[i]->str, "linear_attention");
     } else {
         int iv = (int)jnum(o, "full_attention_interval", 4);
         for (int i = 0; i < c->n_layers; i++) c->is_linear[i] = ((i + 1) % iv) != 0;
@@ -1208,8 +1208,8 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
-    if (np + q->max_tok > ctx_max) {
-        printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = serve_fit(np, &q->max_tok, ctx_max);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
 
     State s; state_init(m, &s, np + q->max_tok + 8);
     float *lg = falloc(c->V);
@@ -1321,8 +1321,9 @@ static void serve_loop_batched(Model *m, Tok *T, int nslots) {
             int *ids = malloc((size_t)cap * sizeof(int));
             int np = tok_encode(T, q.payload, q.plen, ids, cap);
             free(q.payload);
-            if (np <= 0 || np + q.max_tok > ctx_max) {
-                printf("ERROR %s %s\n", q.id, np <= 0 ? "empty prompt" : "context exceeds CTX_MAX");
+            const char *bad = np <= 0 ? "empty prompt" : serve_fit(np, &q.max_tok, ctx_max);
+            if (bad) {
+                printf("ERROR %s %s\n", q.id, bad);
                 fflush(stdout); free(ids); continue;
             }
             /* prefer the slot that already holds the longest usable prefix */

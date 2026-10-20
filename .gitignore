@@ -34,6 +34,8 @@ c/tests/*
 !c/tests/*.cu
 !c/tests/*.mm
 !c/tests/*.py
+!c/tests/tok_*_tiny.json
+!c/tests/tok_*_cases.txt
 
 # oracoli tiny generati (make_glm_oracle.py) e dati benchmark scaricati
 c/glm_tiny/
@@ -72,6 +74,7 @@ c/tiny_qwen35/
 c/deepseek
 c/deepseek.exe
 c/tiny_deepseek/
+c/tiny_deepseek_flat/
 c/tiny_dsv4_py/
 c/tiny_dsv4_32/
 c/tiny_dsv4_fp4/

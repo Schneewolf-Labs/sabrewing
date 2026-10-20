@@ -30,6 +30,7 @@ carry a partial window across the prefill -> decode boundary.
 Usage: python3 tools/make_tiny_deepseek.py <outdir>
 """
 import json
+import os
 import sys
 
 import torch
@@ -47,6 +48,32 @@ def main():
 
     V, D, HD, HEADS = 64, 24, 16, 2
     E, K, MOE_I = 6, 2, 16
+
+    # Two config shapes reach the engine, and transformers treats them DIFFERENTLY:
+    #   nested (default)  rope_parameters = {main, compress}, as save_pretrained writes it.
+    #                     A yarn compress block without attention_factor gets YaRN's derived
+    #                     gain 0.1*ln(factor)+1 on cos AND sin.
+    #   DSV4_ROPE=flat    a top-level `rope_scaling` block, the shape DeepSeek's own
+    #                     config.json ships. transformers rewrites it to nested and
+    #                     setdefault()s attention_factor = 1.0 (the V4 reference does not
+    #                     rescale cos/sin). The engine must get this right for the REAL
+    #                     checkpoint, so the fixture's config.json is rewritten back to the
+    #                     flat shape after saving. Its compress theta is low (500) so
+    #                     YaRN's interpolated pair turns ~1 rad over the prompt instead of
+    #                     ~0.05: at theta 160000 an engine that skipped YaRN entirely still
+    #                     landed inside the 1e-3 logits gate.
+    flat = os.environ.get("DSV4_ROPE") == "flat"
+    yarn = {"factor": 4.0, "beta_fast": 32.0, "beta_slow": 1.0,
+            "original_max_position_embeddings": 16}
+    if flat:
+        rope_kw = {"rope_scaling": {"type": "yarn", **yarn}, "qk_rope_head_dim": 4}
+    else:
+        rope_kw = {"rope_parameters": {
+            "main": {"rope_type": "default", "rope_theta": 10000.0,
+                     "partial_rotary_factor": 4 / HD},
+            "compress": {"rope_type": "yarn", "rope_theta": 160000.0, **yarn,
+                         "partial_rotary_factor": 4 / HD},
+        }}
 
     cfg = DeepseekV4Config(
         vocab_size=V,
@@ -91,15 +118,8 @@ def main():
         max_position_embeddings=4096,
         tie_word_embeddings=False,
         rope_theta=10000.0,
-        compress_rope_theta=160000.0,
-        rope_parameters={
-            "main": {"rope_type": "default", "rope_theta": 10000.0,
-                     "partial_rotary_factor": 4 / HD},
-            "compress": {"rope_type": "yarn", "rope_theta": 160000.0, "factor": 4.0,
-                         "beta_fast": 32.0, "beta_slow": 1.0,
-                         "original_max_position_embeddings": 16,
-                         "partial_rotary_factor": 4 / HD},
-        },
+        compress_rope_theta=160000.0 if not flat else 500.0,
+        **rope_kw,
         eos_token_id=None,
     )
 
@@ -137,6 +157,15 @@ def main():
         ppl = float(torch.exp(-logp.gather(1, nxt[:, None]).mean()))
 
     model.save_pretrained(out, safe_serialization=True)
+    if flat:
+        with open(f"{out}/config.json") as f:
+            c = json.load(f)
+        c.pop("rope_parameters", None)
+        c.pop("partial_rotary_factor", None)
+        c["rope_scaling"] = {"type": "yarn", **yarn}
+        c["qk_rope_head_dim"] = 4
+        with open(f"{out}/config.json", "w") as f:
+            json.dump(c, f, indent=2)
     ref = {"prompt_ids": prompt, "full_ids": full, "tf_pred": tf, "ppl_ref": ppl,
            "logits_last": logits[-1].tolist()}
     with open(f"{out}/ref_deepseek.json", "w") as f:

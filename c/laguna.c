@@ -273,7 +273,7 @@ static void cfg_load(Cfg *c, const char *snap) {
     jval *mol = json_get(o, "mlp_only_layers");
     for (int i = 0; i < c->n_layers; i++) {
         c->heads[i] = (hpl && hpl->t == J_ARR && i < hpl->len) ? (int)hpl->kids[i]->num : def_heads;
-        c->is_sliding[i] = (lt && lt->t == J_ARR && i < lt->len && !strcmp(lt->kids[i]->str, "sliding_attention")) ? 1 : 0;
+        c->is_sliding[i] = (lt && lt->t == J_ARR && i < lt->len && !strcmp(jstr_at(lt, i), "sliding_attention")) ? 1 : 0;
         c->is_moe[i] = 1;
     }
     /* dense layers: `mlp_only_layers` lists them (Qwen2-MoE style, [0] on S-2.1);
@@ -283,7 +283,7 @@ static void cfg_load(Cfg *c, const char *snap) {
     jval *mlt = json_get(o, "mlp_layer_types");
     if (mol && mol->t == J_ARR) for (int i = 0; i < mol->len; i++) { int li = (int)mol->kids[i]->num; if (li >= 0 && li < c->n_layers) c->is_moe[li] = 0; }
     else if (mlt && mlt->t == J_ARR) for (int i = 0; i < mlt->len && i < c->n_layers; i++)
-        c->is_moe[i] = strcmp(mlt->kids[i]->str, "dense") ? 1 : 0;
+        c->is_moe[i] = strcmp(jstr_at(mlt, i), "dense") ? 1 : 0;
 
     /* RoPE — full_attention (YaRN partial) drives global layers, sliding_attention (plain) the rest */
     jval *rp = json_get(o, "rope_parameters");
@@ -1175,7 +1175,8 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
-    if (np + q->max_tok > ctx_max) { printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = serve_fit(np, &q->max_tok, ctx_max);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
     KVCache kv; kv_init(&kv, m, np + q->max_tok + 8);
     double t0 = now_s();
     float *Hp = falloc((int64_t)np * D); forward(m, &kv, ids, np, 0, Hp);
@@ -1380,7 +1381,8 @@ static void slot_admit(Model *m, Tok *T, SSlot *s, SReq *q, uint64_t seq) {
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     int ctx_max = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
-    if (np + q->max_tok > ctx_max) { printf("ERROR %s context exceeds CTX_MAX\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = serve_fit(np, &q->max_tok, ctx_max);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
     snprintf(s->id, sizeof(s->id), "%s", q->id);
     s->used = 1; s->ids = ids; s->np = np; s->np_done = 0;
     s->gen = 0; s->max_tok = q->max_tok; s->limited = 1;

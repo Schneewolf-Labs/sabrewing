@@ -21,10 +21,19 @@ jobs:
       - uses: actions/checkout@v4
       # ARCH=x86-64-v3: portable AVX2 baseline — hosted runners vary, and
       # `native` would make the build depend on whichever CPU we drew.
-      - name: Build glm + inkling + olmoe
-        run: make -C c glm inkling olmoe ARCH=x86-64-v3
+      - name: Build every engine
+        run: make -C c glm inkling olmoe laguna qwen35 deepseek ARCH=x86-64-v3
       - name: C test suite
         run: make -C c test-c ARCH=x86-64-v3
+      # Dependency-free (no torch, no weights): a pure-Python V4 reference the
+      # deepseek engine must reproduce token-exact, incl. split-prefill state.
+      - name: DeepSeek-V4 cross-check (deepseek-ref)
+        run: make -C c deepseek-ref ARCH=x86-64-v3
+      # Quant kernels vs a double-precision reference, and every batched GEMM
+      # bit-identical to its S=1 kernel. `native` so the AVX-512 tiled paths are
+      # exercised whenever the runner we drew has AVX-512 (v3 compiles them out).
+      - name: Kernel check
+        run: make -C c kernel-check ARCH=native
 
   cuda-syntax:
     name: CUDA syntax check (glm + inkling backends)

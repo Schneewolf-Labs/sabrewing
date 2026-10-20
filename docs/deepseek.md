@@ -67,8 +67,14 @@ The compressed entries are concatenated onto the sliding keys and masked per que
 attention is one softmax over `[window ++ selected compressed]` with the per-head sink as an
 extra logit that is normalized in and then dropped.
 
-Both CSA/HCA layers and every compressor use the *compress* rope (θ=160000, YaRN factor 16
-with `attention_factor` pinned to 1.0 — the reference does not rescale cos/sin).
+Both CSA/HCA layers and every compressor use the *compress* rope (θ=160000, YaRN factor 16).
+Its cos/sin gain depends on the **config shape**, exactly as transformers normalizes it:
+DeepSeek's shipped `config.json` carries a flat top-level `rope_scaling`, for which
+`DeepseekV4Config` `setdefault`s `attention_factor = 1.0` (the reference does not rescale
+cos/sin; DeepInfer hard-codes `mscale=False` for V4.1). A nested
+`rope_parameters = {main, compress}` block without `attention_factor` — what
+`save_pretrained` writes for a config built that way — instead gets YaRN's derived
+`0.1*ln(factor)+1` (1.2773 at factor 16). See "The flat-config bug" below.
 
 ### The traps
 
@@ -172,6 +178,19 @@ Why the pure-Python harness missed them: it writes its own snapshot, so it never
 the checkpoint's tensor names, and it **pinned `"attention_factor": 1.0`** in the config it
 emitted, making the correct and incorrect behaviours coincide. It now computes the real
 mscale. This is the "shared misreading" failure the harness's own docs warn about.
+
+**The flat-config bug (found 2026-10, reading DeepInfer).** Bug 2's fix was right for the
+fixture and wrong for the checkpoint. `make_tiny_deepseek.py` only ever built the *nested*
+config shape, and the engine only ever read `rope_parameters.{main,compress}`. DeepSeek
+ships a flat `rope_scaling` block, so on the real 284B config the engine found no compress
+entry and ran the compress rope as **plain RoPE — no YaRN at all** (7 of 32 rotary pairs at
+the wrong frequency; worst at long context, invisible on short prompts). transformers, the
+vendor reference and DeepInfer all apply YaRN there with gain 1.0. The engine now normalizes
+both shapes the way `DeepseekV4Config` does, and `DSV4_ROPE=flat make_tiny_deepseek.py`
+builds a flat-config fixture (`make deepseek-test` runs both). That fixture uses a low
+compress θ (500), because at θ=160000 an engine that skipped YaRN entirely still passed the
+1e-3 logits gate (rel 2.9e-4); at θ=500 the old engine fails it (rel 5.9e-3) and the fixed
+one passes at rel 2.3e-7.
 
 A third fixture bug surfaced on the way: `make_tiny_deepseek.py` used `index_n_heads=2`.
 The indexer score is `sum_h w_h * relu(q_h . k_e)`; with two heads a random model relus
@@ -345,16 +364,18 @@ way round in the two schemes — native `attn.indexer.compressor.*` vs transform
 
 - **CPU only, single stream.** No CUDA tier, no batching, no serve mode. Decode is a
   per-token, per-expert loop; `matmul_fp4_kb` (the batched, read-the-weight-row-once
-  kernel) exists and is validated but nothing calls it yet — that is the group-by-expert
-  lever, and it is what a batched decode path would use first.
+  kernel) is now called by prefill (`moe_rows` groups a chunk's routed rows by expert,
+  bit-identical); batched *decode* would use it the same way.
 - **Compressed KV grows without bound.** CSA keeps one f32 `head_dim` entry per 4 tokens
   per CSA layer — inherent to the architecture (it *is* the long-range memory), but at 1M
   context that is hundreds of GB in f32. This, not the weights, is what decides whether
   long context is reachable on one box.
 - **Attention is O(window + compressed) per query, computed densely.** Correct, not fast:
   the indexer scores every compressed entry per query rather than exploiting sparsity.
-- **Prefill is slow.** ~5 tok/s on 24 AVX-512 cores at this stage; the expert GEMV
-  dominates and every routed expert is re-read per token.
+- **Prefill was slow** (~5 tok/s on 24 AVX-512 cores; every routed expert re-read per
+  token). Prefill now groups experts by expert and runs the shared expert, router and
+  both mHC projections as single S=n GEMMs on the register-blocked core: 2.0-2.1x on a
+  64-expert synthetic V4 (4-core AVX-512). Not yet re-measured on the 284B checkpoint.
 - **The DSpark / MTP module is not implemented.** `mtp.*` is skipped at conversion. The
   main stack does not depend on it; it is speculative decoding, i.e. throughput, not
   quality.
@@ -375,3 +396,61 @@ way round in the two schemes — native `attn.indexer.compressor.*` vs transform
 3. **Serve mode** (`KV_SLOTS`) once batching lands.
 4. A GPU fp4 kernel: the experts are already in a format Blackwell decodes natively, so
    the container does not need re-converting for it.
+
+## V4.1-Flash: what changes
+
+[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) is the model
+DeepSeek's own production engine, [DeepInfer](https://github.com/deepseek-ai/DeepInfer),
+serves. Read against that code (2026-10) it is **a new attention stack, not a re-tune**, so it
+needs its own engine (or a V4.1 mode with most of `attn_forward` replaced), not a config
+switch. There is no `transformers` model for it yet (5.20 ships only `deepseek_v4`), which is
+why it is not implemented here: without an oracle, an engine and a hand-written reference
+would share every misreading, the failure this file's Validation section is about.
+
+What DeepInfer implements (`deepinfer/hugging_face/config.py`,
+`model_executor/models/v4_modules/`):
+
+- **Config**: `model_type: deepseek_v41`, text keys under `text_config`; dense fp8 uses
+  **32x32** ue8m0 blocks (V4: 128x128 — `convert_deepseek_fp4.py`'s `FP8_BLOCK`). Experts stay
+  fp4 + ue8m0/32. Per colibri's notes (not checked against the checkpoint): 40 layers, hidden 5120, 384
+  experts top-6 + 1 shared.
+- **Attention**: CSA/HCA become **C1/C2** (`compress_ratios` ∈ {0,1,2}). C2 = per-channel
+  softmax-pooled pairs (`wgate; wkv`), C1 = `RMSNorm(wkv(x))` per token; no APE
+  (`position_bias`), no overlap, entry width `head_dim` (V4 CSA: 2x). **Every** compressed
+  layer is sparse (indexer top-k); there is no dense HCA analogue.
+- **Cross-layer sharing**: `kv_source_layer_ids` / `index_source_layer_ids` alias compressed
+  KV, index K and top-k indices across layers; compressor/indexer weights exist only on source
+  layers. A two-level **candidate-block** top-k (block = max score, last block forced) prunes
+  long contexts.
+- **YOCO**: layers from the first C1 layer on compute their compressed KV from one shared
+  hidden (that layer's attention-norm output); sliding-window KV stays per layer.
+- **Indexer**: index K = `k_norm(wk(compressed latent))`, no separate indexer compressor.
+- **No per-head q RMSNorm** (`use_qnorm` false). K == V, conjugate output rotation, grouped
+  `wo_a`, per-head sinks are unchanged.
+- **RoPE**: YaRN on compressed layers with `mscale` forced off — gain 1.0, the same as V4's
+  shipped flat config (see "The flat-config bug").
+- **MoE**: `sqrtsoftplus` + `noaux_tc` as before, **no hash layers**, a separate selection bias
+  for image tokens (`bias_vl`), the SwiGLU clamp on shared and routed experts.
+- **mHC is shifted**: each sublayer consumes the *previous* site's pre-mix (one-hot stream 0
+  first); no `hc_head`.
+- **Engram**: new per-layer hashed n-gram memory (`layers.L.engram.*`) applied to the trunk
+  between sites; hashing runs over a normalized (NFKC/NFD, lower-cased) vocabulary.
+- **DSpark**: a 3-stage draft module with its own small MoE, a Markov head and a confidence
+  head that schedules how many draft tokens to verify.
+
+Upstream colibri has a V4.1 engine (`c/deepseek_v41.c`). It disagrees with DeepInfer on the
+index-K source (by default colibri scores against one globally "published" slot, as the
+vendor `model.py` does; DeepInfer gives each layer its own source, colibri's
+`V41_INDEX_OWNER=1`), gates YaRN on `CTX`
+(a small context silently drops it), and ignores `bias_vl` — worth knowing before borrowing
+from it.
+
+DeepInfer ideas that apply to V4 here, independent of V4.1:
+- **Quantized compressed KV** (the long-context blocker above): FP4 + e4m3 per-16 scales for
+  the main compressed series (288 B/token vs 2 KB f32), MXFP8 for the window, quantized then
+  dequantized in prefill too, so split prefill still matches decode bit for bit.
+- **Counter-based sampling**: `u = SplitMix64(seed + mix(position))` with no RNG state, so
+  batched, speculative and serial decode sample identically.
+- **Rollback by overwrite**: size the window ring `window + max_draft + 1` and the compressor
+  ring `ratio + backtrack - 1`, and a rejected draft is just overwritten. That is the cheap way
+  to add speculative decoding to the V4 state machine.

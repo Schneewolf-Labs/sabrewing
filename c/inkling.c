@@ -312,17 +312,17 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *lt = json_get(r,"layer_types");
     jval *ll = json_get(r,"local_layer_ids");
     for (int i = 0; i < c->n_layers; i++) {
-        if (lt && lt->t == J_ARR) c->local[i] = (strcmp(lt->kids[i]->str,"hybrid_sliding")==0);
+        if (lt && lt->t == J_ARR) c->local[i] = (strcmp(jstr_at(lt, i),"hybrid_sliding")==0);
         else if (ll && ll->t == J_ARR) {
             c->local[i] = 0;
-            for (int j = 0; j < ll->len; j++) if ((int)ll->kids[j]->num == i) { c->local[i] = 1; break; }
+            for (int j = 0; j < ll->len; j++) if (ll->kids[j]->t == J_NUM && (int)ll->kids[j]->num == i) { c->local[i] = 1; break; }
         } else c->local[i] = ((i + 1) % 6) != 0;
     }
     /* MLP types: explicit mlp_layer_types[] > dense_mlp_idx (first k layers dense) */
     jval *mt = json_get(r,"mlp_layer_types");
     int dense_idx = (int)jnum(r,"dense_mlp_idx",0);
     for (int i = 0; i < c->n_layers; i++) {
-        if (mt && mt->t == J_ARR) c->sparse[i] = (strcmp(mt->kids[i]->str,"sparse")==0);
+        if (mt && mt->t == J_ARR) c->sparse[i] = (strcmp(jstr_at(mt, i),"sparse")==0);
         else c->sparse[i] = (i >= dense_idx);
     }
     free(buf); free(arena);
@@ -338,7 +338,7 @@ static float *load_t(Model *m, const char *name) {
 }
 static float load_scalar(Model *m, const char *name, float dflt) {
     if (!st_has(&m->S, name)) return dflt;
-    float v; st_read_f32(&m->S, name, &v, 0); return v;
+    float v; st_read_f32_cap(&m->S, name, &v, 1, 0); return v;   /* a scalar: never more than 1 */
 }
 
 /* chunked pread: a single pread caps at ~2.1 GB on Linux, and the bf16
@@ -484,7 +484,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits, const char
     }
 #endif
     m->embed      = load_w(m, "model.embed_tokens.weight", 0, 0);
-    m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+    /* transformers >= 5.18 nests it under embed_tokens; missing it silently skips the norm */
+    const char *en = st_has(&m->S,"model.embed_norm.weight") ? "model.embed_norm.weight"
+                   : st_has(&m->S,"model.embed_tokens.embed_norm.weight") ? "model.embed_tokens.embed_norm.weight" : NULL;
+    m->embed_norm = en ? load_t(m, en) : NULL;
     m->final_norm = load_t(m, "model.norm.weight");
     m->lm_head    = load_w(m, "lm_head.weight", 1, c->hidden);
     m->L = calloc(c->n_layers, sizeof(Layer));
@@ -1484,7 +1487,7 @@ static double generate_spec_mtp(Model *m, const int *prompt, int np, int n_new, 
     return fwd ? (double)n_new / (double)fwd : 0.0;
 }
 
-static const char *prompt_reject(Cfg *c, const int *ids, int np, int want);
+static const char *prompt_reject(Cfg *c, const int *ids, int np, int *want);
 
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
 static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
@@ -1493,7 +1496,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int *ids = malloc(cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
-    const char *bad = prompt_reject(c, ids, np, n_new);
+    const char *bad = prompt_reject(c, ids, np, &n_new);
     if (bad) { fprintf(stderr, "rejected: %s\n", bad); free(ids); return; }
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt); fflush(stdout);
@@ -1556,12 +1559,11 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
 /* reject a prompt that can't be served correctly: multimodal placeholder
  * tokens (text-only engine) or a context that would overrun the KV bound.
  * Returns NULL if ok, else a short reason. */
-static const char *prompt_reject(Cfg *c, const int *ids, int np, int want) {
+static const char *prompt_reject(Cfg *c, const int *ids, int np, int *want) {
     for (int i = 0; i < np; i++)
         if (ids[i] == c->img_tok || ids[i] == c->aud_tok)
             return "multimodal input not supported (text only)";
-    if (np + want > c->ctx_max) return "context exceeds CTX_MAX";
-    return NULL;
+    return serve_fit(np, want, c->ctx_max);   /* clamps *want to the remaining context */
 }
 
 /* CTC-style repetition penalty applied in place: recently emitted tokens get
@@ -1589,7 +1591,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
-    const char *bad = prompt_reject(c, ids, np, q->max_tok);
+    const char *bad = prompt_reject(c, ids, np, &q->max_tok);
     if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
     state_reset(m);
     kv_alloc(m, np + q->max_tok + 8);

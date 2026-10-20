@@ -18,6 +18,14 @@ static float *falloc(int64_t n) { float *p = malloc(n * sizeof(float)); if (!p) 
 /* config number with default: jnum(cfg, "key", fallback) */
 static double jnum(jval *o, const char *k, double d) { jval *v = json_get(o, k); return (v && v->t == J_NUM) ? v->num : d; }
 
+/* i-th element of a JSON array as a string; "" when absent, out of range or not a
+ * string. Config arrays (layer_types, mlp_layer_types) are untrusted input: indexing
+ * kids[i]->str directly read past short arrays and fed NULL to strcmp. */
+static const char *jstr_at(jval *a, int i) {
+    if (!a || a->t != J_ARR || i < 0 || i >= a->len || a->kids[i]->t != J_STR) return "";
+    return a->kids[i]->str;
+}
+
 /* parse a JSON int array into a malloc'd int[] (n written to *n_out; NULL if absent) */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -80,7 +88,9 @@ static void moe_omp_autotune(void) {
     if (getenv("MOE_NO_OMP_AUTOTUNE")) return;      /* escape hatch */
     int phys = moe_physical_cores();
 #ifdef _OPENMP
-    if (phys > 0) omp_set_num_threads(phys);
+    /* only ever LOWER the team: omp_get_max_threads() already honors the cpuset
+     * (taskset, a container's CPU quota), and the machine's core count can exceed it */
+    if (phys > 0 && phys < omp_get_max_threads()) omp_set_num_threads(phys);
 #else
     (void)phys;
 #endif

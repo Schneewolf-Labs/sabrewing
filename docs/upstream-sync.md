@@ -7,13 +7,14 @@ the Inkling engine and everything around it is ours.
 
 ## The three file classes
 
-**VENDORED** — taken verbatim from upstream, no local changes. `glm.c`, `st.h`,
+**VENDORED** — taken verbatim from upstream, no local changes. `glm.c`,
 `json.h`, `tok_unicode.h`, `compat.h`, `tier.h`, `backend_cuda.*`,
 `backend_loader.c`, `coli`, and friends. `tools/upstream-sync.sh pull` adopts
 upstream's version.
 
 **MERGED** — we changed them, usually with a matching upstream PR open:
-`Makefile` (inkling targets), `openai_server.py` (inkling arch + serve). Sync
+`Makefile` (inkling targets), `openai_server.py` (inkling arch + serve), `st.h`
+(upstream renumbered its dtype codes, so its 2026 hardening fixes were cherry-picked). Sync
 only *reports* drift; you merge by hand. **When the upstream PR lands, move the
 file to VENDORED and pull** — the upstream version then contains our change and
 the divergence disappears. (`tok.h` followed this path: o200k landed upstream
