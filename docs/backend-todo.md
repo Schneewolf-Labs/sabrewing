@@ -19,11 +19,14 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   in-flight sentinel, and shared `sample_logits` pinned greedy output to token 0.
   All three now degrade deterministically and warn once. Upstream #563 / #370
   had fixed only the `colibri.c` copies.
-- [ ] **Tiny oracle snapshots are gone** — `/tmp/tlag`, `/tmp/tlag_i4` and the
-  tiny inkling fixture no longer exist on this box, so the token-exact harness
-  cannot run here at all. Rebuilding needs `transformers >= 5.7`
-  (`tools/make_tiny_laguna.py`, `make_tiny_inkling.py`). Until then engine changes
-  can only be validated by cross-build greedy identity on the real containers.
+- [x] **Tiny oracle snapshots are gone** — rebuildable anywhere with CPU torch +
+  `transformers` 5.14.1 (PyPI's `torch`; nothing else): `make_tiny_{laguna,inkling,
+  qwen35,deepseek}.py` all build and pass (2026-10). For `BATCH`/`BATCH_AB` on a tiny
+  snapshot, drop in a 256-entry byte-level `tokenizer.json` (vocab ids < 256, no
+  merges) — the tiny models' vocab is 256. The int4 tiny laguna container is ~3/24
+  greedy vs transformers (quantization on random weights), so batching changes are
+  gated on *self*-consistency there: `BATCH_AB=1` token identity and output identity
+  with the previous build.
 
 - [~] **MTP speculative decode** — draft+verify with the shipped 8-module head.
   Phase 1 (n-gram scaffolding + conv rollback) and depth-0 drafting are DONE and
@@ -73,7 +76,8 @@ Tracking the gaps left by the fast initial build. Cross items off as done
   **nothing calls it**, and with B streams sharing experts the cached layers amortise
   much better. 256 experts at top-6 is exactly the shape it was built for.
   *(2026-10: prefill now calls it — `moe_rows` groups a prefill chunk's routed rows by
-  expert, bit-identical, 2.3-2.5x prefill on a 64-expert synthetic V4. Batched DECODE is
+  expert, bit-identical, 2.0-2.1x prefill (AVX-512 build; 2.3-2.5x at the AVX2 default) on a 64-expert
+  synthetic V4. Batched DECODE is
   still the open item.)*
 - [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
   entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
