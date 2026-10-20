@@ -295,7 +295,7 @@ static void cfg_load(Cfg *c, const char *dir) {
         if (lt->len != c->n_layers) {
             fprintf(stderr, "layer_types has %d entries, expected %d\n", lt->len, c->n_layers); exit(1); }
         for (int i = 0; i < c->n_layers; i++) {
-            const char *s = lt->kids[i]->str;
+            const char *s = jstr_at(lt, i);
             if (!strcmp(s, "sliding_attention")) c->att[i] = ATT_SLIDING;
             else if (!strcmp(s, "compressed_sparse_attention")) c->att[i] = ATT_CSA;
             else if (!strcmp(s, "heavily_compressed_attention")) c->att[i] = ATT_HCA;
@@ -319,7 +319,7 @@ static void cfg_load(Cfg *c, const char *dir) {
     /* mlp_layer_types: leading hash_moe layers route by the frozen tid2eid table. */
     jval *mt = json_get(o, "mlp_layer_types");
     if (mt && mt->t == J_ARR && mt->len == c->n_layers) {
-        for (int i = 0; i < c->n_layers; i++) c->hash[i] = !strcmp(mt->kids[i]->str, "hash_moe");
+        for (int i = 0; i < c->n_layers; i++) c->hash[i] = !strcmp(jstr_at(mt, i), "hash_moe");
     } else {
         int nh = (int)jnum(o, "num_hash_layers", 3);
         for (int i = 0; i < c->n_layers; i++) c->hash[i] = i < nh;

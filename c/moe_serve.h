@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>              /* isfinite: SUBMIT header validation */
 #include <sys/select.h>
 
 /* `slot` is the gateway's cache_slot: which persistent KV cache this request should
@@ -73,8 +74,12 @@ static int serve_read_cmd(const char *cur_id) {
     }
     if (!strcmp(cmd, "SUBMIT")) {
         int slot, plen, max_tok; float temp, top_p;
+        /* every field is untrusted (the stdin protocol is public): a negative max_tok
+         * used to pass the context check and size the KV cache SMALLER than the prompt */
         if (sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5 ||
-            plen < 0 || plen > (1 << 22)) { printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+            plen < 0 || plen > (1 << 22) || max_tok < 1 || max_tok > (1 << 24) ||
+            !isfinite(temp) || !isfinite(top_p)) {
+            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
 
         char *pl = malloc((size_t)plen + 1);
         if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
@@ -87,6 +92,16 @@ static int serve_read_cmd(const char *cur_id) {
         } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
     }
     return 0;
+}
+
+/* Fit a request to the context window: refuse a prompt that leaves no room to
+ * generate, otherwise clamp max_tok to what remains — max_tokens is a ceiling, not a
+ * demand (OpenAI semantics), so a long agent prompt gets a shorter answer instead of an
+ * error. Returns the error text, or NULL with *max_tok possibly lowered. */
+static const char *serve_fit(int np, int *max_tok, int ctx_max) {
+    if (np >= ctx_max) return "context exceeds CTX_MAX";
+    if (*max_tok > ctx_max - np) *max_tok = ctx_max - np;
+    return NULL;
 }
 
 #endif
