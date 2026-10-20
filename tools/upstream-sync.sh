@@ -22,7 +22,7 @@ BRANCH=dev
 
 VENDORED=(
   c/colibri.c c/quant.h c/sample.h c/kv_persist.h c/telemetry.h c/uring.h
-  c/olmoe.c c/json.h c/tok.h c/tok_unicode.h c/compat.h c/tier.h
+  c/olmoe.c c/json.h c/tok.h c/tok_unicode.h c/tok_unicode_deepseek.h c/compat.h c/tier.h
   c/grammar.h c/schema_gbnf.h c/decode_batch.h c/backend_cuda.cu c/backend_cuda.h
   c/backend_metal.h c/backend_metal.mm c/backend_loader.c c/iobench.c
   c/coli c/version.py c/doctor.py c/resource_plan.py c/setup.sh
@@ -33,6 +33,8 @@ VENDORED=(
   c/tests/test_int3_convert.py c/tests/test_int3_load.c c/tests/test_iq3_pack.py
   c/tests/test_pipe_block.c c/tests/test_ragged_attention.cu c/tests/test_router_cuda.cu
   c/tests/test_st_mirror.c c/tests/test_tok_o200k.c c/tests/tok_o200k_cases.txt
+  c/tests/test_tok_deepseek.c c/tests/tok_deepseek_cases.txt c/tests/tok_deepseek_tiny.json
+  c/tests/test_tok_gpt2.c c/tests/tok_gpt2_cases.txt c/tests/tok_gpt2_tiny.json
   c/tests/tok_o200k_tiny.json
   c/tests/bench_tensor_core.cu c/tests/test_backend_cuda.cu c/tests/test_backend_metal.mm
   c/tests/test_benchmark_cuda_fixture.py c/tests/test_decode_batch.c
