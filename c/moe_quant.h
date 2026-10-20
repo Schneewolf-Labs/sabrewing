@@ -25,6 +25,24 @@
 enum { MOE_Q4_F32 = 0, MOE_Q4_IDOT = 1 };
 enum { MOE_Q8_F32 = 0, MOE_Q8_IDOT = 1 };
 
+#if !defined(__AVX512F__)
+/* Row expanders for the portable lane path (moe_gemm_lanes, moe_matmul.h): the values the
+ * kernels' FMAs consume — the per-row scale is applied by the caller. */
+static void moe_rdeq_q4(float *dst, const void *W, const void *aux, int64_t o, int I) {
+    (void)aux;
+    const uint8_t *p = (const uint8_t*)W + o * (I / 2);
+    for (int c = 0; c < I / 2; c++) {
+        dst[2 * c] = (float)((int)(p[c] & 0xF) - 8);
+        dst[2 * c + 1] = (float)((int)(p[c] >> 4) - 8);
+    }
+}
+static void moe_rdeq_q8(float *dst, const void *W, const void *aux, int64_t o, int I) {
+    (void)aux;
+    const int8_t *q = (const int8_t*)W + o * I;
+    for (int i = 0; i < I; i++) dst[i] = (float)q[i];
+}
+#endif
+
 #if defined(__AVX2__)
 /* int8·int8 -> int32 dot accumulate over a 32-lane block, sign-folded so the
  * unsigned-times-signed VNNI op is exact for signed a. */
@@ -106,6 +124,12 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
             for (; c < I / 2; c++) { uint8_t b = p[c]; s += x[2 * c] * ((int)(b & 0xF) - 8) + x[2 * c + 1] * ((int)(b >> 4) - 8); }
             y[o] = s * scale[o];
         }
+        return;
+    }
+#endif
+#if !defined(__AVX512F__)
+    if (mode == MOE_Q4_F32 && !exact && I % 2 == 0) {
+        moe_gemm_lanes(y, x, 1, I, O, packed, moe_rdeq_q4, NULL, scale);
         return;
     }
 #endif
@@ -212,6 +236,11 @@ static void matmul_q4_kb(float *y, const float *x, const uint8_t *packed, const 
         moe_gemm_tiled(y, x, S, I, O, packed, moe_deq_q4, NULL, scale);
         return;
     }
+#else
+    if (mode == MOE_Q4_F32 && !exact && I % 2 == 0) {   /* same function as S=1: bit-identical */
+        moe_gemm_lanes(y, x, S, I, O, packed, moe_rdeq_q4, NULL, scale);
+        return;
+    }
 #endif
     for (int s = 0; s < S; s++)
         matmul_q4_k(y + (int64_t)s * O, x + (int64_t)s * I, packed, scale, I, O, mode, exact);
@@ -255,6 +284,39 @@ static inline float moe_ue8m0(uint8_t e) {
     float f; memcpy(&f, &u, 4); return f;
 }
 
+#if !defined(__AVX512F__)
+static void moe_rdeq_fp4(float *dst, const void *W, const void *aux, int64_t o, int I) {
+    const uint8_t *p = (const uint8_t*)W + o * (I / 2);
+    const uint8_t *e = (const uint8_t*)aux + o * (I / 32);
+    for (int b = 0; b < I / 32; b++) {             /* 16 bytes = 32 columns = one scale */
+        float bs = moe_ue8m0(e[b]);
+        const uint8_t *pb = p + b * 16;
+        float *d = dst + b * 32;
+#if defined(__AVX2__)
+        /* e2m1 = sign bit (8) + an 8-entry magnitude: one permute + an xor of the sign,
+         * the same values as the 16-entry LUT (-0.0 included), ~4x the scalar decode */
+        const __m256 mag = _mm256_loadu_ps(moe_fp4_lut);
+        const __m128i m0f = _mm_set1_epi8(0x0F);
+        __m128i by = _mm_loadu_si128((const __m128i*)pb);
+        __m128i lo = _mm_and_si128(by, m0f), hi = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
+        __m128i il[2] = { _mm_unpacklo_epi8(lo, hi), _mm_unpackhi_epi8(lo, hi) };
+        __m256 vs = _mm256_set1_ps(bs);
+        for (int h = 0; h < 4; h++) {
+            __m256i idx = _mm256_cvtepu8_epi32(h & 1 ? _mm_srli_si128(il[h >> 1], 8) : il[h >> 1]);
+            __m256 v = _mm256_permutevar8x32_ps(mag, idx);
+            __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(idx, _mm256_set1_epi32(8)), 28);
+            _mm256_storeu_ps(d + 8 * h, _mm256_mul_ps(_mm256_xor_ps(v, _mm256_castsi256_ps(sgn)), vs));
+        }
+        continue;
+#endif
+        for (int c = 0; c < 16; c++) {
+            d[2 * c] = moe_fp4_lut[pb[c] & 0xF] * bs;
+            d[2 * c + 1] = moe_fp4_lut[pb[c] >> 4] * bs;
+        }
+    }
+}
+#endif
+
 /* y[O] = x[I] @ dequant(packed, es)^T. `exact` forces the double-accumulate
  * reference, which is the oracle contract the f32 path is compared against. */
 static void matmul_fp4_k(float *y, const float *x, const uint8_t *packed, const uint8_t *es,
@@ -287,6 +349,9 @@ static void matmul_fp4_k(float *y, const float *x, const uint8_t *packed, const 
         }
         return;
     }
+#endif
+#if !defined(__AVX512F__)
+    if (!exact && I % 32 == 0) { moe_gemm_lanes(y, x, 1, I, O, packed, moe_rdeq_fp4, es, NULL); return; }
 #endif
     /* portable double-accumulate reference */
     #pragma omp parallel for schedule(static) if(O >= 512)
@@ -336,6 +401,8 @@ static void matmul_fp4_kb(float *y, const float *x, const uint8_t *packed, const
         moe_gemm_tiled(y, x, S, I, O, packed, moe_deq_fp4, es, NULL);
         return;
     }
+#else
+    if (!exact && I % 32 == 0) { moe_gemm_lanes(y, x, S, I, O, packed, moe_rdeq_fp4, es, NULL); return; }
 #endif
     for (int s = 0; s < S; s++)
         matmul_fp4_k(y + (int64_t)s * O, x + (int64_t)s * I, packed, es, I, O, exact);
@@ -393,6 +460,9 @@ static void matmul_q8_k(float *y, const float *x, const int8_t *q, const float *
         }
         return;
     }
+#endif
+#if !defined(__AVX512F__)
+    if (mode == MOE_Q8_F32 && !exact) { moe_gemm_lanes(y, x, 1, I, O, q, moe_rdeq_q8, NULL, scale); return; }
 #endif
     #pragma omp parallel for schedule(static) if(O >= 512)   /* single-row kernel: O is the whole work */
     for (int o = 0; o < O; o++) {
