@@ -49,6 +49,57 @@ static int report(const char *name, const float *y, const float *ref, int O, dou
 }
 
 
+/* The batched (S>1) paths run a register-blocked core (moe_gemm_tiled) that
+ * interleaves independent reductions; every row must stay BIT-identical to the S=1
+ * kernel for every format. Odd O exercises the ragged last tile, odd S the 1..3-row
+ * tails and the MOE_SCHUNK boundary, I%16 != 0 the scalar tail (f32/bf16 only — the
+ * quantized formats need I%32 == 0). */
+static int check_batched_bitexact(void) {
+    int ok = 1;
+    int Is[] = {96, 1000, 3072}, Os[] = {1, 5, 258}, Ss[] = {2, 3, 4, 5, 7, 33, 70};
+    for (size_t ii = 0; ii < 3; ii++) for (size_t oi = 0; oi < 3; oi++) {
+        int I = Is[ii], O = Os[oi];
+        float *W = malloc((size_t)O * I * 4), *sc = malloc((size_t)O * 4);
+        uint16_t *Wb = malloc((size_t)O * I * 2);
+        uint8_t *pk = malloc((size_t)O * I / 2), *es = malloc((size_t)O * I / 32 + 1);
+        for (int64_t i = 0; i < (int64_t)O * I; i++) { W[i] = rand() / (float)RAND_MAX - .5f; Wb[i] = f2bf16(W[i]); }
+        for (int64_t i = 0; i < (int64_t)O * I / 2; i++) pk[i] = rand() & 0xFF;
+        for (int64_t i = 0; i < (int64_t)O * I / 32; i++) es[i] = 118 + rand() % 10;
+        for (int o = 0; o < O; o++) sc[o] = 0.01f + rand() / (float)RAND_MAX * 0.03f;
+        for (size_t si = 0; si < sizeof(Ss) / sizeof(Ss[0]); si++) {
+            int S = Ss[si];
+            float *x = malloc((size_t)S * I * 4), *yb = malloc((size_t)S * O * 4), *y1 = malloc((size_t)O * 4);
+            for (int64_t i = 0; i < (int64_t)S * I; i++) x[i] = rand() / (float)RAND_MAX * 2.f - 1.f;
+            for (int f = 0; f < 4; f++) {
+                if (f >= 2 && I % 32) continue;
+                if (f == 0) matmul_f32(yb, x, W, S, I, O, 0);
+                if (f == 1) matmul_bf16_k(yb, x, Wb, S, I, O, 0, 0);
+                if (f == 2) matmul_q4_kb(yb, x, pk, sc, S, I, O, MOE_Q4_F32, 0);
+                if (f == 3) matmul_fp4_kb(yb, x, pk, es, S, I, O, 0);
+                int bad = 0;
+                for (int s = 0; s < S && !bad; s++) {
+                    const float *xs = x + (size_t)s * I;
+                    if (f == 0) matmul_f32(y1, xs, W, 1, I, O, 0);
+                    if (f == 1) matmul_bf16_k(y1, xs, Wb, 1, I, O, 0, 0);
+                    if (f == 2) matmul_q4_k(y1, xs, pk, sc, I, O, MOE_Q4_F32, 0);
+                    if (f == 3) matmul_fp4_k(y1, xs, pk, es, I, O, 0);
+                    if (memcmp(y1, yb + (size_t)s * O, (size_t)O * 4)) bad = 1;
+                }
+                if (bad) {
+                    static const char *nm[] = {"f32", "bf16", "q4", "fp4"};
+                    printf("  FAIL: batched %s I=%d O=%d S=%d differs from S=1\n", nm[f], I, O, S);
+                    ok = 0;
+                }
+            }
+            free(x); free(yb); free(y1);
+        }
+        free(W); free(sc); free(Wb); free(pk); free(es);
+    }
+    printf("  f32/bf16/q4/fp4 batched vs S=1 over I{96,1000,3072} O{1,5,258} S{2..70}: %s\n",
+           ok ? "bit-identical OK" : "FAIL");
+    return ok;
+}
+
 /* sdpa_group_split must agree with sdpa_group for every chunk count: the merge is exact
  * algebra, so only float reassociation should differ. nchunk=1 must be BIT-identical
  * (it delegates), and a chunk count that does not divide the window evenly is the case
@@ -421,6 +472,9 @@ int main(void) {
             free(pk); free(scl);
         }
     }
+
+    printf("batched GEMM core (moe_gemm_tiled):\n");
+    ok &= check_batched_bitexact();
 
     printf("sdpa_group_split (flash-decoding split-K):\n");
     ok &= check_sdpa_split();

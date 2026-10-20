@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>            /* memcpy: ue8m0 bit-pattern decode */
+#include "moe_matmul.h"        /* moe_gemm_tiled: the batched (S>1) register-blocked core */
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -124,6 +125,27 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
     }
 }
 
+#if defined(__AVX512F__)
+/* int4 rows -> f32 (nibble - 8, scale applied by the caller): exactly the values the
+ * S=1 kernel feeds its FMAs. I % 32 == 0. */
+static void moe_deq_q4(float *dst, const void *W, const void *aux, int64_t o, int n, int I) {
+    (void)aux;
+    const __m128i m0f = _mm_set1_epi8(0x0F);
+    const __m512 v8 = _mm512_set1_ps(8.f);
+    for (int r = 0; r < n; r++) {
+        const uint8_t *p = (const uint8_t*)W + (o + r) * (I / 2);
+        float *d = dst + (int64_t)r * I;
+        for (int c = 0; c < I / 2; c += 16) {
+            __m128i b  = _mm_loadu_si128((const __m128i*)(p + c));
+            __m128i lo = _mm_and_si128(b, m0f);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
+            _mm512_storeu_ps(d + 2 * c,      _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi))), v8));
+            _mm512_storeu_ps(d + 2 * c + 16, _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi))), v8));
+        }
+    }
+}
+#endif
+
 /* Batched int4: y[S,O] = x[S,I] @ dequant(packed)^T, reading each weight ROW ONCE
  * for all S activation rows. This is the group-by-expert lever: an expert's int4
  * blob streams from RAM (or VRAM) once and serves every token routed to it, so a
@@ -134,7 +156,8 @@ static void matmul_q4_k(float *y, const float *x, const uint8_t *packed, const f
  * numerics. The fast paths unpack the weight row once (into an L1-resident buffer)
  * and reuse it across the S rows, which also removes the repeated nibble unpack;
  * they need I%32==0 (laguna: D=3072, I=1024) and defer to the per-row loop
- * otherwise, same result either way. */
+ * otherwise, same result either way. The f32 contract runs on the shared
+ * register-blocked core (moe_gemm_tiled, moe_matmul.h). */
 static void matmul_q4_kb(float *y, const float *x, const uint8_t *packed, const float *scale,
                          int S, int I, int O, int mode, int exact) {
     if (S == 1) { matmul_q4_k(y, x, packed, scale, I, O, mode, exact); return; }
@@ -185,30 +208,8 @@ static void matmul_q4_kb(float *y, const float *x, const uint8_t *packed, const 
     }
 #endif
 #if defined(__AVX512F__)
-    if (mode == MOE_Q4_F32 && !exact && I % 32 == 0 && I <= 8192) {
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *p = packed + (int64_t)o * (I / 2);
-            const __m128i m0f = _mm_set1_epi8(0x0F);
-            const __m512 v8 = _mm512_set1_ps(8.f);
-            float wf[8192];                                   /* dequantized row, reused for all S */
-            for (int c = 0; c < I / 2; c += 16) {              /* 16 bytes -> 32 weights */
-                __m128i b  = _mm_loadu_si128((const __m128i*)(p + c));
-                __m128i lo = _mm_and_si128(b, m0f);
-                __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), m0f);
-                _mm512_storeu_ps(wf + 2 * c,
-                    _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi))), v8));
-                _mm512_storeu_ps(wf + 2 * c + 16,
-                    _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi))), v8));
-            }
-            for (int s = 0; s < S; s++) {
-                const float *xr = x + (int64_t)s * I;
-                __m512 acc = _mm512_setzero_ps();
-                for (int i = 0; i < I; i += 16)                /* same FMA order as the S=1 kernel */
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(xr + i), _mm512_loadu_ps(wf + i), acc);
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc) * scale[o];
-            }
-        }
+    if (mode == MOE_Q4_F32 && !exact && I % 32 == 0) {
+        moe_gemm_tiled(y, x, S, I, O, packed, moe_deq_q4, NULL, scale);
         return;
     }
 #endif
@@ -274,11 +275,13 @@ static void matmul_fp4_k(float *y, const float *x, const uint8_t *packed, const 
                 __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m0f); /* odd columns  */
                 __m128i il0 = _mm_unpacklo_epi8(lo, hi);                /* cols 2c..2c+15 */
                 __m128i il1 = _mm_unpackhi_epi8(lo, hi);                /* cols 2c+16..2c+31 */
-                __m512 f0 = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(il0), lut);
-                __m512 f1 = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(il1), lut);
+                /* scale the WEIGHT: LUT * 2^k is exact, so this is the true dequantized
+                 * value and the batched path can reuse it across rows */
                 __m512 bs = _mm512_set1_ps(moe_ue8m0(e[b]));
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_loadu_ps(x + 2 * c), bs), f0, acc);
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_loadu_ps(x + 2 * c + 16), bs), f1, acc);
+                __m512 f0 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepu8_epi32(il0), lut), bs);
+                __m512 f1 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepu8_epi32(il1), lut), bs);
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + 2 * c), f0, acc);
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(x + 2 * c + 16), f1, acc);
             }
             y[o] = _mm512_reduce_add_ps(acc);
         }
@@ -301,6 +304,27 @@ static void matmul_fp4_k(float *y, const float *x, const uint8_t *packed, const 
     }
 }
 
+#if defined(__AVX512F__)
+/* fp4 rows -> f32 (LUT * 2^k, exact), the values matmul_fp4_k's FMAs consume. */
+static void moe_deq_fp4(float *dst, const void *W, const void *aux, int64_t o, int n, int I) {
+    const __m512 lut = _mm512_loadu_ps(moe_fp4_lut);
+    const __m128i m0f = _mm_set1_epi8(0x0F);
+    for (int r = 0; r < n; r++) {
+        const uint8_t *p = (const uint8_t*)W + (o + r) * (I / 2);
+        const uint8_t *e = (const uint8_t*)aux + (o + r) * (I / 32);
+        float *d = dst + (int64_t)r * I;
+        for (int c = 0, b = 0; c < I / 2; c += 16, b++) {
+            __m128i by = _mm_loadu_si128((const __m128i*)(p + c));
+            __m128i lo = _mm_and_si128(by, m0f);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
+            __m512 bs = _mm512_set1_ps(moe_ue8m0(e[b]));
+            _mm512_storeu_ps(d + 2 * c,      _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi)), lut), bs));
+            _mm512_storeu_ps(d + 2 * c + 16, _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi)), lut), bs));
+        }
+    }
+}
+#endif
+
 /* Batched fp4: y[S,O] = x[S,I] @ dequant(...)^T, reading each weight row once for
  * all S activation rows — the group-by-expert lever, same contract as
  * matmul_q4_kb. Each (o,s) reduces in the same order as the S=1 kernel above, so
@@ -309,28 +333,7 @@ static void matmul_fp4_kb(float *y, const float *x, const uint8_t *packed, const
                           int S, int I, int O, int exact) {
 #if defined(__AVX512F__)
     if (!exact && I % 32 == 0 && S > 1) {
-        const __m512 lut = _mm512_loadu_ps(moe_fp4_lut);
-        #pragma omp parallel for schedule(static) if(O >= 64)
-        for (int o = 0; o < O; o++) {
-            const uint8_t *p = packed + (int64_t)o * (I / 2);
-            const uint8_t *e = es + (int64_t)o * (I / 32);
-            for (int s = 0; s < S; s++) {
-                const float *xs = x + (int64_t)s * I;
-                __m512 acc = _mm512_setzero_ps();
-                const __m128i m0f = _mm_set1_epi8(0x0F);
-                for (int c = 0, b = 0; c + 16 <= I / 2; c += 16, b++) {
-                    __m128i by = _mm_loadu_si128((const __m128i*)(p + c));
-                    __m128i lo = _mm_and_si128(by, m0f);
-                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m0f);
-                    __m512 f0 = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi)), lut);
-                    __m512 f1 = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi)), lut);
-                    __m512 bs = _mm512_set1_ps(moe_ue8m0(e[b]));
-                    acc = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_loadu_ps(xs + 2 * c), bs), f0, acc);
-                    acc = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_loadu_ps(xs + 2 * c + 16), bs), f1, acc);
-                }
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
-            }
-        }
+        moe_gemm_tiled(y, x, S, I, O, packed, moe_deq_fp4, es, NULL);
         return;
     }
 #endif
