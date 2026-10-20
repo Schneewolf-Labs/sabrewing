@@ -99,6 +99,8 @@ typedef struct {
     float *conv, *dt, *alog, *onorm;          /* conv [3*qkv][K] (q|k|v channel order) */
     /* DSA */
     Wt qa, qb, kva, kvb, ao;
+    Wt kT;                                    /* kv_b's key rows, per head TRANSPOSED: [H][kl][nope] */
+    Wt kvv;                                   /* kv_b's value rows only: [H][vd][kl] */
     float *qa_n, *kva_n;
     Wt iqb, iwk, iw, igate;
     float *ik_w, *ik_b, *iape;                /* k LayerNorm (weight + bias), ape [kpool][idx_dim] */
@@ -452,6 +454,41 @@ static void model_load(Model *m, const char *snap) {
             L->kva_n = load_f(m, pick(m, nm, sizeof(nm), i, "self_attn.kv_a_layernorm.weight", NULL), kl);
             L->kvb = load_w(m, pick(m, nm, sizeof(nm), i, "self_attn.kv_b_proj.weight", NULL), (int64_t)H * (c->nope + c->vdim), kl);
             L->ao = load_w(m, pick(m, nm, sizeof(nm), i, "self_attn.o_proj.weight", NULL), D, (int64_t)H * c->vdim);
+            /* Absorbing q into latent space is q_h . Wk_h, i.e. a GEMM against Wk_h^T; keep
+             * that transposed copy (same dtype) so a prefill runs it as one GEMM per head
+             * instead of re-reading kv_b's rows per (query, head). */
+            {
+                int nope = c->nope, rows = c->nope + c->vdim;
+                int64_t ne = (int64_t)H * kl * nope;
+                int64_t nv = (int64_t)H * c->vdim * kl;
+                if (L->kvb.b) {
+                    uint16_t *t = malloc((size_t)ne * sizeof(uint16_t)), *v = malloc((size_t)nv * sizeof(uint16_t));
+                    for (int h = 0; h < H; h++) {
+                        for (int d = 0; d < nope; d++)
+                            for (int j = 0; j < kl; j++)
+                                t[((int64_t)h * kl + j) * nope + d] = L->kvb.b[((int64_t)h * rows + d) * kl + j];
+                        memcpy(v + (int64_t)h * c->vdim * kl, L->kvb.b + ((int64_t)h * rows + nope) * kl,
+                               (size_t)c->vdim * kl * sizeof(uint16_t));
+                    }
+                    L->kT.b = t; L->kvv.b = v;
+                    free((void *)L->kvb.b);
+                } else {
+                    float *t = falloc(ne), *v = falloc(nv);
+                    for (int h = 0; h < H; h++) {
+                        for (int d = 0; d < nope; d++)
+                            for (int j = 0; j < kl; j++)
+                                t[((int64_t)h * kl + j) * nope + d] = L->kvb.f[((int64_t)h * rows + d) * kl + j];
+                        memcpy(v + (int64_t)h * c->vdim * kl, L->kvb.f + ((int64_t)h * rows + nope) * kl,
+                               (size_t)c->vdim * kl * sizeof(float));
+                    }
+                    L->kT.f = t; L->kvv.f = v;
+                    free((void *)L->kvb.f);
+                }
+#ifdef COLI_CUDA
+                if (L->kvb.d) lag_cuda_free(L->kvb.d);
+#endif
+                L->kvb.f = NULL; L->kvb.b = NULL; L->kvb.d = NULL;   /* split into kT + kvv */
+            }
             if (!c->idx_shared[i]) {
                 L->iqb = load_w(m, pick(m, nm, sizeof(nm), i, "self_attn.indexer.wq_b.weight", NULL), (int64_t)c->idx_heads * Id, ql);
                 L->iwk = load_w(m, pick(m, nm, sizeof(nm), i, "self_attn.indexer.wk.weight", NULL), Id, D);
@@ -677,18 +714,19 @@ static void indexer(Model *m, Layer *L, LState *ls, const float *x, const float 
         char *take = calloc(nvis > 0 ? nvis : 1, 1);
         if (nvis <= keep) memset(take, 1, nvis);
         else {
-            float *score = malloc((size_t)nvis * sizeof(float));
-            const float *qt = q + (int64_t)t * IH * Id, *wt = w + (int64_t)t * IH;
+            float *score = malloc((size_t)nvis * sizeof(float)), *dots = malloc((size_t)nvis * IH * sizeof(float));
+            const float *wt = w + (int64_t)t * IH;
+            /* [nvis, IH] = pool keys . q_t^T, one GEMM (pool keys are contiguous) */
+            matmul_f32(dots, ls->pool, q + (int64_t)t * IH * Id, nvis, Id, IH, g_exact);
             for (int p = 0; p < nvis; p++) {
-                const float *pk = ls->pool + (int64_t)p * Id;
                 float s = 0;
                 for (int h = 0; h < IH; h++) {
-                    float d = 0; for (int j = 0; j < Id; j++) d += qt[h * Id + j] * pk[j];
-                    d *= sc;
+                    float d = dots[(int64_t)p * IH + h] * sc;
                     s += (wt[h] * hs) * (d > 0 ? d : 0);
                 }
                 score[p] = s;
             }
+            free(dots);
             /* top `keep` by score; ties to the lower pool (torch.topk leaves it undefined —
              * the fixture uses 8 indexer heads so a tie is not something it measures) */
             for (int r = 0; r < keep; r++) {
@@ -722,46 +760,62 @@ static void dsa_forward(Model *m, Layer *L, LState *ls, const float *x, int n, i
         rmsnorm_w(ls->lat + (int64_t)(pos0 + t) * kl, lat + (int64_t)t * kl, L->kva_n, kl, c->eps);
     if (L->iqb.f || L->iqb.b) indexer(m, L, ls, x, qres, n, pos0, sel);   /* else: shared, reuse */
 
-    /* absorbed attention, one (query, head) per task:
-     *   score_j = (Wk_h^T q_h) . lat_j / sqrt(nope)   out_h = Wv_h (sum_j a_j lat_j) */
+    /* absorbed attention:
+     *   score_j = (Wk_h^T q_h) . lat_j / sqrt(nope)    out_h = Wv_h (sum_j a_j lat_j)
+     * The two weight products are per-head GEMMs over all n queries (weights read once per
+     * call); only the latent attention itself runs per (query, head). */
     float scale = 1.f / sqrtf((float)nope);
-    int rows = nope + vd;
-    #pragma omp parallel for schedule(dynamic) if(n * H > 1)
-    for (int th = 0; th < n * H; th++) {
-        int t = th / H, h = th % H;
-        float *ql_ = malloc((size_t)kl * sizeof(float)), *ol = calloc(kl, sizeof(float));
-        float *wrow = malloc((size_t)kl * sizeof(float));
-        const float *qh = q + (int64_t)t * H * nope + h * nope;
-        for (int j = 0; j < kl; j++) ql_[j] = 0.f;
-        for (int d = 0; d < nope; d++) {
-            const float *wk = wt_row(L->kvb, ((int64_t)h * rows + d) * kl, wrow, kl);
-            float qd = qh[d];
-            for (int j = 0; j < kl; j++) ql_[j] += qd * wk[j];
-        }
+    float *qlat = falloc((int64_t)n * H * kl), *olat = falloc((int64_t)n * H * kl);
+    /* One region across heads: a decode step is 64 small GEMVs, and a region per GEMV
+     * cost more than the GEMVs (the inner GEMM runs single-threaded inside it). */
+    #pragma omp parallel for schedule(static) if(H > 1)
+    for (int h = 0; h < H; h++) {
+        float *qh = falloc((int64_t)n * nope), *tmpl = falloc((int64_t)n * kl);
+        for (int t = 0; t < n; t++) memcpy(qh + (int64_t)t * nope, q + (int64_t)t * H * nope + h * nope, nope * sizeof(float));
+        Wt kh = { L->kT.f ? L->kT.f + (int64_t)h * kl * nope : NULL,
+                  L->kT.b ? L->kT.b + (int64_t)h * kl * nope : NULL, NULL };
+        mmw(tmpl, qh, kh, n, nope, kl);
+        for (int t = 0; t < n; t++) memcpy(qlat + ((int64_t)t * H + h) * kl, tmpl + (int64_t)t * kl, kl * sizeof(float));
+        free(qh); free(tmpl);
+    }
+    /* Per query, all heads at once: gather the selected latents G [cnt, kl], then
+     * scores [cnt, H] = G . qlat^T is one GEMM on the tiled core, and the weighted sum is
+     * an axpy per (selected token, head) in ascending position order. */
+    int maxc = 0;
+    for (int t = 0; t < n; t++) if (sel->cnt[t] > maxc) maxc = sel->cnt[t];
+    float *G = falloc((int64_t)(maxc > 0 ? maxc : 1) * kl), *S = falloc((int64_t)(maxc > 0 ? maxc : 1) * H);
+    for (int t = 0; t < n; t++) {
         const int *pos = sel->pos + (int64_t)t * sel->width;
         int cnt = sel->cnt[t];
-        float *sc = malloc((size_t)(cnt > 0 ? cnt : 1) * sizeof(float)), mx = -INFINITY;
-        for (int i = 0; i < cnt; i++) {
-            const float *lj = ls->lat + (int64_t)pos[i] * kl;
-            float s = 0; for (int j = 0; j < kl; j++) s += ql_[j] * lj[j];
-            sc[i] = s * scale;
-            if (sc[i] > mx) mx = sc[i];
+        for (int i = 0; i < cnt; i++) memcpy(G + (int64_t)i * kl, ls->lat + (int64_t)pos[i] * kl, kl * sizeof(float));
+        matmul_f32(S, G, qlat + (int64_t)t * H * kl, cnt, kl, H, g_exact);
+        #pragma omp parallel for schedule(static) if(H > 1)
+        for (int h = 0; h < H; h++) {
+            float mx = -INFINITY, sum = 0, *ol = olat + ((int64_t)t * H + h) * kl;
+            for (int i = 0; i < cnt; i++) if (S[(int64_t)i * H + h] * scale > mx) mx = S[(int64_t)i * H + h] * scale;
+            for (int j = 0; j < kl; j++) ol[j] = 0.f;
+            float *e = malloc((size_t)(cnt > 0 ? cnt : 1) * sizeof(float));
+            for (int i = 0; i < cnt; i++) { e[i] = expf(S[(int64_t)i * H + h] * scale - mx); sum += e[i]; }
+            for (int i = 0; i < cnt; i++) {
+                const float *lj = G + (int64_t)i * kl;
+                float w = e[i] / sum;
+                for (int j = 0; j < kl; j++) ol[j] += w * lj[j];
+            }
+            free(e);
         }
-        float sum = 0;
-        for (int i = 0; i < cnt; i++) { sc[i] = expf(sc[i] - mx); sum += sc[i]; }
-        for (int i = 0; i < cnt; i++) {
-            const float *lj = ls->lat + (int64_t)pos[i] * kl;
-            float a = sc[i] / sum;
-            for (int j = 0; j < kl; j++) ol[j] += a * lj[j];
-        }
-        float *oh = att + (int64_t)t * H * vd + h * vd;
-        for (int v = 0; v < vd; v++) {
-            const float *wv = wt_row(L->kvb, ((int64_t)h * rows + nope + v) * kl, wrow, kl);
-            float s = 0; for (int j = 0; j < kl; j++) s += wv[j] * ol[j];
-            oh[v] = s;
-        }
-        free(ql_); free(ol); free(wrow); free(sc);
     }
+    free(G); free(S);
+    #pragma omp parallel for schedule(static) if(H > 1)
+    for (int h = 0; h < H; h++) {
+        float *oh = falloc((int64_t)n * vd), *tmpl = falloc((int64_t)n * kl);
+        for (int t = 0; t < n; t++) memcpy(tmpl + (int64_t)t * kl, olat + ((int64_t)t * H + h) * kl, kl * sizeof(float));
+        Wt vh = { L->kvv.f ? L->kvv.f + (int64_t)h * vd * kl : NULL,
+                  L->kvv.b ? L->kvv.b + (int64_t)h * vd * kl : NULL, NULL };
+        mmw(oh, tmpl, vh, n, kl, vd);
+        for (int t = 0; t < n; t++) memcpy(att + (int64_t)t * H * vd + h * vd, oh + (int64_t)t * vd, vd * sizeof(float));
+        free(oh); free(tmpl);
+    }
+    free(qlat); free(olat);
     mmw(out, att, L->ao, n, H * vd, D);
     free(qres); free(q); free(att); free(lat);
 }
