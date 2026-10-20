@@ -82,6 +82,13 @@ Tracking the gaps left by the fast initial build. Cross items off as done
 - [ ] **DeepSeek-V4 compressed KV is f32 and unbounded** — CSA keeps one f32 head_dim
   entry per 4 tokens per CSA layer. At 1M context that is hundreds of GB, and it is
   the actual blocker on long context, not the weights.
+- [ ] **GLM-5.3-Flash has never run on its real checkpoint** — `glm53.c` is oracle-green
+  and container-checked on fixtures only (`docs/glm53.md`). First run: convert, then measure
+  perplexity on real text. The per-row int4 experts are this repo's container; upstream
+  quantizes the same experts in 64-wide groups, and the FP8 source has 3 mantissa bits, so
+  the per-row cost may exceed Laguna's — group scales in `moe_quant.h` are the fallback.
+  Then a CUDA expert cache and KV_SLOTS batching; the model's 33 KB/token KV makes it the best
+  long-context many-agent candidate here.
 - [ ] **KV cache not trimmed to the sliding window** — global layers keep full KV;
   55/66 layers only need 512 tokens but we store all. Long context over-allocates
   and never recycles across requests. Trim sliding layers to their window.

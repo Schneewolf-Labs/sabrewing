@@ -1154,7 +1154,12 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
 }
 
 static int serve(Model *m, Tok *T) {
-    printf("READY\n"); fflush(stdout);
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    g_rng ^= sd ? (uint64_t)strtoull(sd, NULL, 10) : (uint64_t)time(NULL) * 2654435761u;
+    fputs("\x01\x01READY\x01\x01\n", stdout);            /* the sentinel + first STAT the gateway waits for */
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
     for (;;) {
         if (!g_qn) { if (serve_read_cmd(NULL) < 0) break; continue; }
         SReq q = g_q[0];

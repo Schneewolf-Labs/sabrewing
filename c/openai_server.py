@@ -827,6 +827,108 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---------------------------------------------------------------- GLM-5.3-Flash
+# Ported from upstream colibri's render_chat_glm53, which is pinned byte for byte against
+# the checkpoint's chat_template.jinja. Not a variant of GLM-5.2's: the reasoning-effort
+# system line is ALWAYS present (the template defaults it to Max), only Low/High/Max
+# exist, the generation prompt OPENS <think> (there is no thinking-off form), and tools
+# are declared with GLM-5.3's own preamble and spacing. Calls come back in GLM-5.2's
+# <tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value> form, so parse_tool_calls
+# serves both. Reasoning is always generated; the gateway surfaces it as
+# reasoning_content and keeps content clean.
+GLM53_TOOL_PREAMBLE = ("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the "
+                       "user query.\n\nYou are provided with function signatures within <tools></tools> "
+                       "XML tags:\n<tools>\n")
+GLM53_TOOL_EPILOGUE = ("\n</tools>\n\nFor each function call, output the function name and arguments "
+                       "within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}"
+                       "</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+                       "<arg_value>{arg-value-2}</arg_value>...</tool_call>")
+
+
+def _glm53_tool_json(tool):
+    """One signature as the template serializes it: client key order, defer_loading and
+    strict dropped."""
+    fn = tool.get("function", tool) if isinstance(tool, dict) else None
+    if not isinstance(fn, dict):
+        raise APIError(400, "Each tool must be an object.", "tools")
+    return "{" + ", ".join(f'"{k}": {json.dumps(v, ensure_ascii=False)}'
+                           for k, v in fn.items() if k not in ("defer_loading", "strict")) + "}"
+
+
+def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
+    effort = {"minimal": "Low", "low": "Low", "medium": "High", "high": "High",
+              "xhigh": "Max"}.get(reasoning_effort, "Max" if enable_thinking else "Low")
+    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    if tools:
+        prompt.append(GLM53_TOOL_PREAMBLE
+                      + "".join(f"\n{_glm53_tool_json(t)}\n\n" for t in tools
+                                if not (t.get("function", t) if isinstance(t, dict) else {}).get("defer_loading"))
+                      + GLM53_TOOL_EPILOGUE)
+        if forced:
+            prompt.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+        elif tool_choice == "required":
+            prompt.append("\n\nYou must call one of the functions above. Do not answer directly.")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            prompt.append(f"<|system|>{text}")
+        elif role == "user":
+            prompt.append(f"<|user|>{text}")
+        elif role == "tool":
+            prompt.append(f"<|observation|>{TR_OPEN}{text}{TR_CLOSE}")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            if reasoning is None and THINK_CLOSE in text:
+                reasoning = text.split(THINK_CLOSE)[0].split(THINK_OPEN)[-1]
+                text = text.split(THINK_CLOSE)[-1]
+            calls = []
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                calls.append(BOX_START + (fn.get("name") or "") + "".join(
+                    f"<arg_key>{k}</arg_key><arg_value>"
+                    + (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)) + "</arg_value>"
+                    for k, v in (args if isinstance(args, dict) else {}).items()) + BOX_END)
+            body = text.strip()
+            tail = "\n" + "".join(calls) + "\n" if calls else ""
+            if calls and not body:
+                tail = tail.lstrip("\n")    # the model writes </think><tool_call> with no newline
+            prompt.append(f"<|assistant|>{THINK_OPEN}{reasoning or ''}{THINK_CLOSE}{body}{tail}")
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    prompt.append("<|assistant|><think>")
+    return "".join(prompt)
+
+
+def chat_renderer():
+    return {"inkling": render_chat_inkling, "laguna": render_chat_laguna,
+            "qwen35": render_chat_qwen35, "glm53": render_chat_glm53}.get(ARCH, render_chat)
+
+
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
 # A translation layer, NOT a second engine path: /v1/messages rewrites an Anthropic-shaped
 # request into the exact OpenAI-shaped body the existing path already validates, so prompt
@@ -879,6 +981,9 @@ class ThinkingStreamSplit:
     def finish(self):
         self._emit(self.buf)
         self.buf = ""
+
+
+ThinkingStreamSplit.close = ThinkingStreamSplit.finish   # same interface as InklingStreamSplit
 
 
 def split_thinking_reply(text):
@@ -1943,6 +2048,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     text, reasoning = split_laguna(text)
                 elif ARCH == "qwen35":
                     text, reasoning = split_qwen35(text)
+                elif ARCH == "glm53":                   # the prompt opened <think>
+                    reasoning, text = split_thinking_reply(text)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
                     content, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
@@ -2034,7 +2141,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         "logprobs": None, "finish_reason": None}])
 
             splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
-                        if ARCH == "inkling" else None)
+                        if ARCH == "inkling" else
+                        ThinkingStreamSplit(emit_reasoning if chat else (lambda _t: None), emit)
+                        if ARCH == "glm53" else None)
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
@@ -2069,9 +2178,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     if flush:
                         emit(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
+                tsplit = (ThinkingStreamSplit(emit_reasoning, emit_tools) if ARCH == "glm53" else None)
                 stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    gone, grammar=grammar)
+                    prompt, maximum, temperature, top_p, tsplit.feed if tsplit else emit_tools,
+                    cache_slot, gone, grammar=grammar)
+                if tsplit:
+                    tsplit.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
@@ -2143,9 +2255,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = {"inkling": render_chat_inkling, "laguna": render_chat_laguna,
-                    "qwen35": render_chat_qwen35}.get(ARCH, render_chat)
-        prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
+        prompt = chat_renderer()(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
 
@@ -2178,8 +2288,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        # the arch's own template: this used to render GLM-5.2's for every model
+        prompt = chat_renderer()(messages, enable_thinking, "high" if enable_thinking else None,
+                                 tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2198,10 +2309,11 @@ class APIHandler(BaseHTTPRequestHandler):
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
-            if enable_thinking:
+            if enable_thinking or ARCH == "glm53":
                 reasoning, text = split_thinking_reply(text)
-                content.append({"type": "thinking", "thinking": reasoning,
-                                "signature": ANTHROPIC_LOCAL_SIGNATURE})
+                if enable_thinking:
+                    content.append({"type": "thinking", "thinking": reasoning,
+                                    "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
                 text, calls = (parse_tool_calls_qwen35 if ARCH == "qwen35"
@@ -2339,8 +2451,8 @@ class APIHandler(BaseHTTPRequestHandler):
                               "signature": ANTHROPIC_LOCAL_SIGNATURE}})
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
+            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking) if enable_thinking
+                     else ThinkingStreamSplit(lambda _t: None, emit_answer) if ARCH == "glm53" else None)
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -2437,7 +2549,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "laguna", "qwen35"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "glm53", "inkling", "laguna", "qwen35"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--lora", default=os.environ.get("LORA"),
                         help="LoRA adapter directory (Tinker raw format; inkling engine only)")
@@ -2461,12 +2573,14 @@ def main():
             with open(Path(args.model) / "config.json") as fh:
                 mt = json.load(fh).get("model_type") or ""
                 ARCH = ("inkling" if "inkling" in mt else "laguna" if "laguna" in mt
-                        else "qwen35" if "qwen3_5" in mt or "qwen35" in mt else "glm")
+                        else "qwen35" if "qwen3_5" in mt or "qwen35" in mt
+                        else "glm53" if "glm5_next" in mt else "glm")
         except OSError:
             ARCH = "glm"
     if args.model_id is None:
         args.model_id = {"inkling": "inkling-colibri", "laguna": "laguna-s-2.1-colibri",
-                         "qwen35": "qwen3.5-35b-a3b-sabrewing"}.get(ARCH, "glm-5.2-colibri")
+                         "qwen35": "qwen3.5-35b-a3b-sabrewing",
+                         "glm53": "glm-5.3-flash-sabrewing"}.get(ARCH, "glm-5.2-colibri")
     if args.lora:
         # the engine reads LORA from its environment (serve-mode twin of -l)
         os.environ["LORA"] = str(args.lora)

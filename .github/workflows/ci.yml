@@ -22,7 +22,7 @@ jobs:
       # ARCH=x86-64-v3: portable AVX2 baseline — hosted runners vary, and
       # `native` would make the build depend on whichever CPU we drew.
       - name: Build every engine
-        run: make -C c glm inkling olmoe laguna qwen35 deepseek ARCH=x86-64-v3
+        run: make -C c glm inkling olmoe laguna qwen35 deepseek glm53 ARCH=x86-64-v3
       - name: C test suite
         run: make -C c test-c ARCH=x86-64-v3
       # Dependency-free (no torch, no weights): a pure-Python V4 reference the
