@@ -1,6 +1,7 @@
 /* compat.h — shim di portabilita' per piattaforme non-Linux (oggi: macOS / Apple Silicon,
  * Windows 11 x86-64 via MinGW-w64).
- * Su Linux questo header e' un NO-OP totale: nessun simbolo definito o ridefinito,
+ * Su Linux questo header non ridefinisce nulla: aggiunge solo helper portabili
+ * (compat_fsize, COMPAT_O_RDONLY, ...) che li' sono sottili wrapper POSIX,
  * zero impatto sul percorso x86 esistente.
  * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti. */
 #ifndef COMPAT_H
@@ -298,14 +299,18 @@ static inline int compat_open_direct(const char *path){
 /* --- dimensione file da fd: GetFileSizeEx ---
  * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
  * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
- * qualsiasi fd (buffered o direct). -1 su errore. */
+ * qualsiasi fd (buffered o direct). -1 su errore (errno impostato).
+ * EN: also the ONLY correct way to size a shard here — the CRT's plain
+ * `struct stat`/fstat carries a 32-bit st_size and fails with EOVERFLOW
+ * ("Value too large") on any file > 2 GB (issue #9). */
 static inline off_t compat_fsize(int fd){
     intptr_t osfh = _get_osfhandle(fd);
-    if(osfh == -1 || osfh == -2) return -1;
+    if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
     LARGE_INTEGER li;
-    if(!GetFileSizeEx((HANDLE)osfh, &li)) return -1;
+    if(!GetFileSizeEx((HANDLE)osfh, &li)){ errno = EIO; return -1; }
     return (off_t)li.QuadPart;
 }
+#define COMPAT_HAVE_FSIZE 1
 
 /* --- setenv -> SetEnvironmentVariableA (POSIX setenv assente su Windows) --- */
 static inline int compat_setenv(const char *name, const char *value, int overwrite){
@@ -369,6 +374,22 @@ static inline char *compat_mkdtemp(char *tmpl){
 /* --- COMPAT_O_RDONLY: O_RDONLY con O_BINARY su Windows, O_RDONLY puro altrove --- */
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
+#endif
+
+/* --- compat_fsize su Linux/macOS: fstat ---
+ * Dimensione di un file da fd, 64 bit, -1 su errore (errno da fstat).
+ * EN: the portable way to size a model/shard file. Do NOT use a raw
+ * `struct stat` + fstat or lseek(SEEK_END) for that: on Windows the former
+ * overflows at 2 GB (issue #9) and the latter fails on NO_BUFFERING fds. */
+#ifndef COMPAT_HAVE_FSIZE
+#define COMPAT_HAVE_FSIZE 1
+#include <sys/types.h>
+#include <sys/stat.h>
+static inline off_t compat_fsize(int fd){
+    struct stat st;
+    if(fstat(fd, &st) != 0) return -1;
+    return st.st_size;
+}
 #endif
 
 #endif /* COMPAT_H */

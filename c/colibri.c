@@ -6021,7 +6021,7 @@ static double mirror_probe_bw(shards *S,int rep){
     int big=-1; int64_t bsz=0;
     for(int i=0;i<S->nfd;i++){
         if(rep && S->mfds[i]<0) continue;
-        int64_t sz=lseek(rep?S->mfds[i]:S->fds[i],0,SEEK_END);
+        int64_t sz=(int64_t)compat_fsize(rep?S->mfds[i]:S->fds[i]);
         if(sz>bsz){ bsz=sz; big=i; }
     }
     const int64_t blk=19ll<<20; const int NB=8;
