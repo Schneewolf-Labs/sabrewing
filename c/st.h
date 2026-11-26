@@ -149,7 +149,7 @@ static int st_mirror_init(shards *S, const char *dir) {
         char mp[2048]; snprintf(mp, sizeof(mp), "%s/%s", dir, base);
         int mfd = open(mp, COMPAT_O_RDONLY);
         if (mfd < 0) continue;               /* partial mirror: this shard stays on the primary */
-        int64_t sza = lseek(S->fds[i], 0, SEEK_END), szb = lseek(mfd, 0, SEEK_END);
+        int64_t sza = (int64_t)compat_fsize(S->fds[i]), szb = (int64_t)compat_fsize(mfd);
         if (sza != szb) {
             fprintf(stderr, "[MIRROR] %s: size differs from the primary copy — file skipped\n", mp);
             close(mfd); continue;
@@ -276,9 +276,10 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
-        struct stat sst;
-        if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
-        int64_t fsz = (int64_t)sst.st_size;
+        /* compat_fsize, not a raw fstat: Windows' CRT struct stat has a 32-bit
+         * st_size and fails with EOVERFLOW on any shard > 2 GB (issue #9) */
+        int64_t fsz = (int64_t)compat_fsize(fd);
+        if (fsz < 0) { perror("fstat shard"); exit(1); }
         uint64_t hlen;
         st_pread_full(fd, &hlen, 8, 0, "pread hlen");
         /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
